@@ -36,7 +36,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "Trakt 评分同步豆瓣"
     plugin_desc = "从 Trakt 读取用户电影评分，匹配豆瓣条目并同步为「看过」及评分。"
     plugin_icon = "trakt.svg"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -49,6 +49,7 @@ class TraktRatingsSync(_PluginBase):
     _douban_cookie = ""
     _private = True
     _only_movies = True
+    _max_sync_count = 0  # 0 表示不限制
     _cron = "0 2 * * *"  # 每天凌晨 2 点
 
     def init_plugin(self, config: dict = None):
@@ -59,6 +60,7 @@ class TraktRatingsSync(_PluginBase):
         self._douban_cookie = config.get("douban_cookie", "")
         self._private = config.get("private", True)
         self._only_movies = config.get("only_movies", True)
+        self._max_sync_count = int(config.get("max_sync_count") or 0) if config.get("max_sync_count") is not None else 0
         self._cron = config.get("cron", "0 2 * * *") or "0 2 * * *"
 
     def _fetch_trakt_ratings_movies(self) -> List[Dict[str, Any]]:
@@ -223,6 +225,10 @@ class TraktRatingsSync(_PluginBase):
             logger.info("未获取到 Trakt 电影评分或接口异常")
             return
 
+        if self._max_sync_count > 0:
+            items = items[: self._max_sync_count]
+            logger.info("本次最多同步 %d 条，已截断列表", self._max_sync_count)
+
         synced: Dict[str, Any] = self.get_data("synced") or {}
         wait_retry: Dict[str, Any] = self.get_data("wait") or {}
 
@@ -336,6 +342,25 @@ class TraktRatingsSync(_PluginBase):
                                     {
                                         "component": "VTextField",
                                         "props": {
+                                            "model": "max_sync_count",
+                                            "label": "最大同步数量",
+                                            "placeholder": "0 表示不限制，单次最多同步条数",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
                                             "model": "douban_cookie",
                                             "label": "豆瓣 Cookie",
                                             "placeholder": "留空则从 CookieCloud 获取",
@@ -374,11 +399,50 @@ class TraktRatingsSync(_PluginBase):
             "douban_cookie": "",
             "private": True,
             "only_movies": True,
+            "max_sync_count": 0,
             "cron": "0 2 * * *",
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        return []
+        """插件详情页：说明手动同步方式"""
+        return [
+            {
+                "component": "VCard",
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "props": {"content": "手动同步"},
+                        "content": [],
+                    },
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "info",
+                                    "variant": "tonal",
+                                    "text": "立即执行一次 Trakt → 豆瓣 同步：请调用插件 API（GET 或 POST）\n"
+                                    "路径：/api/v1/plugin/traktratingssync/sync\n"
+                                    "或在「插件」→「API」中查看该接口。",
+                                },
+                                "content": [],
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "content": "立即同步",
+                                    "color": "primary",
+                                    "event": "runPlugin",
+                                    "path": "/sync",
+                                },
+                                "content": [],
+                            },
+                        ],
+                    },
+                ],
+            }
+        ]
 
     def get_state(self) -> bool:
         return self._enable
