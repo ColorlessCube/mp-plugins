@@ -16,6 +16,12 @@ from app.utils.http import RequestUtils
 
 TRAKT_API_BASE = "https://api.trakt.tv"
 TRAKT_API_VERSION = "2"
+# Trakt 要求：Content-Type、trakt-api-key、trakt-api-version（见 https://trakt.docs.apiary.io）
+TRAKT_HEADERS_BASE = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "trakt-api-version": TRAKT_API_VERSION,
+}
 
 
 def _trakt_rating_to_douban(trakt_rating: int) -> int:
@@ -56,23 +62,39 @@ class TraktRatingsSync(_PluginBase):
         self._cron = config.get("cron", "0 2 * * *") or "0 2 * * *"
 
     def _fetch_trakt_ratings_movies(self) -> List[Dict[str, Any]]:
-        """拉取 Trakt 用户电影评分列表（公开接口，仅需 client_id）"""
+        """拉取 Trakt 用户电影评分列表（公开接口，仅需 client_id）。
+        API 文档：https://trakt.docs.apiary.io 要求 Header：Content-Type、trakt-api-key、trakt-api-version。
+        """
         if not self._trakt_username or not self._trakt_client_id:
             return []
         url = f"{TRAKT_API_BASE}/users/{self._trakt_username}/ratings/movies"
         headers = {
-            "Content-Type": "application/json",
-            "trakt-api-version": TRAKT_API_VERSION,
+            **TRAKT_HEADERS_BASE,
             "trakt-api-key": self._trakt_client_id,
         }
         try:
             resp = RequestUtils(timeout=30, headers=headers).get_res(url=url)
-            if resp and resp.status_code == 200:
+            if not resp:
+                logger.warning("Trakt API 请求失败（网络或超时）")
+                return []
+            if resp.status_code == 200:
                 data = resp.json()
-                return data if isinstance(data, list) else []
-            logger.warning(f"Trakt API 返回异常: status={getattr(resp, 'status_code', None)}")
+                if not isinstance(data, list):
+                    logger.warning("Trakt API 返回格式异常，期望数组")
+                    return []
+                return data
+            if resp.status_code == 429:
+                logger.warning("Trakt API 触发频率限制(429)，请稍后再试")
+                return []
+            if resp.status_code == 403:
+                logger.warning("Trakt API 拒绝访问(403)，请检查 Client ID 或该用户评分是否设为私有")
+                return []
+            if resp.status_code == 404:
+                logger.warning("Trakt 用户不存在或未公开评分: %s", self._trakt_username)
+                return []
+            logger.warning("Trakt API 返回异常: status=%s body=%s", resp.status_code, (resp.text or "")[:200])
         except Exception as e:
-            logger.error(f"拉取 Trakt 评分失败: {e}", exc_info=True)
+            logger.error("拉取 Trakt 评分失败: %s", e, exc_info=True)
         return []
 
     async def _get_douban_id_by_tmdb(self, tmdb_id: Optional[int], imdb_id: Optional[str],
@@ -103,9 +125,11 @@ class TraktRatingsSync(_PluginBase):
 
     def _sync_one(self, item: Dict[str, Any], douban_helper: DoubanHelper,
                   synced: Dict[str, Any], wait_retry: Dict[str, Any]) -> bool:
-        """同步单条评分到豆瓣（同步上下文，内部用 run_coroutine_threadsafe 调异步匹配）"""
-        movie = item.get("movie") or {}
-        ids = movie.get("ids") or {}
+        """同步单条评分到豆瓣（同步上下文，内部用 run_coroutine_threadsafe 调异步匹配）。
+        Trakt 返回项结构：{ "rating": 1-10, "rated_at": "...", "movie": { "title", "year", "ids": { "trakt", "slug", "imdb", "tmdb" } } }。
+        """
+        movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+        ids = movie.get("ids") if isinstance(movie.get("ids"), dict) else {}
         trakt_rating = item.get("rating")
         if not isinstance(trakt_rating, (int, float)):
             trakt_rating = 0
