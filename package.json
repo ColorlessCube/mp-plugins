@@ -1,0 +1,15 @@
+{
+  "TraktRatingsSync": {
+    "name": "Trakt 评分同步豆瓣",
+    "description": "从 Trakt 读取用户电影评分，匹配豆瓣条目并同步为「看过」及评分。",
+    "version": "1.0.0",
+    "icon": "trakt.svg",
+    "author": "ColorlessCube",
+    "level": 1,
+    "v2": true,
+    "labels": "同步,豆瓣,Trakt",
+    "history": {
+      "v1.0.0": "首次发布：支持从 Trakt 拉取电影评分并同步到豆瓣（看过+评分）"
+    }
+  }
+}
