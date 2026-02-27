@@ -4,6 +4,7 @@ Trakt 评分同步到豆瓣插件
 从 Trakt 读取用户电影评分，通过 TMDB/IMDB 匹配豆瓣条目，并将评分同步到豆瓣（标记为「看过」并写入评分）。
 """
 import asyncio
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.chain.media import MediaChain
@@ -28,15 +29,15 @@ def _trakt_rating_to_douban(trakt_rating: int) -> int:
     """Trakt 1-10 转为豆瓣 1-5 星"""
     if trakt_rating <= 0:
         return 1
-    douban = max(1, min(5, round(trakt_rating / 2)))
+    douban = math.ceil(trakt_rating / 2)
     return int(douban)
 
 
 class TraktRatingsSync(_PluginBase):
     plugin_name = "Trakt 评分同步豆瓣"
     plugin_desc = "从 Trakt 读取用户电影评分，匹配豆瓣条目并同步为「看过」及评分。"
-    plugin_icon = "trakt.svg"
-    plugin_version = "1.1.0"
+    plugin_icon = "trakt.png"
+    plugin_version = "1.3.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -225,9 +226,14 @@ class TraktRatingsSync(_PluginBase):
             logger.info("未获取到 Trakt 电影评分或接口异常")
             return
 
+        # 按评分时间倒序，优先同步最近评分的；再按最大数量截断
+        def _rated_at_sort_key(x: Dict[str, Any]) -> str:
+            return (x.get("rated_at") or "")[:19]
+
+        items.sort(key=_rated_at_sort_key, reverse=True)
         if self._max_sync_count > 0:
             items = items[: self._max_sync_count]
-            logger.info("本次最多同步 %d 条，已截断列表", self._max_sync_count)
+            logger.info("本次最多同步 %d 条，已按最近评分取前 N 条", self._max_sync_count)
 
         synced: Dict[str, Any] = self.get_data("synced") or {}
         wait_retry: Dict[str, Any] = self.get_data("wait") or {}
@@ -404,45 +410,7 @@ class TraktRatingsSync(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """插件详情页：说明手动同步方式"""
-        return [
-            {
-                "component": "VCard",
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "props": {"content": "手动同步"},
-                        "content": [],
-                    },
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "variant": "tonal",
-                                    "text": "立即执行一次 Trakt → 豆瓣 同步：请调用插件 API（GET 或 POST）\n"
-                                    "路径：/api/v1/plugin/traktratingssync/sync\n"
-                                    "或在「插件」→「API」中查看该接口。",
-                                },
-                                "content": [],
-                            },
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "content": "立即同步",
-                                    "color": "primary",
-                                    "event": "runPlugin",
-                                    "path": "/sync",
-                                },
-                                "content": [],
-                            },
-                        ],
-                    },
-                ],
-            }
-        ]
+        return []
 
     def get_state(self) -> bool:
         return self._enable
