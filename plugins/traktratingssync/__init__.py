@@ -41,7 +41,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "Trakt 评分同步豆瓣"
     plugin_desc = "从 Trakt 读取用户电影/电视剧评分，匹配豆瓣条目并同步为「看过」及评分；可选把 Trakt 中尚未看完的视频同步为豆瓣「在看」。"
     plugin_icon = "trakt.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -58,6 +58,8 @@ class TraktRatingsSync(_PluginBase):
     _sync_type = "all"  # all: 全部，movies: 仅电影，shows: 仅电视剧
     _max_sync_count = 0  # 0 表示不限制
     _cron = "0 2 * * *"  # 每天凌晨 2 点
+    _bark_webhook_url = ""  # Bark Webhook URL，用于发送通知
+    _message_helper =  None
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -77,6 +79,27 @@ class TraktRatingsSync(_PluginBase):
             self._sync_type = sync_type
         self._max_sync_count = int(config.get("max_sync_count") or 0) if config.get("max_sync_count") is not None else 0
         self._cron = config.get("cron", "0 2 * * *") or "0 2 * * *"
+        self._bark_webhook_url = (config.get("bark_webhook_url") or "").strip()
+        self._message_helper = MessageHelper()
+
+    def _send_bark_notification(self, title: str, content: str) -> bool:
+       if not self._bark_webhook_url:
+           logger.debug("未配置 Bark Webhook URL，跳过通知发送")
+           return False
+       try:
+           resp = RequestUtils(timeout=10).post_res(
+                url=self._bark_webhook_url,
+                json={"title": title, "body": content}
+            )
+           if resp and resp.status_code == 200:
+               logger.info(f"Bark 通知发送成功：{title}")
+               return True
+           else:
+               logger.warning(f"Bark 通知发送失败：{getattr(resp, 'status_code', None)}")
+               return False
+       except Exception as e:
+           logger.error(f"发送 Bark 通知失败：{e}")
+           return False
 
     def _fetch_trakt_ratings_movies(self) -> List[Dict[str, Any]]:
         """拉取 Trakt 用户电影评分列表（公开接口，仅需 client_id）。
@@ -316,6 +339,11 @@ class TraktRatingsSync(_PluginBase):
 
         def _sync_one_playback_item(item: Dict[str, Any], media_key: str, media_type: MediaType) -> None:
             progress = item.get("progress")
+            # 修改进度判断：progress >= 10 才认为是正在观看
+            if isinstance(progress, (int, float)) and progress < 10:
+                title_temp = (item.get(media_key) or {}).get("title", "未知")
+                logger.debug("进度低于 10 %，跳过：%s progress=%s", title_temp, progress)
+                return
             if isinstance(progress, (int, float)) and progress >= 100:
                 return
             media = item.get(media_key) or {}
@@ -439,7 +467,7 @@ class TraktRatingsSync(_PluginBase):
                     f"并输入授权码：{user_code}\n\n"
                     f"授权有效期约 {expires_in // 60} 分钟，完成后系统会在下次定时任务中自动获取 Access Token。"
                 )
-                MessageHelper().put(
+                self._message_helper.put(
                     message=msg,
                     role="plugin",
                     title="Trakt 评分同步豆瓣 授权",
@@ -487,7 +515,7 @@ class TraktRatingsSync(_PluginBase):
                     })
                     # 授权成功后清除 device 信息
                     self.save_data("trakt_device", None)
-                    MessageHelper().put(
+                    self._message_helper.put(
                         message="Trakt 授权成功，已启用未看完列表同步为豆瓣「在看」。",
                         role="plugin",
                         title="Trakt 评分同步豆瓣 授权成功",
@@ -509,7 +537,7 @@ class TraktRatingsSync(_PluginBase):
                     return None
                 # 其他错误：设备码失效或被拒绝，需要重新触发授权流程
                 self.save_data("trakt_device", None)
-                MessageHelper().put(
+                self._message_helper.put(
                     message=f"Trakt 授权失败（{err or '未知错误'}），请重新在插件配置中触发授权。",
                     role="plugin",
                     title="Trakt 评分同步豆瓣 授权失败",
@@ -750,6 +778,20 @@ class TraktRatingsSync(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "bark_webhook_url",
+                                            "label": "Bark Webhook URL",
+                                            "placeholder": "https://api.day.app/your_key/your_message",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -787,10 +829,125 @@ class TraktRatingsSync(_PluginBase):
             "sync_type": "all",
             "max_sync_count": 0,
             "cron": "0 2 * * *",
+            "bark_webhook_url": "",
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        return []
+        """获取插件详情页面，显示同步历史记录"""
+        synced = self.get_data("synced") or {}
+        
+        # 转换为列表并按标题排序
+        history_list = list(synced.values())
+        for item in history_list:
+            # 添加简单的格式化时间戳
+            item["sync_time"] = item.get("rated_at", "未知时间")
+        
+        # 按标题排序显示
+        history_list.sort(key=lambda x: x.get("title", ""), reverse=True)
+        
+        # 限制显示最近 50 条
+        history_list = history_list[:50]
+        
+        if not history_list:
+           return [
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "text": "暂无同步历史记录",
+                    },
+                }
+            ]
+        
+        return [
+            {
+                "component": "VTable",
+                "props": {
+                    "hover": True,
+                    "fixedHeader": True,
+                },
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [
+                            {
+                                "component": "th",
+                                "props": {"class": "text-start ps-4"},
+                                "text": "标题",
+                            },
+                            {
+                                "component": "th",
+                                "props": {"class": "text-start ps-4"},
+                                "text": "年份",
+                            },
+                            {
+                                "component": "th",
+                                "props": {"class": "text-start ps-4"},
+                                "text": "类型",
+                            },
+                            {
+                                "component": "th",
+                                "props": {"class": "text-start ps-4"},
+                                "text": "Trakt 评分",
+                            },
+                            {
+                                "component": "th",
+                                "props": {"class": "text-start ps-4"},
+                                "text": "豆瓣评分",
+                            },
+                            {
+                                "component": "th",
+                                "props": {"class": "text-start ps-4"},
+                                "text": "豆瓣 ID",
+                            },
+                        ],
+                    },
+                    {
+                        "component": "tbody",
+                        "content": [
+                            {
+                                "component": "tr",
+                                "props": {"key": f"history_{idx}"},
+                                "content": [
+                                    {
+                                        "component": "td",
+                                        "props": {"class": "text-start ps-4"},
+                                        "text": f"{item.get('title', '未知')} ({item.get('year', '')})",
+                                    },
+                                    {
+                                        "component": "td",
+                                        "props": {"class": "text-start ps-4"},
+                                        "text": str(item.get('year', '-')),
+                                    },
+                                    {
+                                        "component": "td",
+                                        "props": {"class": "text-start ps-4"},
+                                        "text": "电影" if item.get('media_type') == 'movie' else "剧集",
+                                    },
+                                    {
+                                        "component": "td",
+                                        "props": {"class": "text-start ps-4"},
+                                        "text": str(item.get('trakt_rating', '-')),
+                                    },
+                                    {
+                                        "component": "td",
+                                        "props": {"class": "text-start ps-4"},
+                                        "text": str(_trakt_rating_to_douban(item.get('trakt_rating', 0))),
+                                    },
+                                    {
+                                        "component": "td",
+                                        "props": {"class": "text-start ps-4"},
+                                        "text": str(item.get('douban_id', '-')),
+                                    },
+                                ],
+                            }
+                            for idx, item in enumerate(history_list)
+                        ],
+                    },
+                ],
+            }
+        ]
 
     def get_state(self) -> bool:
         return self._enable
