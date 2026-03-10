@@ -12,12 +12,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.chain.media import MediaChain
 from app.core.config import global_vars
-from app.helper.message import MessageHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from .douban_helper import DoubanHelper
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
+from urllib.parse import quote
 
 TRAKT_API_BASE = "https://api.trakt.tv"
 TRAKT_API_VERSION = "2"
@@ -41,7 +41,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "Trakt 评分同步豆瓣"
     plugin_desc = "从 Trakt 读取用户电影/电视剧评分,匹配豆瓣条目并同步为「看过」及评分;可选把 Trakt 中尚未看完的视频同步为豆瓣「在看」。"
     plugin_icon = "trakt.png"
-    plugin_version = "v2.3.0"
+    plugin_version = "v2.4.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -59,7 +59,6 @@ class TraktRatingsSync(_PluginBase):
     _max_sync_count = 0  # 0 表示不限制
     _cron = "0 2 * * *"  # 每天凌晨 2 点
     _bark_webhook_url = ""  # Bark Webhook URL,用于发送通知
-    _message_helper = None
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -80,57 +79,97 @@ class TraktRatingsSync(_PluginBase):
         self._max_sync_count = int(config.get("max_sync_count") or 0) if config.get("max_sync_count") is not None else 0
         self._cron = config.get("cron", "0 2 * * *") or "0 2 * * *"
         self._bark_webhook_url = (config.get("bark_webhook_url") or "").strip()
-        self._message_helper = MessageHelper()
-
-    def _send_message(self, title: str, message: str) -> None:
-        """发送插件通知消息(通过 MessageHelper 和 Bark 双通道)"""
-        try:
-            # 1. 通过 MessageHelper 发送(系统会转发到配置的通知渠道)
-            if self._message_helper:
-                self._message_helper.put(
-                    message=message,
-                    role="plugin",
-                    title=title,
-                )
-                logger.info(f"已发送插件通知: {title}")
-
-            # 2. 如果配置了 Bark,也发送到 Bark
-            if self._bark_webhook_url:
-                self._send_bark_notification(title, message)
-        except Exception as e:
-            logger.error(f"发送消息失败: {e}", exc_info=True)
 
     def _send_bark_notification(self, title: str, content: str) -> bool:
         """发送 Bark 通知
 
-        Bark 支持 GET 和 POST 两种请求方式：
-        - GET: https://api.day.app/yourkey/title/body
-        - POST: https://api.day.app/yourkey
-                body: {"title": "title", "body": "body"}
+        Bark 支持多种请求方式：
+        1. GET: https://api.day.app/yourkey/title/body
+        2. POST JSON: https://api.day.app/yourkey
+           body: {"title": "title", "body": "body"}
 
         参考: https://github.com/Finb/Bark
+
+        Args:
+            title: 通知标题
+            content: 通知内容
+
+        Returns:
+            bool: 发送是否成功
         """
         if not self._bark_webhook_url:
             logger.debug("未配置 Bark Webhook URL,跳过通知发送")
             return False
+
+        # 尝试多种方式发送，直到成功
+        methods = [
+            ("POST JSON", self._send_bark_post_json),
+            ("GET", self._send_bark_get),
+        ]
+
+        for method_name, method_func in methods:
+            try:
+                logger.debug(f"尝试使用 {method_name} 方式发送 Bark 通知")
+                if method_func(title, content):
+                    logger.info(f"✅ Bark 通知发送成功 ({method_name}): {title}")
+                    return True
+                else:
+                    logger.debug(f"❌ {method_name} 方式发送失败，尝试下一种方式")
+            except Exception as e:
+                logger.debug(f"❌ {method_name} 方式发送异常: {e}")
+                continue
+
+        logger.error(f"❌ 所有 Bark 发送方式都失败了: {title}")
+        return False
+
+    def _send_bark_get(self, title: str, content: str) -> bool:
+        """使用 GET 方式发送 Bark 通知"""
         try:
-            # 使用 POST 方式发送，参数为 title 和 body
-            resp = RequestUtils(timeout=10).post_res(
-                url=self._bark_webhook_url,
-                json={
-                    "title": title,
-                    "body": content,
-                    "group": "Trakt同步"  # 添加分组，方便查看
-                }
-            )
+            # GET 方式: https://api.day.app/yourkey/title/body
+            # 需要对中文进行 URL 编码
+            url = f"{self._bark_webhook_url.rstrip('/')}/{quote(title)}/{quote(content)}"
+
+            logger.debug(f"Bark GET 请求 URL: {url}")
+            resp = RequestUtils(timeout=10).get_res(url=url)
+
             if resp and resp.status_code == 200:
-                logger.info(f"Bark 通知发送成功: {title}")
                 return True
             else:
-                logger.warning(f"Bark 通知发送失败: {getattr(resp, 'status_code', None)}")
+                logger.debug(f"Bark GET 返回状态码: {getattr(resp, 'status_code', None)}")
                 return False
         except Exception as e:
-            logger.error(f"发送 Bark 通知失败: {e}")
+            logger.debug(f"Bark GET 请求失败: {e}")
+            return False
+
+    def _send_bark_post_json(self, title: str, content: str) -> bool:
+        """使用 POST JSON 方式发送 Bark 通知"""
+        try:
+            # POST 方式: https://api.day.app/yourkey
+            url = self._bark_webhook_url.rstrip('/')
+
+            payload = {
+                "title": title,
+                "body": content,
+                "group": "Trakt同步",
+                "sound": "bell"  # 添加提示音
+            }
+
+            logger.debug(f"Bark POST 请求 URL: {url}")
+            logger.debug(f"Bark POST 请求 Payload: {payload}")
+
+            resp = RequestUtils(timeout=10, headers={"Content-Type": "application/json"}).post_res(
+                url=url,
+                json=payload
+            )
+
+            if resp and resp.status_code == 200:
+                return True
+            else:
+                logger.debug(f"Bark POST 返回状态码: {getattr(resp, 'status_code', None)}")
+                logger.debug(f"Bark POST 返回内容: {getattr(resp, 'text', '')[:200]}")
+                return False
+        except Exception as e:
+            logger.debug(f"Bark POST 请求失败: {e}")
             return False
 
     def _fetch_trakt_ratings_movies(self) -> List[Dict[str, Any]]:
@@ -213,13 +252,21 @@ class TraktRatingsSync(_PluginBase):
         Returns:
             Tuple[Optional[str], Optional[str]]: (douban_id, cn_title)
         """
+        douban_info = None
         if tmdb_id:
             try:
                 douban_info = await MediaChain().async_get_doubaninfo_by_tmdbid(
                     tmdbid=int(tmdb_id), mtype=mtype
                 )
                 if douban_info and douban_info.get("id"):
-                    cn_title = douban_info.get("title") or douban_info.get("cn_name")
+                    # 调试日志：查看豆瓣返回的数据结构
+                    logger.debug(f"豆瓣信息 (TMDB {tmdb_id}): {douban_info}")
+                    # 优先获取中文标题：title > cn_name > name
+                    cn_title = (douban_info.get("title") or
+                                douban_info.get("cn_name") or
+                                douban_info.get("name") or
+                                title)
+                    logger.info(f"匹配成功: TMDB {tmdb_id} -> 豆瓣 {douban_info['id']}, 标题: {cn_title}")
                     return str(douban_info["id"]), cn_title
             except Exception as e:
                 logger.debug(f"TMDB {tmdb_id} 匹配豆瓣失败: {e}")
@@ -232,7 +279,14 @@ class TraktRatingsSync(_PluginBase):
                     imdbid=imdb_id,
                 )
                 if douban_info and douban_info.get("id"):
-                    cn_title = douban_info.get("title") or douban_info.get("cn_name")
+                    # 调试日志：查看豆瓣返回的数据结构
+                    logger.debug(f"豆瓣信息 (标题匹配 {title}): {douban_info}")
+                    # 优先获取中文标题：title > cn_name > name
+                    cn_title = (douban_info.get("title") or
+                                douban_info.get("cn_name") or
+                                douban_info.get("name") or
+                                title)
+                    logger.info(f"匹配成功: {title} -> 豆瓣 {douban_info['id']}, 标题: {cn_title}")
                     return str(douban_info["id"]), cn_title
             except Exception as e:
                 logger.debug(f"标题/IMDB 匹配豆瓣失败 {title}: {e}")
@@ -498,7 +552,7 @@ class TraktRatingsSync(_PluginBase):
                 f"并输入授权码: {user_code}\n\n"
                 f"授权有效期约 {expires_in // 60} 分钟,完成后系统会在下次定时任务中自动获取 Access Token。"
             )
-            self._send_message("Trakt 评分同步豆瓣 授权", msg)
+            self._send_bark_notification("Trakt 评分同步豆瓣 授权", msg)
             logger.info("Trakt 设备码已生成并发送授权通知,等待用户在浏览器完成授权")
 
             return device_data
@@ -547,7 +601,7 @@ class TraktRatingsSync(_PluginBase):
                     })
                     # 授权成功后清除 device 信息
                     self.save_data("trakt_device", None)
-                    self._send_message(
+                    self._send_bark_notification(
                         "Trakt 评分同步豆瓣 授权成功",
                         "Trakt 授权成功,已启用未看完列表同步为豆瓣「在看」。"
                     )
@@ -571,7 +625,7 @@ class TraktRatingsSync(_PluginBase):
 
                 # 其他错误:设备码失效或被拒绝,需要重新触发授权流程
                 self.save_data("trakt_device", None)
-                self._send_message(
+                self._send_bark_notification(
                     "Trakt 评分同步豆瓣 授权失败",
                     f"Trakt 授权失败({err or '未知错误'}),请重新在插件配置中触发授权。"
                 )
@@ -1000,7 +1054,7 @@ class TraktRatingsSync(_PluginBase):
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": "电影" if item.get('media_type') == MediaType.MOVIE.value else "剧集",
+                                        "text": item.get('media_type', '未知'),
                                     },
                                     {
                                         "component": "td",
@@ -1017,18 +1071,18 @@ class TraktRatingsSync(_PluginBase):
                                         "props": {"class": "text-start ps-4"},
                                         "content": [
                                             {
-                                                "component": "VChip",
+                                                "component": "VBtn",
                                                 "props": {
-                                                    "variant": "outlined",
+                                                    "variant": "text",
                                                     "color": "primary",
                                                     "size": "small",
                                                     "href": f"https://movie.douban.com/subject/{item.get('douban_id', '')}/",
                                                     "target": "_blank",
-                                                    "text": str(item.get('douban_id', '-')),
                                                 },
+                                                "text": f"🔗 {item.get('douban_id', '')}",
                                             }
                                         ] if item.get('douban_id') else [],
-                                        "text": str(item.get('douban_id', '-')) if not item.get('douban_id') else None,
+                                        "text": "-" if not item.get('douban_id') else None,
                                     },
                                 ],
                             }
