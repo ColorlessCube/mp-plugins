@@ -17,7 +17,6 @@ from app.plugins import _PluginBase
 from .douban_helper import DoubanHelper
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
-from urllib.parse import quote
 
 TRAKT_API_BASE = "https://api.trakt.tv"
 TRAKT_API_VERSION = "2"
@@ -41,7 +40,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "Trakt 评分同步豆瓣"
     plugin_desc = "从 Trakt 读取用户电影/电视剧评分,匹配豆瓣条目并同步为「看过」及评分;可选把 Trakt 中尚未看完的视频同步为豆瓣「在看」。"
     plugin_icon = "trakt.png"
-    plugin_version = "2.5.0"
+    plugin_version = "3.0.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -81,12 +80,7 @@ class TraktRatingsSync(_PluginBase):
         self._bark_webhook_url = (config.get("bark_webhook_url") or "").strip()
 
     def _send_bark_notification(self, title: str, content: str) -> bool:
-        """发送 Bark 通知
-
-        Bark 支持多种请求方式：
-        1. GET: https://api.day.app/yourkey/title/body
-        2. POST JSON: https://api.day.app/yourkey
-           body: {"title": "title", "body": "body"}
+        """发送 Bark 通知（POST JSON 方式）
 
         参考: https://github.com/Finb/Bark
 
@@ -98,78 +92,32 @@ class TraktRatingsSync(_PluginBase):
             bool: 发送是否成功
         """
         if not self._bark_webhook_url:
-            logger.info("未配置 Bark Webhook URL,跳过通知发送")
+            logger.debug("未配置 Bark Webhook URL，跳过通知发送")
             return False
 
-        # 尝试多种方式发送，直到成功
-        methods = [
-            ("POST JSON", self._send_bark_post_json),
-            ("GET", self._send_bark_get),
-        ]
-
-        for method_name, method_func in methods:
-            try:
-                logger.info(f"尝试使用 {method_name} 方式发送 Bark 通知")
-                if method_func(title, content):
-                    logger.info(f"✅ Bark 通知发送成功 ({method_name}): {title}")
-                    return True
-                else:
-                    logger.info(f"❌ {method_name} 方式发送失败，尝试下一种方式")
-            except Exception as e:
-                logger.info(f"❌ {method_name} 方式发送异常: {e}")
-                continue
-
-        logger.error(f"❌ 所有 Bark 发送方式都失败了: {title}")
-        return False
-
-    def _send_bark_get(self, title: str, content: str) -> bool:
-        """使用 GET 方式发送 Bark 通知"""
         try:
-            # GET 方式: https://api.day.app/yourkey/title/body
-            # 需要对中文进行 URL 编码
-            url = f"{self._bark_webhook_url.rstrip('/')}/{quote(title)}/{quote(content)}"
-
-            logger.info(f"Bark GET 请求 URL: {url}")
-            resp = RequestUtils(timeout=10).get_res(url=url)
-
-            if resp and resp.status_code == 200:
-                return True
-            else:
-                logger.info(f"Bark GET 返回状态码: {getattr(resp, 'status_code', None)}")
-                return False
-        except Exception as e:
-            logger.info(f"Bark GET 请求失败: {e}")
-            return False
-
-    def _send_bark_post_json(self, title: str, content: str) -> bool:
-        """使用 POST JSON 方式发送 Bark 通知"""
-        try:
-            # POST 方式: https://api.day.app/yourkey
             url = self._bark_webhook_url.rstrip('/')
-
             payload = {
                 "title": title,
                 "body": content,
                 "group": "Trakt同步",
-                "sound": "bell"  # 添加提示音
+                "sound": "bell"
             }
 
-            logger.info(f"Bark POST 请求 URL: {url}")
-            logger.info(f"Bark POST 请求 Payload: {payload}")
-
+            logger.debug(f"发送 Bark 通知: {title}")
             resp = RequestUtils(timeout=10, headers={"Content-Type": "application/json"}).post_res(
                 url=url,
                 json=payload
             )
 
             if resp and resp.status_code == 200:
+                logger.info(f"✅ Bark 通知发送成功: {title}")
                 return True
             else:
-                logger.info(f"Bark POST 返回状态码: {getattr(resp, 'status_code', None)}")
-                logger.info(f"Bark POST 返回内容: {getattr(resp, 'text', '')[:200]}")
+                logger.warning(f"❌ Bark 通知发送失败: HTTP {getattr(resp, 'status_code', 'None')}")
                 return False
         except Exception as e:
-            logger.info(f"Bark POST 请求失败: {e}")
+            logger.error(f"❌ Bark 通知发送异常: {e}")
             return False
 
     def _fetch_trakt_ratings_movies(self) -> List[Dict[str, Any]]:
@@ -260,7 +208,7 @@ class TraktRatingsSync(_PluginBase):
                 )
                 if douban_info and douban_info.get("id"):
                     # 调试日志：查看豆瓣返回的数据结构
-                    logger.info(f"豆瓣信息 (TMDB {tmdb_id}): {douban_info}")
+                    logger.debug(f"豆瓣信息 (TMDB {tmdb_id}): {douban_info}")
                     # 优先获取中文标题：title > cn_name > name
                     cn_title = (douban_info.get("title") or
                                 douban_info.get("cn_name") or
@@ -269,7 +217,7 @@ class TraktRatingsSync(_PluginBase):
                     logger.info(f"匹配成功: TMDB {tmdb_id} -> 豆瓣 {douban_info['id']}, 标题: {cn_title}")
                     return str(douban_info["id"]), cn_title
             except Exception as e:
-                logger.info(f"TMDB {tmdb_id} 匹配豆瓣失败: {e}")
+                logger.debug(f"TMDB {tmdb_id} 匹配豆瓣失败: {e}")
         if title or imdb_id:
             try:
                 douban_info = await MediaChain().async_match_doubaninfo(
@@ -280,7 +228,7 @@ class TraktRatingsSync(_PluginBase):
                 )
                 if douban_info and douban_info.get("id"):
                     # 调试日志：查看豆瓣返回的数据结构
-                    logger.info(f"豆瓣信息 (标题匹配 {title}): {douban_info}")
+                    logger.debug(f"豆瓣信息 (标题匹配 {title}): {douban_info}")
                     # 优先获取中文标题：title > cn_name > name
                     cn_title = (douban_info.get("title") or
                                 douban_info.get("cn_name") or
@@ -289,7 +237,7 @@ class TraktRatingsSync(_PluginBase):
                     logger.info(f"匹配成功: {title} -> 豆瓣 {douban_info['id']}, 标题: {cn_title}")
                     return str(douban_info["id"]), cn_title
             except Exception as e:
-                logger.info(f"标题/IMDB 匹配豆瓣失败 {title}: {e}")
+                logger.debug(f"标题/IMDB 匹配豆瓣失败 {title}: {e}")
         return None, None
 
     def _sync_one(self, item: Dict[str, Any], douban_helper: DoubanHelper,
@@ -324,7 +272,7 @@ class TraktRatingsSync(_PluginBase):
         if key in synced:
             prev = synced[key]
             if prev.get("trakt_rating") == trakt_rating and prev.get("douban_id"):
-                logger.info(f"已同步过且评分未变,跳过: {title}")
+                logger.debug(f"已同步过且评分未变,跳过: {title}")
                 return True
 
         try:
@@ -401,7 +349,7 @@ class TraktRatingsSync(_PluginBase):
         # 优先使用配置中的 Access Token,其次使用设备授权流程获得并缓存的 Token
         access_token = self._get_trakt_access_token_for_playback()
         if not access_token:
-            logger.info("未获取到 Trakt Access Token,跳过未看完列表同步")
+            logger.debug("未获取到 Trakt Access Token,跳过未看完列表同步")
             return
 
         headers = {
@@ -415,12 +363,12 @@ class TraktRatingsSync(_PluginBase):
             try:
                 resp = RequestUtils(timeout=20, headers=headers).get_res(url=url)
                 if not resp:
-                    logger.info("Trakt 播放进度请求失败: %s", path)
+                    logger.debug("Trakt 播放进度请求失败: %s", path)
                     return []
                 if resp.status_code == 204:
                     return []
                 if resp.status_code != 200:
-                    logger.info("Trakt 播放进度返回异常 %s: %s %s", path, resp.status_code, (resp.text or "")[:200])
+                    logger.debug("Trakt 播放进度返回异常 %s: %s %s", path, resp.status_code, (resp.text or "")[:200])
                     return []
                 data = resp.json()
                 return data if isinstance(data, list) else []
@@ -432,7 +380,7 @@ class TraktRatingsSync(_PluginBase):
         episodes = _fetch_playback("/sync/playback/episodes")
 
         if not movies and not episodes:
-            logger.info("Trakt 播放进度列表为空,无未看完的条目")
+            logger.debug("Trakt 播放进度列表为空,无未看完的条目")
             return
 
         def _sync_one_playback_item(item: Dict[str, Any], media_key: str, media_type: MediaType) -> None:
@@ -440,7 +388,7 @@ class TraktRatingsSync(_PluginBase):
             # 修改进度判断:progress >= 10 才认为是正在观看
             if isinstance(progress, (int, float)) and progress < 10:
                 title_temp = (item.get(media_key) or {}).get("title", "未知")
-                logger.info("进度低于 10 %,跳过: %s progress=%s", title_temp, progress)
+                logger.debug("进度低于 10 %,跳过: %s progress=%s", title_temp, progress)
                 return
             if isinstance(progress, (int, float)) and progress >= 100:
                 return
@@ -451,7 +399,7 @@ class TraktRatingsSync(_PluginBase):
             title = media.get("title", "未知")
             year = media.get("year")
             if not tmdb_id and not imdb_id:
-                logger.info("Trakt 播放进度条目无 tmdb/imdb,跳过: %s (%s)", title, year)
+                logger.debug("Trakt 播放进度条目无 tmdb/imdb,跳过: %s (%s)", title, year)
                 return
             try:
                 future = asyncio.run_coroutine_threadsafe(
@@ -467,10 +415,10 @@ class TraktRatingsSync(_PluginBase):
                 result = future.result(timeout=30)
                 subject_id, _ = result if result else (None, None)
             except Exception as e:
-                logger.info("匹配豆瓣未看完条目失败 %s (%s): %s", title, year, e)
+                logger.debug("匹配豆瓣未看完条目失败 %s (%s): %s", title, year, e)
                 return
             if not subject_id:
-                logger.info("未找到豆瓣未看完条目: %s (%s)", title, year)
+                logger.debug("未找到豆瓣未看完条目: %s (%s)", title, year)
                 return
             if douban_helper.set_watching_status(
                     subject_id=subject_id,
@@ -615,19 +563,26 @@ class TraktRatingsSync(_PluginBase):
                 try:
                     data = resp.json()
                 except Exception as e:
-                    logger.info("解析 Trakt Access Token 响应失败: %s", e)
+                    logger.debug("解析 Trakt Access Token 响应失败: %s", e)
                     return None
 
                 access_token = data.get("access_token")
                 expires_in = int(data.get("expires_in") or 0)
 
                 if access_token and expires_in > 0:
-                    # 保存 token
+                    # 保存 token 到插件数据
                     expires_at = int(time.time()) + expires_in - 60
                     self.save_data("trakt_token", {
                         "access_token": access_token,
                         "expires_at": expires_at,
                     })
+
+                    # 同时更新插件配置，让 token 回显到配置界面
+                    self.update_config({
+                        "trakt_access_token": access_token
+                    })
+                    logger.info(f"✅ Access Token 已保存到配置（有效期约 {expires_in // 3600} 小时）")
+
                     return access_token
 
                 return None
@@ -644,12 +599,12 @@ class TraktRatingsSync(_PluginBase):
                     return None
                 else:
                     # 授权失败
-                    logger.info(f"Trakt 授权错误: {err}")
+                    logger.debug(f"Trakt 授权错误: {err}")
                     return None
 
             return None
         except Exception as e:
-            logger.info(f"交换 token 异常: {e}")
+            logger.debug(f"交换 token 异常: {e}")
             return None
 
     def _get_trakt_access_token_for_playback(self) -> Optional[str]:
@@ -673,7 +628,7 @@ class TraktRatingsSync(_PluginBase):
 
         # 3. 启动设备码授权流程（阻塞等待）
         if not self._trakt_client_id or not self._trakt_client_secret:
-            logger.info("未配置 Trakt Client Secret，无法自动获取 Access Token")
+            logger.debug("未配置 Trakt Client Secret，无法自动获取 Access Token")
             return None
 
         logger.info("开始 Trakt 设备码授权流程...")
@@ -682,7 +637,7 @@ class TraktRatingsSync(_PluginBase):
     def sync_trakt_ratings_to_douban(self):
         """定时任务入口:拉取 Trakt 评分并同步到豆瓣"""
         if not self._enable:
-            logger.info("Trakt 评分同步插件未启用,跳过")
+            logger.debug("Trakt 评分同步插件未启用,跳过")
             return
         if not self._trakt_username or not self._trakt_client_id:
             logger.warning("未配置 Trakt 用户名或 Client ID,跳过同步")
@@ -848,8 +803,8 @@ class TraktRatingsSync(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "trakt_access_token",
-                                            "label": "Trakt Access Token(可选)",
-                                            "placeholder": "用于读取播放进度 /sync/playback,同步未看完列表为豆瓣在看",
+                                            "label": "Trakt Access Token（可选，自动获取后会自动填充）",
+                                            "placeholder": "留空将自动通过设备码授权获取（阻塞等待10分钟）",
                                         },
                                     }
                                 ],
@@ -934,10 +889,12 @@ class TraktRatingsSync(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "从 Trakt 读取公开评分需在 https://trakt.tv/oauth/applications 创建应用并填写 Client ID;"
-                                                    "如需同步未看完列表为豆瓣「在看」,需额外配置 Trakt Access Token(OAuth);"
-                                                    "豆瓣 Cookie 留空时从 CookieCloud 获取,用于提交「看过」及评分。"
-                                                    "支持同步电影和电视剧评分到豆瓣。",
+                                            "text": "📌 使用说明：\n"
+                                                    "1. 在 https://trakt.tv/oauth/applications 创建应用获取 Client ID\n"
+                                                    "2. 填写 Client Secret 启用自动授权（首次同步时会通过 Bark 发送授权链接，系统阻塞等待10分钟）\n"
+                                                    "3. 授权成功后，Access Token 会自动回填到配置中\n"
+                                                    "4. 豆瓣 Cookie 留空时从 CookieCloud 获取\n"
+                                                    "5. 支持同步电影和电视剧评分，以及未看完列表为「在看」",
                                         },
                                     }
                                 ],
@@ -1047,7 +1004,7 @@ class TraktRatingsSync(_PluginBase):
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": f"{item.get('cn_title') if item.get('cn_title') else item.get('title')}",
+                                        "text": f"{item.get('title', '未知')}",
                                     },
                                     {
                                         "component": "td",
@@ -1057,7 +1014,7 @@ class TraktRatingsSync(_PluginBase):
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": "电影" if item.get('media_type') == MediaType.MOVIE.value else "剧集",
+                                        "text": "电影" if item.get('media_type') == 'movie' else "剧集",
                                     },
                                     {
                                         "component": "td",
