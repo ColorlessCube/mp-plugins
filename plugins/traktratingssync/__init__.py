@@ -41,7 +41,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "Trakt 评分同步豆瓣"
     plugin_desc = "从 Trakt 读取用户电影/电视剧评分,匹配豆瓣条目并同步为「看过」及评分;可选把 Trakt 中尚未看完的视频同步为豆瓣「在看」。"
     plugin_icon = "trakt.png"
-    plugin_version = "2.2.0"
+    plugin_version = "v2.2.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
