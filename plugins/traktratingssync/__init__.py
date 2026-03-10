@@ -41,7 +41,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "Trakt 评分同步豆瓣"
     plugin_desc = "从 Trakt 读取用户电影/电视剧评分,匹配豆瓣条目并同步为「看过」及评分;可选把 Trakt 中尚未看完的视频同步为豆瓣「在看」。"
     plugin_icon = "trakt.png"
-    plugin_version = "v2.2.0"
+    plugin_version = "v2.3.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -101,13 +101,27 @@ class TraktRatingsSync(_PluginBase):
             logger.error(f"发送消息失败: {e}", exc_info=True)
 
     def _send_bark_notification(self, title: str, content: str) -> bool:
+        """发送 Bark 通知
+
+        Bark 支持 GET 和 POST 两种请求方式：
+        - GET: https://api.day.app/yourkey/title/body
+        - POST: https://api.day.app/yourkey
+                body: {"title": "title", "body": "body"}
+
+        参考: https://github.com/Finb/Bark
+        """
         if not self._bark_webhook_url:
             logger.debug("未配置 Bark Webhook URL,跳过通知发送")
             return False
         try:
+            # 使用 POST 方式发送，参数为 title 和 body
             resp = RequestUtils(timeout=10).post_res(
                 url=self._bark_webhook_url,
-                json={"title": title, "body": content}
+                json={
+                    "title": title,
+                    "body": content,
+                    "group": "Trakt同步"  # 添加分组，方便查看
+                }
             )
             if resp and resp.status_code == 200:
                 logger.info(f"Bark 通知发送成功: {title}")
@@ -193,15 +207,20 @@ class TraktRatingsSync(_PluginBase):
 
     async def _get_douban_id_by_tmdb(self, tmdb_id: Optional[int], imdb_id: Optional[str],
                                      title: Optional[str] = None, year: Optional[int] = None,
-                                     mtype: MediaType = MediaType.MOVIE) -> Optional[str]:
-        """根据 TMDB ID(及可选 IMDB/标题/年份)获取豆瓣 subject_id"""
+                                     mtype: MediaType = MediaType.MOVIE) -> Tuple[Optional[str], Optional[str]]:
+        """根据 TMDB ID(及可选 IMDB/标题/年份)获取豆瓣 subject_id 和中文标题
+
+        Returns:
+            Tuple[Optional[str], Optional[str]]: (douban_id, cn_title)
+        """
         if tmdb_id:
             try:
                 douban_info = await MediaChain().async_get_doubaninfo_by_tmdbid(
                     tmdbid=int(tmdb_id), mtype=mtype
                 )
                 if douban_info and douban_info.get("id"):
-                    return str(douban_info["id"])
+                    cn_title = douban_info.get("title") or douban_info.get("cn_name")
+                    return str(douban_info["id"]), cn_title
             except Exception as e:
                 logger.debug(f"TMDB {tmdb_id} 匹配豆瓣失败: {e}")
         if title or imdb_id:
@@ -213,10 +232,11 @@ class TraktRatingsSync(_PluginBase):
                     imdbid=imdb_id,
                 )
                 if douban_info and douban_info.get("id"):
-                    return str(douban_info["id"])
+                    cn_title = douban_info.get("title") or douban_info.get("cn_name")
+                    return str(douban_info["id"]), cn_title
             except Exception as e:
                 logger.debug(f"标题/IMDB 匹配豆瓣失败 {title}: {e}")
-        return None
+        return None, None
 
     def _sync_one(self, item: Dict[str, Any], douban_helper: DoubanHelper,
                   synced: Dict[str, Any], wait_retry: Dict[str, Any],
@@ -264,7 +284,8 @@ class TraktRatingsSync(_PluginBase):
                 ),
                 global_vars.loop,
             )
-            subject_id = future.result(timeout=30)
+            result = future.result(timeout=30)
+            subject_id, cn_title = result if result else (None, None)
         except Exception as e:
             logger.warning(f"匹配豆瓣失败 {title} ({year}): {e}")
             if key not in wait_retry:
@@ -282,6 +303,9 @@ class TraktRatingsSync(_PluginBase):
             logger.warning(f"未找到豆瓣条目: {title} ({year})")
             return False
 
+        # 使用中文标题(如果有)
+        display_title = cn_title or title
+
         ret = douban_helper.set_watching_status(
             subject_id=subject_id,
             status="collect",
@@ -292,13 +316,15 @@ class TraktRatingsSync(_PluginBase):
             synced[key] = {
                 "douban_id": subject_id,
                 "trakt_rating": trakt_rating,
-                "title": title,
+                "title": display_title,
+                "cn_title": cn_title,
+                "en_title": title,
                 "year": year,
                 "media_type": media_type.value,
             }
             if key in wait_retry:
                 del wait_retry[key]
-            logger.info(f"同步成功: {title} ({year}) -> 豆瓣 {subject_id} 评分 {douban_rating} 星")
+            logger.info(f"同步成功: {display_title} ({year}) -> 豆瓣 {subject_id} 评分 {douban_rating} 星")
             return True
         else:
             logger.error(f"豆瓣提交失败: {title} ({year}) subject_id={subject_id}")
@@ -384,7 +410,8 @@ class TraktRatingsSync(_PluginBase):
                     ),
                     global_vars.loop,
                 )
-                subject_id = future.result(timeout=30)
+                result = future.result(timeout=30)
+                subject_id, _ = result if result else (None, None)
             except Exception as e:
                 logger.debug("匹配豆瓣未看完条目失败 %s (%s): %s", title, year, e)
                 return
@@ -880,8 +907,17 @@ class TraktRatingsSync(_PluginBase):
         """获取插件详情页面,显示同步历史记录"""
         synced = self.get_data("synced") or {}
 
-        # 转换为列表(去重处理已由 key 唯一性保证)
-        history_list = list(synced.values())
+        # 转换为列表并去重(按 douban_id 去重,保留最新的记录)
+        seen_douban_ids = {}
+        for key, item in synced.items():
+            douban_id = item.get("douban_id")
+            if douban_id:
+                # 如果已存在相同 douban_id,比较 trakt_rating 决定保留哪个
+                if douban_id not in seen_douban_ids:
+                    seen_douban_ids[douban_id] = item
+                # 如果需要,可以添加更复杂的去重逻辑
+
+        history_list = list(seen_douban_ids.values())
 
         # 按标题排序显示
         history_list.sort(key=lambda x: x.get("title", ""), reverse=True)
@@ -979,7 +1015,20 @@ class TraktRatingsSync(_PluginBase):
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": str(item.get('douban_id', '-')),
+                                        "content": [
+                                            {
+                                                "component": "VChip",
+                                                "props": {
+                                                    "variant": "outlined",
+                                                    "color": "primary",
+                                                    "size": "small",
+                                                    "href": f"https://movie.douban.com/subject/{item.get('douban_id', '')}/",
+                                                    "target": "_blank",
+                                                    "text": str(item.get('douban_id', '-')),
+                                                },
+                                            }
+                                        ] if item.get('douban_id') else [],
+                                        "text": str(item.get('douban_id', '-')) if not item.get('douban_id') else None,
                                     },
                                 ],
                             }
