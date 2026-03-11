@@ -2,7 +2,7 @@
   "TraktRatingsSync": {
     "name": "Trakt 评分同步豆瓣",
     "description": "从 Trakt 读取用户电影/电视剧评分，匹配豆瓣条目并同步为「看过」及评分；可选同步 Trakt 中尚未看完的视频为豆瓣「在看」。",
-    "version": "3.0.0",
+    "version": "3.1.0",
     "icon": "trakt.svg",
     "author": "ColorlessCube",
     "level": 1,
@@ -15,7 +15,8 @@
       "v2.1.0": "增加详情页；优化正在观看的判断；优化消息通知",
       "v2.4.0": "优化插件详情页；优化通知；",
       "v2.5.0": "修复 auth token 同步问题",
-      "v3.0.0": "修复 token 回显问题"
+      "v3.0.0": "修复 token 回显问题",
+      "v3.1.0": "优化插件架构"
     }
   }
 }
