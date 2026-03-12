@@ -102,12 +102,68 @@ class DoubanHelper:
         first = subject_items[0]
         return first.get("title"), first.get("subject_id")
 
+    def get_book_subject_id(self, title: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+        """根据标题在豆瓣搜索图书，返回 (subject_name, subject_id)"""
+        if not title:
+            return None, None
+        url = f"https://www.douban.com/search?cat=1001&q={title}"
+        response = RequestUtils(headers=self.headers, timeout=10).get_res(url=url)
+        if not response or response.status_code != 200:
+            logger.error(f"搜索图书 {title} 失败 状态码：{getattr(response, 'status_code', None)}")
+            return None, None
+        soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
+        title_divs = soup.find_all("div", class_="title")
+        subject_items: List[dict] = []
+        for div in title_divs:
+            item = {}
+            a_tag = div.find_all("a")[0]
+            item["title"] = (a_tag.string or "").strip()
+            link = unquote(a_tag.get("href", ""))
+            if "subject/" in link:
+                match = re.search(r"subject/(\d+)/", link)
+                if match:
+                    item["subject_id"] = match.group(1)
+            subject_items.append(item)
+        if not subject_items:
+            logger.error(f"找不到图书 {title} 相关条目")
+            return None, None
+        first = subject_items[0]
+        return first.get("title"), first.get("subject_id")
+
+    def get_music_subject_id(self, title: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+        """根据标题在豆瓣搜索音乐，返回 (subject_name, subject_id)"""
+        if not title:
+            return None, None
+        url = f"https://www.douban.com/search?cat=1003&q={title}"
+        response = RequestUtils(headers=self.headers, timeout=10).get_res(url=url)
+        if not response or response.status_code != 200:
+            logger.error(f"搜索音乐 {title} 失败 状态码：{getattr(response, 'status_code', None)}")
+            return None, None
+        soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
+        title_divs = soup.find_all("div", class_="title")
+        subject_items: List[dict] = []
+        for div in title_divs:
+            item = {}
+            a_tag = div.find_all("a")[0]
+            item["title"] = (a_tag.string or "").strip()
+            link = unquote(a_tag.get("href", ""))
+            if "subject/" in link:
+                match = re.search(r"subject/(\d+)/", link)
+                if match:
+                    item["subject_id"] = match.group(1)
+            subject_items.append(item)
+        if not subject_items:
+            logger.error(f"找不到音乐 {title} 相关条目")
+            return None, None
+        first = subject_items[0]
+        return first.get("title"), first.get("subject_id")
+
     def set_watching_status(
-        self,
-        subject_id: str,
-        status: str = "do",
-        private: bool = True,
-        rating: Optional[int] = None,
+            self,
+            subject_id: str,
+            status: str = "do",
+            private: bool = True,
+            rating: Optional[int] = None,
     ) -> bool:
         """设置豆瓣观看状态（想看/在看/看过），可选 1–5 星评分"""
         self.headers["Referer"] = f"https://movie.douban.com/subject/{subject_id}/"
@@ -146,6 +202,98 @@ class DoubanHelper:
             if ok:
                 return True
             logger.error(f"douban_id: {subject_id} 未开播")
+            return False
+        logger.error(response.text)
+        return False
+
+    def set_book_status(
+            self,
+            subject_id: str,
+            status: str = "do",
+            private: bool = True,
+            rating: Optional[int] = None,
+    ) -> bool:
+        """设置豆瓣图书状态（想读/在读/读过），可选 1–5 星评分"""
+        self.headers["Referer"] = f"https://book.douban.com/subject/{subject_id}/"
+        self.headers["Origin"] = "https://book.douban.com"
+        self.headers["Host"] = "book.douban.com"
+        self.headers["Cookie"] = ";".join([f"{key}={value}" for key, value in self.cookies.items()])
+        data_json = {
+            "ck": self.ck,
+            "interest": status,
+            "rating": "",
+            "tags": "",
+            "comment": "",
+        }
+        if private:
+            data_json["private"] = "on"
+        if rating is not None and 1 <= rating <= 5:
+            data_json["rating"] = str(rating)
+        try:
+            response = requests.post(
+                url=f"https://book.douban.com/j/subject/{subject_id}/interest",
+                headers=self.headers,
+                data=data_json,
+                timeout=10,
+            )
+        except Exception as e:
+            logger.error(f"请求豆瓣失败: {e}")
+            return False
+        if not response:
+            logger.error("豆瓣未返回内容")
+            return False
+        if response.status_code == 200:
+            ret = response.json().get("r")
+            ok = False if (isinstance(ret, bool) and ret is False) else True
+            if ok:
+                return True
+            logger.error(f"douban_id: {subject_id} 图书状态设置失败")
+            return False
+        logger.error(response.text)
+        return False
+
+    def set_music_status(
+            self,
+            subject_id: str,
+            status: str = "do",
+            private: bool = True,
+            rating: Optional[int] = None,
+    ) -> bool:
+        """设置豆瓣音乐状态（想听/在听/听过），可选 1–5 星评分"""
+        self.headers["Referer"] = f"https://music.douban.com/subject/{subject_id}/"
+        self.headers["Origin"] = "https://music.douban.com"
+        self.headers["Host"] = "music.douban.com"
+        self.headers["Cookie"] = ";".join([f"{key}={value}" for key, value in self.cookies.items()])
+        data_json = {
+            "ck": self.ck,
+            "interest": status,
+            "rating": "",
+            "tags": "",
+            "comment": "",
+        }
+        if private:
+            data_json["private"] = "on"
+        if rating is not None and 1 <= rating <= 5:
+            data_json["rating"] = str(rating)
+        try:
+            response = requests.post(
+                url=f"https://music.douban.com/j/subject/{subject_id}/interest",
+                headers=self.headers,
+                data=data_json,
+                timeout=10,
+            )
+        except Exception as e:
+            logger.error(f"请求豆瓣失败: {e}")
+            return False
+        if not response:
+            logger.error("豆瓣未返回内容")
+            return False
+        if response.status_code == 200:
+            ret = response.json().get("r")
+            ok = False if (isinstance(ret, bool) and ret is False) else True
+            if ok:
+                return True
+            logger.error(f"douban_id: {subject_id} 音乐状态设置失败")
             return False
         logger.error(response.text)
         return False
