@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 豆瓣书影音档案 Helper（本插件自包含，不依赖 doubanSync 插件）
-用于提交「看过」状态及评分到豆瓣。
+用于提交「看过」状态及评分到豆瓣。Cookie 需在插件配置中手动填写。
 """
 import re
 from typing import List, Optional, Tuple
@@ -13,27 +13,19 @@ from http.cookies import SimpleCookie
 
 from app.core.config import settings
 from app.core.meta import MetaBase
-from app.helper.cookiecloud import CookieCloudHelper
 from app.log import logger
 from app.utils.http import RequestUtils
 
 
 class DoubanHelper:
-    """豆瓣 Cookie 登录与状态/评分提交"""
+    """豆瓣 Cookie 登录与状态/评分提交。Cookie 需在插件配置中手动填写。"""
 
     def __init__(self, user_cookie: Optional[str] = None):
-        if not user_cookie:
-            self.cookiecloud = CookieCloudHelper()
-            cookie_dict, msg = self.cookiecloud.download()
-            if cookie_dict is None:
-                logger.error(f"获取cookiecloud数据错误 {msg}")
-            self.cookies = cookie_dict.get("douban.com") if cookie_dict else None
+        if user_cookie:
+            self.cookies = {k: v.value for k, v in SimpleCookie(user_cookie).items()}
         else:
-            self.cookies = user_cookie
-        if not self.cookies:
             self.cookies = {}
-        else:
-            self.cookies = {k: v.value for k, v in SimpleCookie(self.cookies).items()}
+            logger.warning("未配置豆瓣 Cookie，请在插件配置中填写")
 
         self.headers = {
             "User-Agent": settings.USER_AGENT,
@@ -47,13 +39,23 @@ class DoubanHelper:
 
         self.cookies.pop("__utmz", None)
         self.cookies.pop("ck", None)
-        self.set_ck()
-        self.ck = self.cookies.get("ck")
-        logger.debug(f"ck:{self.ck} cookie:{self.cookies}")
-        if not self.cookies:
-            logger.error("cookie获取为空，请检查插件配置或cookie cloud")
-        if not self.ck:
-            logger.error("请求ck失败，请检查传入的cookie登录状态")
+        self._authenticated = False
+
+        if self.cookies:
+            self.set_ck()
+            self.ck = self.cookies.get("ck")
+            if self.ck:
+                self._authenticated = True
+                logger.debug(f"豆瓣认证成功 ck:{self.ck}")
+            else:
+                logger.error("获取豆瓣 ck 失败，Cookie 可能已失效，请在插件配置中更新豆瓣 Cookie")
+        else:
+            self.ck = None
+
+    @property
+    def is_authenticated(self) -> bool:
+        """返回豆瓣 Cookie 是否有效（ck 已成功获取）"""
+        return self._authenticated
 
     def set_ck(self) -> None:
         """刷新豆瓣 ck"""

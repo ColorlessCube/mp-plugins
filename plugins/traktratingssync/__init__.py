@@ -41,7 +41,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "Trakt 评分同步豆瓣"
     plugin_desc = "从 Trakt 读取用户电影/电视剧评分,匹配豆瓣条目并同步为「看过」及评分;可选把 Trakt 中尚未看完的视频同步为豆瓣「在看」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.2.0"
+    plugin_version = "3.3.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -69,7 +69,7 @@ class TraktRatingsSync(_PluginBase):
         # 可选:Trakt OAuth Client Secret + Access Token,用于读取播放进度(未看完列表)
         self._trakt_client_secret = (config.get("trakt_client_secret") or "").strip()
         self._trakt_access_token = (config.get("trakt_access_token") or "").strip()
-        self._douban_cookie = config.get("douban_cookie", "")
+        self._douban_cookie = (config.get("douban_cookie") or "").strip()
         self._private = config.get("private", True)
         sync_type = config.get("sync_type", "all") or "all"
         self._sync_type = sync_type
@@ -92,7 +92,13 @@ class TraktRatingsSync(_PluginBase):
         try:
             self._douban_helper = DoubanHelper(user_cookie=self._douban_cookie or None)
         except Exception as e:
-            logger.error(f"初始化豆瓣 Helper 失败(请检查 Cookie/CookieCloud): {e}")
+            logger.error(f"初始化豆瓣 Helper 失败: {e}")
+            return
+
+        if not self._douban_helper.is_authenticated:
+            msg = "豆瓣 Cookie 认证失败，请重新录入"
+            logger.error(msg)
+            self._send_bark_notification("豆瓣 Cookie 已失效", msg)
             return
 
         try:
@@ -896,7 +902,7 @@ class TraktRatingsSync(_PluginBase):
                                         "props": {
                                             "model": "douban_cookie",
                                             "label": "豆瓣 Cookie",
-                                            "placeholder": "留空则从 CookieCloud 获取",
+                                            "placeholder": "从浏览器复制豆瓣 Cookie 粘贴到此处",
                                         },
                                     }
                                 ],
@@ -933,7 +939,7 @@ class TraktRatingsSync(_PluginBase):
                                                     "1. 在 https://trakt.tv/oauth/applications 创建应用获取 Client ID\n"
                                                     "2. 填写 Client Secret 启用自动授权（首次同步时会通过 Bark 发送授权链接，系统阻塞等待10分钟）\n"
                                                     "3. 授权成功后，Access Token 会自动回填到配置中\n"
-                                                    "4. 豆瓣 Cookie 留空时从 CookieCloud 获取\n"
+                                                    "4. 豆瓣 Cookie 需从浏览器手动复制，失效时会通过 Bark 推送通知提醒更新\n"
                                                     "5. 支持同步电影和电视剧评分，以及未看完列表为「在看」",
                                         },
                                     }
