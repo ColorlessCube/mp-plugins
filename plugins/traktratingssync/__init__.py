@@ -1,485 +1,191 @@
 # -*- coding: utf-8 -*-
 """
-Trakt 评分同步到豆瓣插件
-从 Trakt 读取用户电影/电视剧评分,通过 TMDB/IMDB 匹配豆瓣条目,并将评分同步到豆瓣(标记为「看过」并写入评分)。
-支持同步类型选择:全部、仅电影、仅电视剧。
-可选:基于 Trakt 播放进度(/sync/playback)同步「尚未看完」的视频为豆瓣「在看」。
+豆瓣书影音同步插件
+
+插件定义、配置读取和任务调度入口。
+所有业务逻辑分别由对应 helper 实现：
+  - TraktHelper   → Trakt API 封装（评分拉取、播放进度、OAuth 授权）
+  - DoubanHelper  → 豆瓣 Cookie 操作（标记看过/在看、写入评分）
+  - WereadHelper  → 微信读书 Web API（书架、阅读进度）
+  - NeteaseHelper → 网易云音乐 Web API（最近播放记录，按专辑聚合）
 """
-import asyncio
-import math
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.chain.media import MediaChain
-from app.core.config import global_vars
 from app.log import logger
 from app.plugins import _PluginBase
-from .douban_helper import DoubanHelper
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
-
-TRAKT_API_BASE = "https://api.trakt.tv"
-TRAKT_API_VERSION = "2"
-# Trakt 要求:Content-Type、trakt-api-key、trakt-api-version(见 https://trakt.docs.apiary.io)
-TRAKT_HEADERS_BASE = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    "trakt-api-version": TRAKT_API_VERSION,
-}
-
-
-def _trakt_rating_to_douban(trakt_rating: int) -> int:
-    """Trakt 1-10 转为豆瓣 1-5 星"""
-    if trakt_rating <= 0:
-        return 1
-    douban = math.ceil(trakt_rating / 2)
-    return int(douban)
+from .douban_helper import DoubanHelper
+from .netease_helper import NeteaseHelper
+from .trakt_helper import TraktHelper
+from .weread_helper import WereadHelper
 
 
 class TraktRatingsSync(_PluginBase):
-    plugin_name = "Trakt 评分同步豆瓣"
-    plugin_desc = "从 Trakt 读取用户电影/电视剧评分,匹配豆瓣条目并同步为「看过」及评分;可选把 Trakt 中尚未看完的视频同步为豆瓣「在看」。"
+    plugin_name = "豆瓣书影音同步"
+    plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.3.0"
+    plugin_version = "3.4.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
     plugin_order = 16
     auth_level = 1
 
-    _enable = False
-    _trakt_username = ""
-    _trakt_client_id = ""
-    _trakt_client_secret = ""
-    _trakt_access_token = ""
-    _douban_cookie = ""
-    _private = True
-    _sync_type = "all"  # all: 全部,movies: 仅电影,shows: 仅电视剧
-    _max_sync_count = 0  # 0 表示不限制
-    _cron = "0 2 * * *"  # 每天凌晨 2 点
-    _bark_webhook_url = ""  # Bark Webhook URL,用于发送通知
-    _douban_helper = None
+    _enable: bool = False
+    _trakt_username: str = ""
+    _trakt_client_id: str = ""
+    _trakt_client_secret: str = ""
+    _trakt_access_token: str = ""
+    _douban_cookie: str = ""
+    _weread_cookie: str = ""
+    _weread_limit: int = 20
+    _netease_cookie: str = ""
+    _netease_limit: int = 20
+    _private: bool = True
+    _sync_type: str = "all"   # all | movies | shows
+    _max_sync_count: int = 0  # 0 = 不限制
+    _cron: str = "0 2 * * *"
+    _bark_webhook_url: str = ""
+
+    # helper 实例（延迟初始化）
+    _douban_helper: Optional[DoubanHelper] = None
+    _trakt_helper: Optional[TraktHelper] = None
+    _weread_helper: Optional[WereadHelper] = None
+    _netease_helper: Optional[NeteaseHelper] = None
+
+    # ------------------------------------------------------------------
+    # 插件生命周期
+    # ------------------------------------------------------------------
 
     def init_plugin(self, config: dict = None):
         config = config or {}
         self._enable = config.get("enable", False)
         self._trakt_username = (config.get("trakt_username") or "").strip()
         self._trakt_client_id = (config.get("trakt_client_id") or "").strip()
-        # 可选:Trakt OAuth Client Secret + Access Token,用于读取播放进度(未看完列表)
         self._trakt_client_secret = (config.get("trakt_client_secret") or "").strip()
         self._trakt_access_token = (config.get("trakt_access_token") or "").strip()
         self._douban_cookie = (config.get("douban_cookie") or "").strip()
+        self._weread_cookie = (config.get("weread_cookie") or "").strip()
+        self._weread_limit = int(config.get("weread_limit") or 20)
+        self._netease_cookie = (config.get("netease_cookie") or "").strip()
+        self._netease_limit = int(config.get("netease_limit") or 20)
         self._private = config.get("private", True)
-        sync_type = config.get("sync_type", "all") or "all"
-        self._sync_type = sync_type
-        self._max_sync_count = int(config.get("max_sync_count") or 0) if config.get("max_sync_count") is not None else 0
+        self._sync_type = config.get("sync_type", "all") or "all"
+        self._max_sync_count = int(config.get("max_sync_count") or 0)
         self._cron = config.get("cron", "0 2 * * *") or "0 2 * * *"
         self._bark_webhook_url = (config.get("bark_webhook_url") or "").strip()
+
+        # 重置 helper，下次 run() 时重新初始化
         self._douban_helper = None
+        self._trakt_helper = None
+        self._weread_helper = None
+        self._netease_helper = None
 
     def run(self):
-        """定时任务入口:拉取 Trakt 评分并同步到豆瓣"""
+        """定时/手动触发入口：依次执行 Trakt 同步、微信读书同步、网易云音乐同步。"""
         if not self._enable:
-            logger.debug("Trakt 同步插件未启用,跳过")
-            return
-        if not self._trakt_username or not self._trakt_client_id:
-            logger.warning("未配置 Trakt 用户名或 Client ID,跳过同步")
+            logger.debug("豆瓣书影音同步插件未启用，跳过")
             return
 
-        logger.info("开始执行 Trakt 同步到豆瓣...")
-
+        # 初始化豆瓣 helper（注入通知回调）
         try:
-            self._douban_helper = DoubanHelper(user_cookie=self._douban_cookie or None)
+            self._douban_helper = DoubanHelper(
+                user_cookie=self._douban_cookie or None,
+                notify_fn=self._send_bark_notification,
+            )
         except Exception as e:
-            logger.error(f"初始化豆瓣 Helper 失败: {e}")
+            logger.error("初始化豆瓣 Helper 失败: %s", e)
             return
 
-        if not self._douban_helper.is_authenticated:
-            msg = "豆瓣 Cookie 认证失败，请重新录入"
-            logger.error(msg)
-            self._send_bark_notification("豆瓣 Cookie 已失效", msg)
+        # 同步 Trakt 最近观看记录（有 client_id 就尝试，token 可在内部通过设备码获取）
+        if self._trakt_client_id:
+            try:
+                self._sync_trakt()
+            except Exception as e:
+                logger.error("同步 Trakt 评分失败: %s", e, exc_info=True)
+
+        # 同步微信读书最近阅读记录
+        if self._weread_cookie:
+            try:
+                self._sync_weread()
+            except Exception as e:
+                logger.error("同步微信读书记录失败: %s", e, exc_info=True)
+
+        # 同步网易云音乐最近听歌专辑到豆瓣「听过」
+        if self._netease_cookie:
+            try:
+                self._sync_netease()
+            except Exception as e:
+                logger.error("同步网易云音乐记录失败: %s", e, exc_info=True)
+
+        logger.info("豆瓣书影音同步完成")
+
+    # ------------------------------------------------------------------
+    # 同步调度方法（内部）
+    # ------------------------------------------------------------------
+
+    def _sync_trakt(self) -> None:
+        """同步 Trakt 最近观看记录，持久化并打印日志摘要。"""
+        if not self._trakt_client_id:
+            logger.debug("未配置 Trakt Client ID，跳过 Trakt 同步")
             return
 
+        # 初始化 Trakt helper
+        self._trakt_helper = TraktHelper(
+            client_id=self._trakt_client_id,
+            client_secret=self._trakt_client_secret,
+            access_token=self._trakt_access_token,
+            username=self._trakt_username,
+            save_data_fn=self.save_data,
+            get_data_fn=self.get_data,
+            update_config_fn=self._merge_update_config,
+            send_notification_fn=self._send_bark_notification,
+        )
+
+        # 同步 Trakt 评分 → 豆瓣看过
         try:
-            self.sync_ratings()
+            self._sync_ratings()
         except Exception as e:
             logger.error("同步 Trakt 评分到豆瓣失败: %s", e, exc_info=True)
 
-        # 同步 Trakt 播放进度中「尚未看完」的视频为豆瓣「在看」
+        # 同步 Trakt 播放进度 → 豆瓣在看
         try:
-            self.sync_progress()
+            self._sync_progress()
         except Exception as e:
             logger.error("同步 Trakt 观看进度到豆瓣失败: %s", e, exc_info=True)
 
-        logger.info("Trakt 同步到豆瓣完成")
+    def _sync_ratings(self) -> None:
+        """从 Trakt 拉取评分并批量同步到豆瓣「看过」。"""
+        all_items: List[Dict[str, Any]] = []
 
-    def _fetch_trakt_ratings(self, media_type) -> List[Dict[str, Any]]:
-        """拉取 Trakt 用户电影评分列表(公开接口,仅需 client_id)。
-        API 文档:https://trakt.docs.apiary.io 要求 Header:Content-Type、trakt-api-key、trakt-api-version。
-        """
-        if not self._trakt_username or not self._trakt_client_id:
-            return []
-
-        if media_type == "movies":
-            url = f"{TRAKT_API_BASE}/users/{self._trakt_username}/ratings/movies"
-        elif media_type == "shows":
-            url = f"{TRAKT_API_BASE}/users/{self._trakt_username}/ratings/shows"
-        else:
-            return []
-
-        headers = {
-            **TRAKT_HEADERS_BASE,
-            "trakt-api-key": self._trakt_client_id,
-        }
-        try:
-            resp = RequestUtils(timeout=30, headers=headers).get_res(url=url)
-            if not resp:
-                logger.warning("Trakt API 请求失败(网络或超时)")
-                return []
-            if resp.status_code == 200:
-                data = resp.json()
-                if not isinstance(data, list):
-                    logger.warning("Trakt API 返回格式异常,期望数组")
-                    return []
-                return data
-            if resp.status_code == 429:
-                logger.warning("Trakt API 触发频率限制(429),请稍后再试")
-                return []
-            if resp.status_code == 403:
-                logger.warning("Trakt API 拒绝访问(403),请检查 Client ID 或该用户评分是否设为私有")
-                return []
-            if resp.status_code == 404:
-                logger.warning("Trakt 用户不存在或未公开评分: %s", self._trakt_username)
-                return []
-            logger.warning("Trakt API 返回异常: status=%s body=%s", resp.status_code, (resp.text or "")[:200])
-        except Exception as e:
-            logger.error("拉取 Trakt 评分失败: %s", e, exc_info=True)
-        return []
-
-    async def _get_douban_info_by_tmdb(self, tmdb_id: Optional[int], imdb_id: Optional[str],
-                                       title: Optional[str] = None, year: Optional[int] = None,
-                                       mtype: MediaType = MediaType.MOVIE) -> Dict[str, Any]:
-        """根据 TMDB ID(及可选 IMDB/标题/年份)获取豆瓣 subject_id 和中文标题
-
-        Returns:
-            Dict[str, Any]
-        """
-        douban_info = None
-        if tmdb_id:
-            try:
-                douban_info = await MediaChain().async_get_doubaninfo_by_tmdbid(
-                    tmdbid=int(tmdb_id), mtype=mtype
-                )
-                if douban_info and douban_info.get("id"):
-                    logger.debug(f"豆瓣信息 (TMDB {tmdb_id}): {douban_info}")
-                    return douban_info
-            except Exception as e:
-                logger.debug(f"TMDB {tmdb_id} 匹配豆瓣失败: {e}")
-        if title or imdb_id:
-            try:
-                douban_info = await MediaChain().async_match_doubaninfo(
-                    name=title or "Unknown",
-                    year=str(year) if year else None,
-                    mtype=mtype,
-                    imdbid=imdb_id,
-                )
-                if douban_info and douban_info.get("id"):
-                    logger.debug(f"豆瓣信息 (标题匹配 {title}): {douban_info}")
-                    return douban_info
-            except Exception as e:
-                logger.debug(f"标题/IMDB 匹配豆瓣失败 {title}: {e}")
-        return douban_info
-
-    def _sync_one_rate(self, item: Dict[str, Any],
-                       finished: Dict[str, Any], wait_retry: Dict[str, Any],
-                       media_type: MediaType = MediaType.MOVIE) -> bool:
-        """同步单条评分到豆瓣(同步上下文,内部用 run_coroutine_threadsafe 调异步匹配)。
-        Trakt 返回项结构: { "rating": 1-10, "rated_at": "...", "movie/show": { "title", "year", "ids": { "trakt", "slug", "imdb", "tmdb" } } }。
-        """
-        if media_type == MediaType.MOVIE:
-            media = item.get("movie") if isinstance(item.get("movie"), dict) else {}
-        else:
-            media = item.get("show") if isinstance(item.get("show"), dict) else {}
-
-        ids = media.get("ids") if isinstance(media.get("ids"), dict) else {}
-        trakt_rating = item.get("rating")
-        if not isinstance(trakt_rating, (int, float)):
-            trakt_rating = 0
-        trakt_rating = int(trakt_rating)
-        douban_rating = _trakt_rating_to_douban(trakt_rating)
-        tmdb_id = ids.get("tmdb")
-        imdb_id = ids.get("imdb")
-        trakt_id = ids.get("trakt") or media.get("trakt_id")
-        slug = ids.get("slug") or ""
-        title = media.get("title", "未知")
-        year = media.get("year")
-
-        if not tmdb_id and not imdb_id:
-            logger.warning(f"Trakt 条目无 tmdb/imdb: {title} ({year})")
-            return False
-
-        key = f"{media_type}_{str(trakt_id) if trakt_id else slug or f'{title}_{year}'}"
-        if key in finished:
-            prev = finished[key]
-            if prev.get("trakt_rating") == trakt_rating and prev.get("douban_id"):
-                logger.debug(f"已同步过且评分未变,跳过: {title}")
-                return True
-
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._get_douban_info_by_tmdb(
-                    int(tmdb_id) if tmdb_id else None,
-                    imdb_id,
-                    title=title,
-                    year=year,
-                    mtype=media_type,
-                ),
-                global_vars.loop,
-            )
-            result = future.result(timeout=30)
-            douban_info = result if result else {}
-        except Exception as e:
-            logger.warning(f"匹配豆瓣失败 {title} ({year}): {e}")
-            if key not in wait_retry:
-                wait_retry[key] = {
-                    "title": title,
-                    "year": year,
-                    "trakt_rating": trakt_rating,
-                    "douban_rating": _trakt_rating_to_douban(trakt_rating),
-                    "tmdb_id": tmdb_id,
-                    "imdb_id": imdb_id,
-                    "media_type": media_type.value,
-                }
-            return False
-        subject_id = douban_info.get("id", None)
-        if not subject_id:
-            logger.warning(f"未找到豆瓣条目: {title} ({year})")
-            return False
-
-        display_title = douban_info.get("alt_title", title)
-
-        ret = self._douban_helper.set_watching_status(
-            subject_id=subject_id,
-            status="collect",
-            private=self._private,
-            rating=douban_rating,
-        )
-        if ret:
-            finished[key] = {
-                "douban_id": subject_id,
-                "trakt_rating": trakt_rating,
-                "douban_rating": _trakt_rating_to_douban(trakt_rating),
-                "title": display_title,
-                "en_title": title,
-                "year": year,
-                "media_type": media_type.value,
-                "status": "看完",  # 标记状态
-                "sync_time": int(time.time()),  # 同步时间戳
-            }
-            if key in wait_retry:
-                del wait_retry[key]
-            logger.info(f"同步成功: {display_title} ({year}) -> 豆瓣 {subject_id} 评分 {douban_rating} 星")
-            return True
-        else:
-            logger.error(f"豆瓣提交失败: {title} ({year}) subject_id={subject_id}")
-            if key not in wait_retry:
-                wait_retry[key] = {
-                    "title": title,
-                    "year": year,
-                    "trakt_rating": trakt_rating,
-                    "douban_rating": _trakt_rating_to_douban(trakt_rating),
-                    "subject_id": subject_id,
-                    "media_type": media_type.value,
-                }
-            return False
-
-    def _sync_one_progress(self, item: Dict[str, Any], media_key: str, media_type: MediaType,
-                           watching: Dict[str, Any]) -> None:
-        """同步单条播放进度到豆瓣「在看」，并缓存数据
-
-        Args:
-            item: 播放进度项
-            media_key: 媒体键名 (movie/show)
-            media_type: 媒体类型
-            watching: 在看缓存字典
-        """
-        progress = item.get("progress")
-        # 修改进度判断:progress >= 10 才认为是正在观看
-        if isinstance(progress, (int, float)) and progress < 10:
-            title_temp = (item.get(media_key) or {}).get("title", "未知")
-            logger.debug("进度低于 10 %,跳过: %s progress=%s", title_temp, progress)
-            return
-        if isinstance(progress, (int, float)) and progress >= 100:
-            return
-        media = item.get(media_key) or {}
-        ids = media.get("ids") or {}
-        tmdb_id = ids.get("tmdb")
-        imdb_id = ids.get("imdb")
-        trakt_id = ids.get("trakt") or media.get("trakt_id")
-        slug = ids.get("slug") or ""
-        title = media.get("title", "未知")
-        year = media.get("year")
-
-        if not tmdb_id and not imdb_id:
-            logger.debug("Trakt 播放进度条目无 tmdb/imdb,跳过: %s (%s)", title, year)
-            return
-
-        # 生成唯一 key
-        key = f"{media_type.value}_{str(trakt_id) if trakt_id else slug or f'{title}_{year}'}"
-
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._get_douban_info_by_tmdb(
-                    int(tmdb_id) if tmdb_id else None,
-                    imdb_id,
-                    title=title,
-                    year=year,
-                    mtype=media_type,
-                ),
-                global_vars.loop,
-            )
-            result = future.result(timeout=30)
-            douban_info = result if result else {}
-        except Exception as e:
-            logger.debug("匹配豆瓣未看完条目失败 %s (%s): %s", title, year, e)
-            return
-
-        subject_id = douban_info.get("id", None)
-        if not subject_id:
-            logger.debug("未找到豆瓣未看完条目: %s (%s)", title, year)
-            return
-
-        # 优先使用中文标题
-        display_title = (
-                douban_info.get("title") or
-                douban_info.get("cn_name") or
-                douban_info.get("name") or
-                title
-        )
-
-        if self._douban_helper.set_watching_status(
-                subject_id=subject_id,
-                status="do",
-                private=self._private,
-                rating=None,
-        ):
-            # 缓存在看数据
-            watching[key] = {
-                "douban_id": subject_id,
-                "title": display_title,
-                "en_title": title,
-                "year": year,
-                "media_type": media_type.value,
-                "progress": progress,
-                "status": "在看",  # 标记状态
-                "sync_time": int(time.time()),  # 同步时间戳
-            }
-            logger.info("同步未看完到豆瓣在看: %s (%s) -> 在看(progress=%s)", display_title, year, progress)
-        else:
-            logger.warning("同步未看完到豆瓣在看失败: %s (%s) subject_id=%s", title, year, subject_id)
-
-    def sync_progress(self) -> None:
-        """基于 Trakt 播放进度(未看完列表)同步豆瓣「在看」。
-
-        使用 /sync/playback/movies 与 /sync/playback/episodes,需要 OAuth Access Token。
-        仅对 progress < 100% 的条目,在豆瓣标记为在看(interest=do,不写评分)。
-        """
-        # 优先使用配置中的 Access Token,其次使用设备授权流程获得并缓存的 Token
-        access_token = self._get_trakt_access_token_for_playback()
-        if not access_token:
-            logger.debug("未获取到 Trakt Access Token,跳过未看完列表同步")
-            return
-
-        headers = {
-            **TRAKT_HEADERS_BASE,
-            "trakt-api-key": self._trakt_client_id,
-            "Authorization": f"Bearer {access_token}",
-        }
-
-        def _fetch_playback(path: str) -> List[Dict[str, Any]]:
-            url = f"{TRAKT_API_BASE}{path}"
-            try:
-                resp = RequestUtils(timeout=20, headers=headers).get_res(url=url)
-                if not resp:
-                    logger.debug("Trakt 播放进度请求失败: %s", path)
-                    return []
-                if resp.status_code == 204:
-                    return []
-                if resp.status_code != 200:
-                    logger.debug("Trakt 播放进度返回异常 %s: %s %s", path, resp.status_code, (resp.text or "")[:200])
-                    return []
-                data = resp.json()
-                return data if isinstance(data, list) else []
-            except Exception as e:
-                logger.error("拉取 Trakt 播放进度失败 %s: %s", path, e, exc_info=True)
-                return []
-
-        # 豆瓣无法将电影设置为在看状态，因此只同步剧集
-        # movies = _fetch_playback("/sync/playback/movies")
-        episodes = _fetch_playback("/sync/playback/episodes")
-
-        if not episodes:
-            logger.debug("Trakt 播放进度列表为空,无未看完的条目")
-            # 清空在看缓存
-            self.save_data("watching", {})
-            return
-
-        # 获取在看缓存
-        watching: Dict[str, Any] = self.get_data("watching") or {}
-
-        success_count = 0
-        for e in episodes or []:
-            # episodes 里按整部剧标记在看,使用 show 信息
-            if not e.get("show"):
-                continue
-            # 保留 progress, 但用 show 做匹配
-            try:
-                self._sync_one_progress(
-                    {"progress": e.get("progress"), "show": e.get("show")},
-                    "show",
-                    MediaType.TV,
-                    watching
-                )
-                success_count += 1
-            except Exception as ex:
-                logger.error(f"同步播放进度失败: {ex}", exc_info=True)
-
-        # 保存在看缓存
-        self.save_data("watching", watching)
-        logger.info(f"Trakt 播放进度同步完成: 成功 {success_count} 条")
-
-    def sync_ratings(self):
-        all_items = []
-        # 根据配置决定同步类型
-        if self._sync_type in ["all", "movies"]:
-            movies = self._fetch_trakt_ratings("movies")
+        if self._sync_type in ("all", "movies"):
+            movies = self._trakt_helper.fetch_ratings("movies")
             if movies:
                 for item in movies:
                     item["_media_type"] = MediaType.MOVIE
                 all_items.extend(movies)
-                logger.info(f"获取到 {len(movies)} 条电影评分")
+                logger.info("获取到 %d 条电影评分", len(movies))
 
-        if self._sync_type in ["all", "shows"]:
-            shows = self._fetch_trakt_ratings("shows")
+        if self._sync_type in ("all", "shows"):
+            shows = self._trakt_helper.fetch_ratings("shows")
             if shows:
                 for item in shows:
                     item["_media_type"] = MediaType.TV
                 all_items.extend(shows)
-                logger.info(f"获取到 {len(shows)} 条电视剧评分")
+                logger.info("获取到 %d 条电视剧评分", len(shows))
 
         if not all_items:
             logger.info("未获取到 Trakt 评分或接口异常")
             return
 
-        # 按评分时间倒序,优先同步最近评分的;再按最大数量截断
-        def _rated_at_sort_key(x: Dict[str, Any]) -> str:
-            return (x.get("rated_at") or "")[:19]
-
-        all_items.sort(key=_rated_at_sort_key, reverse=True)
+        # 按评分时间倒序，优先同步最近评分；按最大数量截断
+        all_items.sort(key=lambda x: (x.get("rated_at") or "")[:19], reverse=True)
         if self._max_sync_count > 0:
             all_items = all_items[: self._max_sync_count]
-            logger.info("本次最多同步 %d 条,已按最近评分取前 N 条", self._max_sync_count)
+            logger.info("本次最多同步 %d 条，已按最近评分取前 N 条", self._max_sync_count)
 
         finished: Dict[str, Any] = self.get_data("finished") or {}
         wait_retry: Dict[str, Any] = self.get_data("wait") or {}
@@ -489,270 +195,301 @@ class TraktRatingsSync(_PluginBase):
         for item in all_items:
             media_type = item.pop("_media_type", MediaType.MOVIE)
             try:
-                if self._sync_one_rate(item, finished, wait_retry, media_type=media_type):
+                if self._trakt_helper.sync_one_rate(
+                    item, finished, wait_retry, media_type,
+                    self._douban_helper, self._private
+                ):
                     success_count += 1
                 else:
                     fail_count += 1
             except Exception as e:
                 fail_count += 1
-                logger.error(f"同步单条失败: {e}", exc_info=True)
+                logger.error("同步单条失败: %s", e, exc_info=True)
 
         self.save_data("finished", finished)
         self.save_data("wait", wait_retry)
-        logger.info(f"Trakt 评分同步完成: 成功 {success_count}, 失败 {fail_count}")
+        logger.info("Trakt 评分同步完成: 成功 %d，失败 %d", success_count, fail_count)
 
-    # ***************************************************************** Trakt 鉴权逻辑 *****************************************************************
+    def _sync_progress(self) -> None:
+        """从 Trakt 播放进度（未看完列表）同步豆瓣「在看」。"""
+        access_token = self._trakt_helper.get_access_token()
+        if not access_token:
+            logger.debug("未获取到 Trakt Access Token，跳过未看完列表同步")
+            return
 
-    def _get_cached_token(self) -> Optional[str]:
-        """获取缓存的 Trakt Access Token(如果未过期)"""
-        now_ts = int(time.time())
-        token_data = self.get_data("trakt_token") or {}
-        access_token = token_data.get("access_token")
-        expires_at = int(token_data.get("expires_at") or 0)
-        if access_token and expires_at > now_ts:
-            return access_token
-        return None
+        # 豆瓣无法将电影设置为在看，仅同步剧集
+        episodes = self._trakt_helper.fetch_playback("/sync/playback/episodes", access_token)
 
-    def _create_device_code_and_wait(self) -> Optional[str]:
-        """创建 Trakt 设备码并阻塞等待用户授权（最多10分钟）
+        if not episodes:
+            logger.debug("Trakt 播放进度列表为空，无未看完的条目")
+            self.save_data("watching", {})
+            return
 
-        Returns:
-            Optional[str]: 获取到的 access_token，失败返回 None
+        watching: Dict[str, Any] = self.get_data("watching") or {}
+        success_count = 0
+
+        for e in episodes:
+            if not e.get("show"):
+                continue
+            try:
+                self._trakt_helper.sync_one_progress(
+                    {"progress": e.get("progress"), "show": e.get("show")},
+                    "show",
+                    MediaType.TV,
+                    watching,
+                    self._douban_helper,
+                    self._private,
+                )
+                success_count += 1
+            except Exception as ex:
+                logger.error("同步播放进度失败: %s", ex, exc_info=True)
+
+        self.save_data("watching", watching)
+        logger.info("Trakt 播放进度同步完成: 成功 %d 条", success_count)
+
+    def _sync_weread(self) -> None:
+        """同步微信读书最近阅读记录，持久化并打印日志摘要。"""
+        if not self._weread_cookie:
+            logger.debug("未配置微信读书 Cookie，跳过同步")
+            return
+
+        if not self._weread_helper:
+            self._weread_helper = WereadHelper(
+                cookie_string=self._weread_cookie,
+                notify_fn=self._send_bark_notification,
+            )
+
+        logger.info("开始同步微信读书最近阅读记录...")
+        books = self._weread_helper.get_recent_books(
+            limit=self._weread_limit,
+            include_progress=True,
+        )
+
+        if not books:
+            logger.info("微信读书未获取到最近阅读记录（Cookie 可能已失效或书架为空）")
+            return
+
+        self.save_data("weread_books", books)
+
+        logger.info("微信读书同步完成，共 %d 本：", len(books))
+        for i, book in enumerate(books, 1):
+            time_str = WereadHelper.format_reading_time(book.get("reading_time", 0))
+            progress = book.get("reading_progress", 0)
+            status = book.get("status", "")
+            logger.info(
+                "  %2d. 【%s】%s - %s | 进度 %s%% | 累计 %s",
+                i, status, book.get("title", ""), book.get("author", ""), progress, time_str,
+            )
+
+    def _sync_netease(self) -> None:
+        """同步网易云音乐最近一周听歌专辑到豆瓣「听过」。
+
+        流程：
+        1. 拉取最近一周播放记录，按专辑聚合
+        2. 对每张专辑用豆瓣搜索（cat=1003）找到对应 subject_id
+        3. 调用 set_music_status("collect") 标记为「听过」
+        4. 结果持久化到插件数据 "netease_albums"
         """
-        url = f"{TRAKT_API_BASE}/oauth/device/code"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "trakt-api-version": TRAKT_API_VERSION,
-            "trakt-api-key": self._trakt_client_id,
+        if not self._netease_cookie:
+            logger.debug("未配置网易云音乐 Cookie，跳过同步")
+            return
+
+        if not self._netease_helper:
+            # NeteaseHelper.__init__ 现在直接接受 Cookie 字符串
+            self._netease_helper = NeteaseHelper(
+                cookies=self._netease_cookie,
+                notify_fn=self._send_bark_notification,
+            )
+
+        logger.info("开始同步网易云音乐最近听歌记录到豆瓣...")
+
+        albums = self._netease_helper.get_recent_albums(limit=self._netease_limit)
+        if not albums:
+            logger.info("网易云音乐未获取到最近专辑记录（Cookie 可能已失效或暂无听歌记录）")
+            return
+
+        # 已同步缓存（key = 豆瓣 subject_id，避免重复提交）
+        synced: Dict[str, Any] = self.get_data("netease_albums") or {}
+
+        success_count = 0
+        skip_count = 0
+        fail_count = 0
+
+        for album_info in albums:
+            album_name = album_info.get("album") or ""
+            artist = album_info.get("artist") or ""
+            if not album_name:
+                continue
+
+            # 用「专辑名 + 艺术家」拼接搜索关键词，精度更高
+            keyword = f"{album_name} {artist}".strip() if artist else album_name
+
+            # 搜索豆瓣音乐 subject_id
+            try:
+                douban_title, subject_id = self._douban_helper.get_music_subject_id(keyword)
+            except Exception as e:
+                logger.warning("豆瓣音乐搜索异常 [%s]: %s", keyword, e)
+                fail_count += 1
+                continue
+
+            if not subject_id:
+                logger.debug("豆瓣未找到音乐条目: %s", keyword)
+                fail_count += 1
+                continue
+
+            # 已同步过则跳过
+            if subject_id in synced:
+                logger.debug("豆瓣音乐已同步过，跳过: %s (id=%s)", douban_title or album_name, subject_id)
+                skip_count += 1
+                continue
+
+            # 提交「听过」状态
+            ok = self._douban_helper.set_music_status(
+                subject_id=subject_id,
+                status="collect",
+                private=self._private,
+                rating=None,
+            )
+            if ok:
+                synced[subject_id] = {
+                    "douban_id": subject_id,
+                    "douban_title": douban_title or album_name,
+                    "album": album_name,
+                    "artist": artist,
+                    "song_count": album_info.get("song_count", 0),
+                    "total_play_count": album_info.get("total_play_count", 0),
+                    "songs": album_info.get("songs", []),
+                    "sync_time": int(time.time()),
+                }
+                logger.info(
+                    "网易云 → 豆瓣 听过: %s - %s (id=%s, 累计播放 %d 次)",
+                    artist, album_name, subject_id, album_info.get("total_play_count", 0)
+                )
+                success_count += 1
+            else:
+                logger.warning("豆瓣音乐提交失败: %s (id=%s)", album_name, subject_id)
+                fail_count += 1
+
+        self.save_data("netease_albums", synced)
+        logger.info(
+            "网易云音乐同步完成: 成功 %d，跳过 %d（已同步），失败/未匹配 %d",
+            success_count, skip_count, fail_count,
+        )
+
+    # ------------------------------------------------------------------
+    # 辅助工具
+    # ------------------------------------------------------------------
+
+    def _merge_update_config(self, patch: Dict[str, Any]) -> None:
+        """将 patch 合并到当前配置后调用 update_config（避免覆盖其他字段）。"""
+        current = {
+            "enable": self._enable,
+            "trakt_username": self._trakt_username,
+            "trakt_client_id": self._trakt_client_id,
+            "trakt_client_secret": self._trakt_client_secret,
+            "trakt_access_token": self._trakt_access_token,
+            "douban_cookie": self._douban_cookie,
+            "weread_cookie": self._weread_cookie,
+            "weread_limit": self._weread_limit,
+            "netease_cookie": self._netease_cookie,
+            "netease_limit": self._netease_limit,
+            "private": self._private,
+            "sync_type": self._sync_type,
+            "max_sync_count": self._max_sync_count,
+            "cron": self._cron,
+            "bark_webhook_url": self._bark_webhook_url,
         }
-        try:
-            resp = RequestUtils(timeout=10, headers=headers).post_res(
-                url=url,
-                json={"client_id": self._trakt_client_id},
-            )
-            if not resp or resp.status_code != 200:
-                logger.warning("获取 Trakt 设备码失败: %s %s",
-                               getattr(resp, "status_code", None),
-                               getattr(resp, "text", "")[:200])
-                return None
-
-            data = resp.json()
-            device_code = data.get("device_code")
-            user_code = data.get("user_code")
-            verification_url = data.get("verification_url")
-            interval = int(data.get("interval") or 5)
-            expires_in = int(data.get("expires_in") or 600)
-
-            if not device_code or not user_code or not verification_url:
-                logger.warning("Trakt 设备码返回内容不完整: %s", data)
-                return None
-
-            # 发送授权通知
-            msg = (
-                f"Trakt 评分同步豆瓣需要授权。\n\n"
-                f"请在浏览器打开: {verification_url}\n"
-                f"并输入授权码: {user_code}\n\n"
-                f"系统将等待 10 分钟，请在此时间内完成授权。"
-            )
-            self._send_bark_notification("Trakt 评分同步豆瓣 授权", msg)
-            logger.info(f"Trakt 设备码已生成: {user_code}")
-            logger.info(f"授权链接: {verification_url}")
-            logger.info("系统将阻塞等待授权，最多等待 10 分钟...")
-
-            # 阻塞轮询，最多等待 10 分钟
-            max_wait_seconds = 600  # 10 分钟
-            start_time = time.time()
-            attempt = 0
-
-            while time.time() - start_time < max_wait_seconds:
-                attempt += 1
-                elapsed = int(time.time() - start_time)
-                logger.info(f"第 {attempt} 次尝试获取 token (已等待 {elapsed} 秒)...")
-
-                # 尝试交换 token
-                access_token = self._exchange_device_token(device_code)
-                if access_token:
-                    logger.info(f"✅ 授权成功! 用时 {elapsed} 秒")
-                    self._send_bark_notification(
-                        "Trakt 授权成功",
-                        f"Trakt 授权已完成，用时 {elapsed} 秒。\n未看完列表同步功能已启用。"
-                    )
-                    return access_token
-
-                # 等待一段时间再试
-                time.sleep(interval)
-
-            # 超时
-            logger.warning("❌ Trakt 授权超时（等待了 10 分钟）")
-            self._send_bark_notification(
-                "Trakt 授权超时",
-                "等待授权超时（10分钟）。请重新运行同步任务或手动配置 Access Token。"
-            )
-            return None
-
-        except Exception as e:
-            logger.error("Trakt 设备码授权流程异常: %s", e, exc_info=True)
-            return None
-
-    def _exchange_device_token(self, device_code: str) -> Optional[str]:
-        """使用设备码交换 Trakt Access Token
-
-        Args:
-            device_code: 设备码
-
-        Returns:
-            Optional[str]: access_token，失败或等待中返回 None
-        """
-        url = f"{TRAKT_API_BASE}/oauth/device/token"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "trakt-api-version": TRAKT_API_VERSION,
-            "trakt-api-key": self._trakt_client_id,
-        }
-        try:
-            resp = RequestUtils(timeout=10, headers=headers).post_res(
-                url=url,
-                json={
-                    "code": device_code,
-                    "client_id": self._trakt_client_id,
-                    "client_secret": self._trakt_client_secret,
-                },
-            )
-            if not resp:
-                return None
-
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception as e:
-                    logger.debug("解析 Trakt Access Token 响应失败: %s", e)
-                    return None
-
-                access_token = data.get("access_token")
-                expires_in = int(data.get("expires_in") or 0)
-
-                if access_token and expires_in > 0:
-                    # 保存 token 到插件数据
-                    expires_at = int(time.time()) + expires_in - 60
-                    self.save_data("trakt_token", {
-                        "access_token": access_token,
-                        "expires_at": expires_at,
-                    })
-
-                    current_config = {
-                        "enable": self._enable,
-                        "trakt_username": self._trakt_username,
-                        "trakt_client_id": self._trakt_client_id,
-                        "trakt_client_secret": self._trakt_client_secret,
-                        "trakt_access_token": access_token,  # ✅ 只更新这个字段
-                        "douban_cookie": self._douban_cookie,
-                        "private": self._private,
-                        "sync_type": self._sync_type,
-                        "max_sync_count": self._max_sync_count,
-                        "cron": self._cron,
-                        "bark_webhook_url": self._bark_webhook_url,
-                    }
-                    self.update_config(current_config)
-
-                    logger.info(f"✅ Access Token 已保存到配置（有效期约 {expires_in // 3600} 小时）")
-
-                    return access_token
-
-                return None
-
-            if resp.status_code == 400:
-                # 授权等待中或失败
-                try:
-                    err = (resp.json().get("error") or "").lower()
-                except Exception:
-                    err = ""
-
-                if err in ("authorization_pending", "slow_down"):
-                    # 等待用户授权
-                    return None
-                else:
-                    # 授权失败
-                    logger.debug(f"Trakt 授权错误: {err}")
-                    return None
-
-            return None
-        except Exception as e:
-            logger.debug(f"交换 token 异常: {e}")
-            return None
-
-    def _get_trakt_access_token_for_playback(self) -> Optional[str]:
-        """获取用于 /sync/playback 的 Trakt Access Token（阻塞式设备授权）
-
-        优先顺序:
-        1. 配置中的 trakt_access_token（始终视为有效，由用户自行维护）
-        2. 插件数据中缓存的 trakt_token（包含 access_token 与 expires_at）
-        3. 若无有效 token，启动设备码授权流程（阻塞等待10分钟）
-        """
-        # 1. 配置中显式提供的 Access Token，直接使用
-        if self._trakt_access_token:
-            logger.info("使用配置的 Access Token")
-            return self._trakt_access_token
-
-        # 2. 检查已缓存的 token
-        cached_token = self._get_cached_token()
-        if cached_token:
-            logger.info("使用缓存的 Access Token")
-            return cached_token
-
-        # 3. 启动设备码授权流程（阻塞等待）
-        if not self._trakt_client_id or not self._trakt_client_secret:
-            logger.debug("未配置 Trakt Client Secret，无法自动获取 Access Token")
-            return None
-
-        logger.info("开始 Trakt 设备码授权流程...")
-        return self._create_device_code_and_wait()
-
-    # ***************************************************************** Bark 通知 *****************************************************************
+        current.update(patch)
+        self.update_config(current)
 
     def _send_bark_notification(self, title: str, content: str) -> bool:
-        """发送 Bark 通知（POST JSON 方式）
+        """发送 Bark 推送通知（POST JSON 方式）。
 
         参考: https://github.com/Finb/Bark
-
-        Args:
-            title: 通知标题
-            content: 通知内容
-
-        Returns:
-            bool: 发送是否成功
         """
         if not self._bark_webhook_url:
             logger.debug("未配置 Bark Webhook URL，跳过通知发送")
             return False
-
         try:
-            url = self._bark_webhook_url.rstrip('/')
+            url = self._bark_webhook_url.rstrip("/")
             payload = {
                 "title": title,
                 "body": content,
-                "group": "Trakt同步",
-                "sound": "bell"
+                "group": "豆瓣书影音同步",
+                "sound": "bell",
             }
-
-            logger.debug(f"发送 Bark 通知: {title}")
-            resp = RequestUtils(timeout=10, headers={"Content-Type": "application/json"}).post_res(
-                url=url,
-                json=payload
-            )
-
+            logger.debug("发送 Bark 通知: %s", title)
+            resp = RequestUtils(
+                timeout=10, headers={"Content-Type": "application/json"}
+            ).post_res(url=url, json=payload)
             if resp and resp.status_code == 200:
-                logger.info(f"✅ Bark 通知发送成功: {title}")
+                logger.info("✅ Bark 通知发送成功: %s", title)
                 return True
-            else:
-                logger.warning(f"❌ Bark 通知发送失败: HTTP {getattr(resp, 'status_code', 'None')}")
-                return False
+            logger.warning("❌ Bark 通知发送失败: HTTP %s", getattr(resp, "status_code", "None"))
+            return False
         except Exception as e:
-            logger.error(f"❌ Bark 通知发送异常: {e}")
+            logger.error("❌ Bark 通知发送异常: %s", e)
             return False
 
-    # ***************************************************************** 插件配置 *****************************************************************
+    # ------------------------------------------------------------------
+    # 插件接口
+    # ------------------------------------------------------------------
+
+    def get_state(self) -> bool:
+        return self._enable
+
+    def stop_service(self):
+        pass
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        return []
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "path": "/sync",
+                "endpoint": self._api_sync,
+                "methods": ["GET", "POST"],
+                "summary": "手动执行同步",
+                "description": "立即执行一次 Trakt 评分同步到豆瓣",
+            }
+        ]
+
+    def _api_sync(self) -> Dict[str, Any]:
+        """手动触发同步（API 端点）。"""
+        try:
+            self.run()
+            return {"success": True, "message": "同步任务已执行"}
+        except Exception as e:
+            logger.error("手动同步失败: %s", e, exc_info=True)
+            return {"success": False, "message": str(e)}
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        if not self._enable:
+            return []
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+            cron = (self._cron or "").strip() or "0 2 * * *"
+            trigger = CronTrigger.from_crontab(cron)
+        except Exception as e:
+            logger.warning("Trakt 评分同步插件 cron 解析失败，使用默认 0 2 * * *: %s", e)
+            try:
+                from apscheduler.triggers.cron import CronTrigger
+                trigger = CronTrigger.from_crontab("0 2 * * *")
+            except Exception:
+                trigger = None
+        if trigger is None:
+            return []
+        return [
+            {
+                "id": "trakt_ratings_sync",
+                "name": "豆瓣书影音同步",
+                "trigger": trigger,
+                "func": self.run,
+                "kwargs": {},
+            }
+        ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
@@ -921,6 +658,64 @@ class TraktRatingsSync(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 10},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "weread_cookie",
+                                            "label": "微信读书 Cookie（可选）",
+                                            "placeholder": "从浏览器打开 weread.qq.com，复制完整 Cookie 粘贴到此处（需包含 wr_skey）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 2},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "weread_limit",
+                                            "label": "微信读书同步数量",
+                                            "placeholder": "20",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 10},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "netease_cookie",
+                                            "label": "网易云音乐 Cookie（可选）",
+                                            "placeholder": "从浏览器 DevTools → Application → Cookies 中复制 MUSIC_U 等字段",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 2},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "netease_limit",
+                                            "label": "网易云同步专辑数",
+                                            "placeholder": "20",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -935,12 +730,15 @@ class TraktRatingsSync(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "📌 使用说明：\n"
-                                                    "1. 在 https://trakt.tv/oauth/applications 创建应用获取 Client ID\n"
-                                                    "2. 填写 Client Secret 启用自动授权（首次同步时会通过 Bark 发送授权链接，系统阻塞等待10分钟）\n"
-                                                    "3. 授权成功后，Access Token 会自动回填到配置中\n"
-                                                    "4. 豆瓣 Cookie 需从浏览器手动复制，失效时会通过 Bark 推送通知提醒更新\n"
-                                                    "5. 支持同步电影和电视剧评分，以及未看完列表为「在看」",
+                                            "text": (
+                                                "📌 使用说明：\n"
+                                                "1. 在 https://trakt.tv/oauth/applications 创建应用获取 Client ID\n"
+                                                "2. 填写 Client Secret 启用自动授权（首次同步时会通过 Bark 发送授权链接，系统阻塞等待10分钟）\n"
+                                                "3. 授权成功后，Access Token 会自动回填到配置中\n"
+                                                "4. 豆瓣 Cookie 需从浏览器手动复制，失效时会通过 Bark 推送通知提醒更新\n"
+                                                "5. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
+                                                "6. 网易云音乐 Cookie 填写后，会将最近一周听歌记录按专辑聚合，同步到豆瓣音乐「听过」"
+                                            ),
                                         },
                                     }
                                 ],
@@ -956,6 +754,10 @@ class TraktRatingsSync(_PluginBase):
             "trakt_client_secret": "",
             "trakt_access_token": "",
             "douban_cookie": "",
+            "weread_cookie": "",
+            "weread_limit": 20,
+            "netease_cookie": "",
+            "netease_limit": 20,
             "private": True,
             "sync_type": "all",
             "max_sync_count": 0,
@@ -964,42 +766,247 @@ class TraktRatingsSync(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """获取插件详情页面,显示同步历史记录（包括看完和在看）"""
+        """插件详情页：展示 Trakt 同步历史（看完/在看）、微信读书最近阅读、网易云音乐同步记录。"""
         finished = self.get_data("finished") or {}
         watching = self.get_data("watching") or {}
 
-        # 兼容旧数据：如果 finished 为空但 synced 有数据，则迁移
+        # 兼容旧数据：synced → finished
         if not finished:
             synced = self.get_data("synced") or {}
             if synced:
                 logger.info("检测到旧数据格式，迁移 synced -> finished")
                 finished = synced
                 self.save_data("finished", finished)
-                # 可选：删除旧数据
-                # self.save_data("synced", {})
 
-        # 合并看完和在看的数据
-        all_items = {}
-
-        # 添加看完的记录
-        for key, item in finished.items():
+        # 合并看完和在看（同一 douban_id 优先显示看完）
+        all_items: Dict[str, Any] = {}
+        for item in finished.values():
             douban_id = item.get("douban_id")
             if douban_id:
                 all_items[douban_id] = item
-
-        # 添加在看的记录（如果同一个 douban_id 既有看完又有在看，优先显示看完）
-        for key, item in watching.items():
+        for item in watching.values():
             douban_id = item.get("douban_id")
             if douban_id and douban_id not in all_items:
                 all_items[douban_id] = item
 
-        history_list = list(all_items.values())
+        history_list = sorted(all_items.values(), key=lambda x: x.get("sync_time", 0), reverse=True)[:100]
 
-        # 按同步时间倒序排列（最新的在前）
-        history_list.sort(key=lambda x: x.get("sync_time", 0), reverse=True)
+        # 微信读书区块
+        weread_books: List[Dict[str, Any]] = self.get_data("weread_books") or []
+        weread_section: List[dict] = []
+        if weread_books:
+            weread_section = [
+                {
+                    "component": "VRow",
+                    "props": {"class": "mt-4"},
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-h6 mb-2"},
+                                    "text": "📚 微信读书 · 最近阅读",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "component": "VTable",
+                    "props": {"hover": True, "fixedHeader": True},
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "书名"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "作者"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "状态"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "进度"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "累计阅读"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "读完时间"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "链接"},
+                            ],
+                        },
+                        {
+                            "component": "tbody",
+                            "content": [
+                                {
+                                    "component": "tr",
+                                    "props": {"key": f"weread_{idx}"},
+                                    "content": [
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": book.get("title", ""),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": book.get("author", "-"),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "content": [
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {
+                                                        "size": "small",
+                                                        "color": (
+                                                            "success" if book.get("status") == "读完"
+                                                            else "primary" if book.get("status") == "在读"
+                                                            else "default"
+                                                        ),
+                                                        "variant": "flat",
+                                                    },
+                                                    "text": book.get("status", "在读"),
+                                                }
+                                            ],
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": f"{book.get('reading_progress', 0)}%",
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": WereadHelper.format_reading_time(book.get("reading_time", 0)),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": book.get("finished_date") or "-",
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "content": [
+                                                {
+                                                    "component": "VBtn",
+                                                    "props": {
+                                                        "variant": "text",
+                                                        "color": "primary",
+                                                        "size": "small",
+                                                        "href": book.get("weread_url", ""),
+                                                        "target": "_blank",
+                                                    },
+                                                    "text": "🔗 阅读",
+                                                }
+                                            ] if book.get("weread_url") else [],
+                                        },
+                                    ],
+                                }
+                                for idx, book in enumerate(weread_books)
+                            ],
+                        },
+                    ],
+                },
+            ]
 
-        # 限制显示最近 100 条
-        history_list = history_list[:100]
+        # 网易云音乐同步记录区块
+        netease_synced: Dict[str, Any] = self.get_data("netease_albums") or {}
+        netease_list = sorted(
+            netease_synced.values(), key=lambda x: x.get("sync_time", 0), reverse=True
+        )[:100]
+        netease_section: List[dict] = []
+        if netease_list:
+            netease_section = [
+                {
+                    "component": "VRow",
+                    "props": {"class": "mt-4"},
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-h6 mb-2"},
+                                    "text": "🎵 网易云音乐 · 听过专辑",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "component": "VTable",
+                    "props": {"hover": True, "fixedHeader": True},
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "专辑"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "艺术家"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "曲目数"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "累计播放"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "同步时间"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "豆瓣"},
+                            ],
+                        },
+                        {
+                            "component": "tbody",
+                            "content": [
+                                {
+                                    "component": "tr",
+                                    "props": {"key": f"netease_{idx}"},
+                                    "content": [
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": rec.get("douban_title") or rec.get("album", "-"),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": rec.get("artist", "-"),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": str(rec.get("song_count", "-")),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": str(rec.get("total_play_count", "-")),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": (
+                                                datetime.fromtimestamp(rec["sync_time"]).strftime("%Y-%m-%d %H:%M")
+                                                if rec.get("sync_time") else "-"
+                                            ),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "content": [
+                                                {
+                                                    "component": "VBtn",
+                                                    "props": {
+                                                        "variant": "text",
+                                                        "color": "primary",
+                                                        "size": "small",
+                                                        "href": f"https://music.douban.com/subject/{rec.get('douban_id', '')}/",
+                                                        "target": "_blank",
+                                                    },
+                                                    "text": f"🔗 {rec.get('douban_id', '')}",
+                                                }
+                                            ] if rec.get("douban_id") else [],
+                                            "text": "-" if not rec.get("douban_id") else None,
+                                        },
+                                    ],
+                                }
+                                for idx, rec in enumerate(netease_list)
+                            ],
+                        },
+                    ],
+                },
+            ]
 
         if not history_list:
             return [
@@ -1008,62 +1015,27 @@ class TraktRatingsSync(_PluginBase):
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": "暂无同步历史记录",
+                        "text": "暂无 Trakt 同步历史记录",
                     },
                 }
-            ]
+            ] + weread_section + netease_section
 
-        return [
+        trakt_table = [
             {
                 "component": "VTable",
-                "props": {
-                    "hover": True,
-                    "fixedHeader": True,
-                },
+                "props": {"hover": True, "fixedHeader": True},
                 "content": [
                     {
                         "component": "thead",
                         "content": [
-                            {
-                                "component": "th",
-                                "props": {"class": "text-start ps-4"},
-                                "text": "标题",
-                            },
-                            {
-                                "component": "th",
-                                "props": {"class": "text-start ps-4"},
-                                "text": "年份",
-                            },
-                            {
-                                "component": "th",
-                                "props": {"class": "text-start ps-4"},
-                                "text": "类型",
-                            },
-                            {
-                                "component": "th",
-                                "props": {"class": "text-start ps-4"},
-                                "text": "状态",
-                            },
-                            {
-                                "component": "th",
-                                "props": {"class": "text-start ps-4"},
-                                "text": "Trakt 评分",
-                            },
-                            {
-                                "component": "th",
-                                "props": {"class": "text-start ps-4"},
-                                "text": "豆瓣评分",
-                            },
-                            {
-                                "component": "th",
-                                "props": {"class": "text-start ps-4"},
-                                "text": "同步时间",
-                            },
-                            {
-                                "component": "th",
-                                "props": {"class": "text-start ps-4"},
-                                "text": "豆瓣 ID",
-                            },
+                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "标题"},
+                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "年份"},
+                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "类型"},
+                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "状态"},
+                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "Trakt 评分"},
+                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "豆瓣评分"},
+                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "同步时间"},
+                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "豆瓣 ID"},
                         ],
                     },
                     {
@@ -1076,17 +1048,17 @@ class TraktRatingsSync(_PluginBase):
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": f"{item.get('title', '未知')}",
+                                        "text": item.get("title", "未知"),
                                     },
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": str(item.get('year', '-')),
+                                        "text": str(item.get("year", "-")),
                                     },
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": item.get('media_type') if item.get('media_type') else "-",
+                                        "text": item.get("media_type") or "-",
                                     },
                                     {
                                         "component": "td",
@@ -1096,30 +1068,30 @@ class TraktRatingsSync(_PluginBase):
                                                 "component": "VChip",
                                                 "props": {
                                                     "size": "small",
-                                                    "color": "success" if item.get('status') == "看完" else "primary",
+                                                    "color": "success" if item.get("status") == "看完" else "primary",
                                                     "variant": "flat",
                                                 },
-                                                "text": item.get('status', '在看'),
+                                                "text": item.get("status", "在看"),
                                             }
                                         ],
                                     },
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": str(item.get('trakt_rating', '-')) if item.get(
-                                            'status') == "看完" else "-",
+                                        "text": str(item.get("trakt_rating", "-")) if item.get("status") == "看完" else "-",
                                     },
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": str(item.get('douban_rating', '-')) if item.get(
-                                            'status') == "看完" else "-",
+                                        "text": str(item.get("douban_rating", "-")) if item.get("status") == "看完" else "-",
                                     },
                                     {
                                         "component": "td",
                                         "props": {"class": "text-start ps-4"},
-                                        "text": datetime.fromtimestamp(item.get('sync_time', 0)).strftime(
-                                            '%Y-%m-%d %H:%M') if item.get('sync_time') else "-",
+                                        "text": (
+                                            datetime.fromtimestamp(item["sync_time"]).strftime("%Y-%m-%d %H:%M")
+                                            if item.get("sync_time") else "-"
+                                        ),
                                     },
                                     {
                                         "component": "td",
@@ -1136,8 +1108,8 @@ class TraktRatingsSync(_PluginBase):
                                                 },
                                                 "text": f"🔗 {item.get('douban_id', '')}",
                                             }
-                                        ] if item.get('douban_id') else [],
-                                        "text": "-" if not item.get('douban_id') else None,
+                                        ] if item.get("douban_id") else [],
+                                        "text": "-" if not item.get("douban_id") else None,
                                     },
                                 ],
                             }
@@ -1147,59 +1119,4 @@ class TraktRatingsSync(_PluginBase):
                 ],
             }
         ]
-
-    def get_state(self) -> bool:
-        return self._enable
-
-    def stop_service(self):
-        pass
-
-    @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
-        return []
-
-    def get_api(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "path": "/sync",
-                "endpoint": self._api_sync,
-                "methods": ["GET", "POST"],
-                "summary": "手动执行同步",
-                "description": "立即执行一次 Trakt 评分同步到豆瓣",
-            }
-        ]
-
-    def _api_sync(self) -> Dict[str, Any]:
-        """手动触发同步(API)"""
-        try:
-            self.run()
-            return {"success": True, "message": "同步任务已执行"}
-        except Exception as e:
-            logger.error(f"手动同步失败: {e}", exc_info=True)
-            return {"success": False, "message": str(e)}
-
-    def get_service(self) -> List[Dict[str, Any]]:
-        if not self._enable:
-            return []
-        try:
-            from apscheduler.triggers.cron import CronTrigger
-            cron = (self._cron or "").strip() or "0 2 * * *"
-            trigger = CronTrigger.from_crontab(cron)
-        except Exception as e:
-            logger.warning(f"Trakt 评分同步插件 cron 解析失败,使用默认 0 2 * * *: {e}")
-            try:
-                from apscheduler.triggers.cron import CronTrigger
-                trigger = CronTrigger.from_crontab("0 2 * * *")
-            except Exception:
-                trigger = None
-        if trigger is None:
-            return []
-        return [
-            {
-                "id": "trakt_ratings_sync",
-                "name": "Trakt 评分同步豆瓣",
-                "trigger": trigger,
-                "func": self.run,
-                "kwargs": {},
-            }
-        ]
+        return trakt_table + weread_section + netease_section

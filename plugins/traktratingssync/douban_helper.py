@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 豆瓣书影音档案 Helper（本插件自包含，不依赖 doubanSync 插件）
-用于提交「看过」状态及评分到豆瓣。Cookie 需在插件配置中手动填写。
+用于提交「看过/在看」「读过/在读」「听过」状态及评分到豆瓣。
+Cookie 需在插件配置中手动填写，失效时通过注入的 notify_fn 通知用户。
 """
 import re
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 from urllib.parse import unquote
 
 import requests
@@ -18,9 +19,27 @@ from app.utils.http import RequestUtils
 
 
 class DoubanHelper:
-    """豆瓣 Cookie 登录与状态/评分提交。Cookie 需在插件配置中手动填写。"""
+    """豆瓣 Cookie 登录与状态/评分提交。
 
-    def __init__(self, user_cookie: Optional[str] = None):
+    Args:
+        user_cookie: 从浏览器复制的豆瓣 Cookie 字符串
+        notify_fn: Cookie 失效等异常时的通知回调，签名 ``(title: str, body: str) -> None``
+    """
+
+    # 豆瓣各域名
+    _URL_DOUBAN = "https://www.douban.com/"
+    _URL_MOVIE_INTEREST = "https://movie.douban.com/j/subject/{subject_id}/interest"
+    _URL_BOOK_INTEREST = "https://book.douban.com/j/subject/{subject_id}/interest"
+    _URL_MUSIC_INTEREST = "https://music.douban.com/j/subject/{subject_id}/interest"
+    _URL_SEARCH = "https://www.douban.com/search"
+
+    def __init__(
+        self,
+        user_cookie: Optional[str] = None,
+        notify_fn: Optional[Callable[[str, str], None]] = None,
+    ):
+        self._notify = notify_fn or (lambda title, body: None)
+
         if user_cookie:
             self.cookies = {k: v.value for k, v in SimpleCookie(user_cookie).items()}
         else:
@@ -42,13 +61,15 @@ class DoubanHelper:
         self._authenticated = False
 
         if self.cookies:
-            self.set_ck()
+            self._refresh_ck()
             self.ck = self.cookies.get("ck")
             if self.ck:
                 self._authenticated = True
-                logger.debug(f"豆瓣认证成功 ck:{self.ck}")
+                logger.debug("豆瓣认证成功 ck:%s", self.ck)
             else:
-                logger.error("获取豆瓣 ck 失败，Cookie 可能已失效，请在插件配置中更新豆瓣 Cookie")
+                msg = "豆瓣 Cookie 已失效，请重新从浏览器复制并更新配置。"
+                logger.error(msg)
+                self._notify("豆瓣 Cookie 已失效", msg)
         else:
             self.ck = None
 
@@ -57,245 +78,188 @@ class DoubanHelper:
         """返回豆瓣 Cookie 是否有效（ck 已成功获取）"""
         return self._authenticated
 
-    def set_ck(self) -> None:
-        """刷新豆瓣 ck"""
-        self.headers["Cookie"] = ";".join([f"{key}={value}" for key, value in self.cookies.items()])
-        response = requests.get("https://www.douban.com/", headers=self.headers, timeout=10)
+    # ------------------------------------------------------------------
+    # 内部工具
+    # ------------------------------------------------------------------
+
+    def _refresh_ck(self) -> None:
+        """访问豆瓣首页刷新 ck Cookie"""
+        self.headers["Cookie"] = ";".join(f"{k}={v}" for k, v in self.cookies.items())
+        try:
+            response = requests.get(self._URL_DOUBAN, headers=self.headers, timeout=10)
+        except Exception as e:
+            logger.warning("刷新豆瓣 ck 请求失败: %s", e)
+            self.cookies["ck"] = ""
+            return
         ck_str = response.headers.get("Set-Cookie", "")
-        logger.debug(ck_str)
+        logger.debug("豆瓣 Set-Cookie: %s", ck_str)
         if not ck_str:
             self.cookies["ck"] = ""
             return
-        cookie_parts = ck_str.split(";")
-        ck = cookie_parts[0].split("=")[1].strip()
-        logger.debug(ck)
-        if ck == '"deleted"':
-            self.cookies["ck"] = ""
-        else:
-            self.cookies["ck"] = ck
+        ck = ck_str.split(";")[0].split("=")[1].strip()
+        self.cookies["ck"] = "" if ck == '"deleted"' else ck
 
-    def get_subject_id(self, title: Optional[str] = None, meta: Optional[MetaBase] = None) -> Tuple[Optional[str], Optional[str]]:
-        """根据标题在豆瓣搜索，返回 (subject_name, subject_id)"""
+    def _build_headers(self, referer: str, host: str) -> dict:
+        """构造带 Referer / Host / Cookie 的请求头"""
+        return {
+            **self.headers,
+            "Referer": referer,
+            "Origin": f"https://{host}",
+            "Host": host,
+            "Cookie": ";".join(f"{k}={v}" for k, v in self.cookies.items()),
+        }
+
+    def _post_interest(self, url: str, referer: str, host: str, data: dict) -> bool:
+        """向豆瓣提交 interest 请求，统一处理响应和 Cookie 失效检测"""
+        headers = self._build_headers(referer, host)
+        try:
+            response = requests.post(url=url, headers=headers, data=data, timeout=10)
+        except Exception as e:
+            logger.error("请求豆瓣失败: %s", e)
+            return False
+        if not response:
+            logger.error("豆瓣未返回内容")
+            return False
+        if response.status_code == 403:
+            msg = "豆瓣返回 403，Cookie 可能已失效，请重新从浏览器复制并更新配置。"
+            logger.error(msg)
+            self._notify("豆瓣 Cookie 已失效", msg)
+            return False
+        if response.status_code == 200:
+            ret = response.json().get("r")
+            if isinstance(ret, bool) and ret is False:
+                logger.error("豆瓣提交失败（条目未开播或不存在）: url=%s", url)
+                return False
+            return True
+        logger.error("豆瓣返回异常 %s: %s", response.status_code, response.text[:200])
+        return False
+
+    def _search_subject(self, keyword: str, cat: str) -> Tuple[Optional[str], Optional[str]]:
+        """通用豆瓣搜索（cat=1001图书/1002影视/1003音乐），返回 (title, subject_id)"""
+        url = self._URL_SEARCH
+        response = RequestUtils(headers=self.headers, timeout=10).get_res(
+            url=url, params={"cat": cat, "q": keyword}
+        )
+        if not response or response.status_code != 200:
+            logger.error("搜索 [%s] 失败: HTTP %s", keyword, getattr(response, "status_code", None))
+            return None, None
+        soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
+        for div in soup.find_all("div", class_="title"):
+            a_tag = div.find_all("a")
+            if not a_tag:
+                continue
+            a = a_tag[0]
+            link = unquote(a.get("href", ""))
+            match = re.search(r"subject/(\d+)/", link)
+            if match:
+                return (a.string or "").strip(), match.group(1)
+        logger.debug("豆瓣未找到 [%s] 相关条目 (cat=%s)", keyword, cat)
+        return None, None
+
+    # ------------------------------------------------------------------
+    # 搜索接口
+    # ------------------------------------------------------------------
+
+    def get_subject_id(
+        self,
+        title: Optional[str] = None,
+        meta: Optional[MetaBase] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """搜索影视条目，返回 (subject_name, subject_id)"""
         if not title and meta:
             title = meta.title
         if not title:
             return None, None
-        url = f"https://www.douban.com/search?cat=1002&q={title}"
-        response = RequestUtils(headers=self.headers, timeout=10).get_res(url=url)
-        if not response or response.status_code != 200:
-            logger.error(f"搜索 {title} 失败 状态码：{getattr(response, 'status_code', None)}")
-            return None, None
-        soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
-        title_divs = soup.find_all("div", class_="title")
-        subject_items: List[dict] = []
-        for div in title_divs:
-            item = {}
-            a_tag = div.find_all("a")[0]
-            item["title"] = (a_tag.string or "").strip()
-            link = unquote(a_tag.get("href", ""))
-            if "subject/" in link:
-                match = re.search(r"subject/(\d+)/", link)
-                if match:
-                    item["subject_id"] = match.group(1)
-            subject_items.append(item)
-        if not subject_items:
-            logger.error(f"找不到 {title} 相关条目")
-            return None, None
-        first = subject_items[0]
-        return first.get("title"), first.get("subject_id")
+        return self._search_subject(title, "1002")
 
     def get_book_subject_id(self, title: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-        """根据标题在豆瓣搜索图书，返回 (subject_name, subject_id)"""
+        """搜索图书条目，返回 (subject_name, subject_id)"""
         if not title:
             return None, None
-        url = f"https://www.douban.com/search?cat=1001&q={title}"
-        response = RequestUtils(headers=self.headers, timeout=10).get_res(url=url)
-        if not response or response.status_code != 200:
-            logger.error(f"搜索图书 {title} 失败 状态码：{getattr(response, 'status_code', None)}")
-            return None, None
-        soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
-        title_divs = soup.find_all("div", class_="title")
-        subject_items: List[dict] = []
-        for div in title_divs:
-            item = {}
-            a_tag = div.find_all("a")[0]
-            item["title"] = (a_tag.string or "").strip()
-            link = unquote(a_tag.get("href", ""))
-            if "subject/" in link:
-                match = re.search(r"subject/(\d+)/", link)
-                if match:
-                    item["subject_id"] = match.group(1)
-            subject_items.append(item)
-        if not subject_items:
-            logger.error(f"找不到图书 {title} 相关条目")
-            return None, None
-        first = subject_items[0]
-        return first.get("title"), first.get("subject_id")
+        return self._search_subject(title, "1001")
 
     def get_music_subject_id(self, title: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-        """根据标题在豆瓣搜索音乐，返回 (subject_name, subject_id)"""
+        """搜索音乐条目，返回 (subject_name, subject_id)"""
         if not title:
             return None, None
-        url = f"https://www.douban.com/search?cat=1003&q={title}"
-        response = RequestUtils(headers=self.headers, timeout=10).get_res(url=url)
-        if not response or response.status_code != 200:
-            logger.error(f"搜索音乐 {title} 失败 状态码：{getattr(response, 'status_code', None)}")
-            return None, None
-        soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
-        title_divs = soup.find_all("div", class_="title")
-        subject_items: List[dict] = []
-        for div in title_divs:
-            item = {}
-            a_tag = div.find_all("a")[0]
-            item["title"] = (a_tag.string or "").strip()
-            link = unquote(a_tag.get("href", ""))
-            if "subject/" in link:
-                match = re.search(r"subject/(\d+)/", link)
-                if match:
-                    item["subject_id"] = match.group(1)
-            subject_items.append(item)
-        if not subject_items:
-            logger.error(f"找不到音乐 {title} 相关条目")
-            return None, None
-        first = subject_items[0]
-        return first.get("title"), first.get("subject_id")
+        return self._search_subject(title, "1003")
+
+    # ------------------------------------------------------------------
+    # 状态提交接口
+    # ------------------------------------------------------------------
 
     def set_watching_status(
-            self,
-            subject_id: str,
-            status: str = "do",
-            private: bool = True,
-            rating: Optional[int] = None,
+        self,
+        subject_id: str,
+        status: str = "do",
+        private: bool = True,
+        rating: Optional[int] = None,
     ) -> bool:
-        """设置豆瓣观看状态（想看/在看/看过），可选 1–5 星评分"""
-        self.headers["Referer"] = f"https://movie.douban.com/subject/{subject_id}/"
-        self.headers["Origin"] = "https://movie.douban.com"
-        self.headers["Host"] = "movie.douban.com"
-        self.headers["Cookie"] = ";".join([f"{key}={value}" for key, value in self.cookies.items()])
-        data_json = {
+        """设置豆瓣影视观看状态（wish/do/collect），可选 1–5 星评分"""
+        url = self._URL_MOVIE_INTEREST.format(subject_id=subject_id)
+        data = {
             "ck": self.ck,
-            "interest": "do",
-            "rating": "",
+            "interest": status,
+            "rating": str(rating) if rating is not None and 1 <= rating <= 5 else "",
             "foldcollect": "U",
             "tags": "",
             "comment": "",
         }
         if private:
-            data_json["private"] = "on"
-        data_json["interest"] = status
-        if rating is not None and 1 <= rating <= 5:
-            data_json["rating"] = str(rating)
-        try:
-            response = requests.post(
-                url=f"https://movie.douban.com/j/subject/{subject_id}/interest",
-                headers=self.headers,
-                data=data_json,
-                timeout=10,
-            )
-        except Exception as e:
-            logger.error(f"请求豆瓣失败: {e}")
-            return False
-        if not response:
-            logger.error("豆瓣未返回内容")
-            return False
-        if response.status_code == 200:
-            ret = response.json().get("r")
-            ok = False if (isinstance(ret, bool) and ret is False) else True
-            if ok:
-                return True
-            logger.error(f"douban_id: {subject_id} 未开播")
-            return False
-        logger.error(response.text)
-        return False
+            data["private"] = "on"
+        return self._post_interest(
+            url,
+            referer=f"https://movie.douban.com/subject/{subject_id}/",
+            host="movie.douban.com",
+            data=data,
+        )
 
     def set_book_status(
-            self,
-            subject_id: str,
-            status: str = "do",
-            private: bool = True,
-            rating: Optional[int] = None,
+        self,
+        subject_id: str,
+        status: str = "do",
+        private: bool = True,
+        rating: Optional[int] = None,
     ) -> bool:
-        """设置豆瓣图书状态（想读/在读/读过），可选 1–5 星评分"""
-        self.headers["Referer"] = f"https://book.douban.com/subject/{subject_id}/"
-        self.headers["Origin"] = "https://book.douban.com"
-        self.headers["Host"] = "book.douban.com"
-        self.headers["Cookie"] = ";".join([f"{key}={value}" for key, value in self.cookies.items()])
-        data_json = {
+        """设置豆瓣图书状态（wish/do/collect），可选 1–5 星评分"""
+        url = self._URL_BOOK_INTEREST.format(subject_id=subject_id)
+        data = {
             "ck": self.ck,
             "interest": status,
-            "rating": "",
+            "rating": str(rating) if rating is not None and 1 <= rating <= 5 else "",
             "tags": "",
             "comment": "",
         }
         if private:
-            data_json["private"] = "on"
-        if rating is not None and 1 <= rating <= 5:
-            data_json["rating"] = str(rating)
-        try:
-            response = requests.post(
-                url=f"https://book.douban.com/j/subject/{subject_id}/interest",
-                headers=self.headers,
-                data=data_json,
-                timeout=10,
-            )
-        except Exception as e:
-            logger.error(f"请求豆瓣失败: {e}")
-            return False
-        if not response:
-            logger.error("豆瓣未返回内容")
-            return False
-        if response.status_code == 200:
-            ret = response.json().get("r")
-            ok = False if (isinstance(ret, bool) and ret is False) else True
-            if ok:
-                return True
-            logger.error(f"douban_id: {subject_id} 图书状态设置失败")
-            return False
-        logger.error(response.text)
-        return False
+            data["private"] = "on"
+        return self._post_interest(
+            url,
+            referer=f"https://book.douban.com/subject/{subject_id}/",
+            host="book.douban.com",
+            data=data,
+        )
 
     def set_music_status(
-            self,
-            subject_id: str,
-            status: str = "do",
-            private: bool = True,
-            rating: Optional[int] = None,
+        self,
+        subject_id: str,
+        status: str = "do",
+        private: bool = True,
+        rating: Optional[int] = None,
     ) -> bool:
-        """设置豆瓣音乐状态（想听/在听/听过），可选 1–5 星评分"""
-        self.headers["Referer"] = f"https://music.douban.com/subject/{subject_id}/"
-        self.headers["Origin"] = "https://music.douban.com"
-        self.headers["Host"] = "music.douban.com"
-        self.headers["Cookie"] = ";".join([f"{key}={value}" for key, value in self.cookies.items()])
-        data_json = {
+        """设置豆瓣音乐状态（wish/do/collect），可选 1–5 星评分"""
+        url = self._URL_MUSIC_INTEREST.format(subject_id=subject_id)
+        data = {
             "ck": self.ck,
             "interest": status,
-            "rating": "",
+            "rating": str(rating) if rating is not None and 1 <= rating <= 5 else "",
             "tags": "",
             "comment": "",
         }
         if private:
-            data_json["private"] = "on"
-        if rating is not None and 1 <= rating <= 5:
-            data_json["rating"] = str(rating)
-        try:
-            response = requests.post(
-                url=f"https://music.douban.com/j/subject/{subject_id}/interest",
-                headers=self.headers,
-                data=data_json,
-                timeout=10,
-            )
-        except Exception as e:
-            logger.error(f"请求豆瓣失败: {e}")
-            return False
-        if not response:
-            logger.error("豆瓣未返回内容")
-            return False
-        if response.status_code == 200:
-            ret = response.json().get("r")
-            ok = False if (isinstance(ret, bool) and ret is False) else True
-            if ok:
-                return True
-            logger.error(f"douban_id: {subject_id} 音乐状态设置失败")
-            return False
-        logger.error(response.text)
-        return False
+            data["private"] = "on"
+        return self._post_interest(
+            url,
+            referer=f"https://music.douban.com/subject/{subject_id}/",
+            host="music.douban.com",
+            data=data,
+        )
