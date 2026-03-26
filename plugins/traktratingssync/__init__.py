@@ -27,7 +27,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.5.0"
+    plugin_version = "3.6.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -248,7 +248,15 @@ class TraktRatingsSync(_PluginBase):
         logger.info("Trakt 播放进度同步完成: 成功 %d 条", success_count)
 
     def _sync_weread(self) -> None:
-        """同步微信读书最近阅读记录，持久化并打印日志摘要。"""
+        """同步微信读书最近阅读记录到豆瓣「在读/读过」，并持久化打印日志摘要。
+
+        流程：
+        1. 拉取微信读书最近阅读记录（含进度/状态）
+        2. 持久化书单供详情页展示
+        3. 对每本书用豆瓣搜索（cat=1001）找到 subject_id
+        4. 「读完」→ 豆瓣「读过」(collect)；「在读」→ 豆瓣「在读」(do)；其余跳过
+        5. 已同步过（相同 subject_id + 状态未变）则跳过，避免重复提交
+        """
         if not self._weread_cookie:
             logger.debug("未配置微信读书 Cookie，跳过同步")
             return
@@ -269,9 +277,10 @@ class TraktRatingsSync(_PluginBase):
             logger.info("微信读书未获取到最近阅读记录（Cookie 可能已失效或书架为空）")
             return
 
+        # 持久化书单（供详情页展示）
         self.save_data("weread_books", books)
 
-        logger.info("微信读书同步完成，共 %d 本：", len(books))
+        logger.info("微信读书拉取完成，共 %d 本，开始同步到豆瓣：", len(books))
         for i, book in enumerate(books, 1):
             time_str = WereadHelper.format_reading_time(book.get("reading_time", 0))
             progress = book.get("reading_progress", 0)
@@ -280,6 +289,88 @@ class TraktRatingsSync(_PluginBase):
                 "  %2d. 【%s】%s - %s | 进度 %s%% | 累计 %s",
                 i, status, book.get("title", ""), book.get("author", ""), progress, time_str,
             )
+
+        # 已同步缓存（key = 豆瓣 subject_id，value 含已同步的 status，避免重复提交）
+        synced: Dict[str, Any] = self.get_data("weread_synced") or {}
+
+        success_count = 0
+        skip_count = 0
+        fail_count = 0
+
+        for book in books:
+            title = (book.get("title") or "").strip()
+            author = (book.get("author") or "").strip()
+            weread_status = book.get("status") or ""  # "读完" / "在读" / ""
+
+            if not title:
+                continue
+
+            # 仅同步「读完」和「在读」，其余状态（未读等）跳过
+            if weread_status == "读完":
+                douban_status = "collect"
+            elif weread_status == "在读":
+                douban_status = "do"
+            else:
+                logger.debug("跳过非在读/读完书目: %s (status=%s)", title, weread_status)
+                continue
+
+            # 搜索豆瓣图书 subject_id（用「书名 + 作者」精确匹配）
+            keyword = f"{title} {author}".strip() if author else title
+            try:
+                douban_title, subject_id = self._douban_helper.get_book_subject_id(keyword)
+            except Exception as e:
+                logger.warning("豆瓣图书搜索异常 [%s]: %s", keyword, e)
+                fail_count += 1
+                continue
+
+            if not subject_id:
+                logger.debug("豆瓣未找到图书条目: %s", keyword)
+                fail_count += 1
+                continue
+
+            # 已同步且状态未变则跳过
+            cached = synced.get(subject_id) or {}
+            if cached.get("douban_status") == douban_status:
+                logger.debug(
+                    "豆瓣图书已同步过且状态未变，跳过: %s (id=%s, status=%s)",
+                    douban_title or title, subject_id, douban_status,
+                )
+                skip_count += 1
+                continue
+
+            # 提交到豆瓣
+            ok = self._douban_helper.set_book_status(
+                subject_id=subject_id,
+                status=douban_status,
+                private=self._private,
+                rating=None,
+            )
+            if ok:
+                synced[subject_id] = {
+                    "douban_id": subject_id,
+                    "douban_title": douban_title or title,
+                    "douban_status": douban_status,
+                    "weread_title": title,
+                    "author": author,
+                    "weread_status": weread_status,
+                    "reading_progress": book.get("reading_progress", 0),
+                    "sync_time": int(time.time()),
+                }
+                logger.info(
+                    "微信读书 → 豆瓣 %s: %s (id=%s)",
+                    "读过" if douban_status == "collect" else "在读",
+                    douban_title or title, subject_id,
+                )
+                success_count += 1
+            else:
+                logger.warning("豆瓣图书提交失败: %s (id=%s)", title, subject_id)
+                fail_count += 1
+
+        self.save_data("weread_synced", synced)
+        logger.info(
+            "微信读书同步完成: 成功 %d，跳过 %d（已同步），失败/未匹配 %d",
+            success_count, skip_count, fail_count,
+        )
 
     def _sync_netease(self) -> None:
         """同步网易云音乐最近一周听歌专辑到豆瓣「听过」。

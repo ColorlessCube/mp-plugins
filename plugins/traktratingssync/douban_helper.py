@@ -10,7 +10,6 @@ from urllib.parse import unquote
 
 import requests
 from bs4 import BeautifulSoup
-from http.cookies import SimpleCookie
 
 from app.core.config import settings
 from app.core.meta import MetaBase
@@ -41,7 +40,14 @@ class DoubanHelper:
         self._notify = notify_fn or (lambda title, body: None)
 
         if user_cookie:
-            self.cookies = {k: v.value for k, v in SimpleCookie(user_cookie).items()}
+            # 手动 split 解析，兼容浏览器复制的 Cookie 字符串
+            # SimpleCookie 对值含特殊字符的字段会静默跳过，导致关键字段丢失
+            self.cookies = {}
+            for part in user_cookie.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    key, _, value = part.partition("=")
+                    self.cookies[key.strip()] = value.strip()
         else:
             self.cookies = {}
             logger.warning("未配置豆瓣 Cookie，请在插件配置中填写")
