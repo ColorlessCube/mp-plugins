@@ -7,7 +7,6 @@ Cookie 失效时通过注入的 notify_fn 通知用户。
 import json
 import random
 import string
-from http.cookies import SimpleCookie
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
@@ -47,9 +46,15 @@ class NeteaseHelper:
         self._notify = notify_fn or (lambda title, body: None)
 
         # 支持字符串或字典两种形式的 Cookie
+        # 使用手动 split 解析而非 SimpleCookie，后者对浏览器复制的 Cookie 字符串
+        # 解析不可靠（遇到值含 = 等特殊字符时会静默跳过整个字段）
         if isinstance(cookies, str):
-            sc = SimpleCookie(cookies)
-            self.cookies: Dict[str, str] = {k: v.value for k, v in sc.items()}
+            self.cookies: Dict[str, str] = {}
+            for part in cookies.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    key, _, value = part.partition("=")
+                    self.cookies[key.strip()] = value.strip()
         elif isinstance(cookies, dict):
             self.cookies = dict(cookies)
         else:
