@@ -27,7 +27,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.6.0"
+    plugin_version = "3.7.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -253,7 +253,11 @@ class TraktRatingsSync(_PluginBase):
         流程：
         1. 拉取微信读书最近阅读记录（含进度/状态）
         2. 持久化书单供详情页展示
-        3. 对每本书用豆瓣搜索（cat=1001）找到 subject_id
+        3. 对每本书：
+           a. 先查 weread_book_id → douban_subject_id 缓存映射，命中则跳过搜索
+           b. 缓存未命中时，调用 get_book_subject_id(title, author) 搜索豆瓣
+              （内部按「书名+作者 → 纯书名 → 书名截断」逐级 fallback）
+           c. 搜索成功后将映射写入缓存，下次直接复用
         4. 「读完」→ 豆瓣「读过」(collect)；「在读」→ 豆瓣「在读」(do)；其余跳过
         5. 已同步过（相同 subject_id + 状态未变）则跳过，避免重复提交
         """
@@ -293,6 +297,10 @@ class TraktRatingsSync(_PluginBase):
         # 已同步缓存（key = 豆瓣 subject_id，value 含已同步的 status，避免重复提交）
         synced: Dict[str, Any] = self.get_data("weread_synced") or {}
 
+        # weread_book_id → douban_subject_id 映射缓存（避免重复搜索豆瓣）
+        # 结构：{ weread_book_id: { "subject_id": str, "douban_title": str } }
+        book_id_map: Dict[str, Any] = self.get_data("weread_book_id_map") or {}
+
         success_count = 0
         skip_count = 0
         fail_count = 0
@@ -300,6 +308,7 @@ class TraktRatingsSync(_PluginBase):
         for book in books:
             title = (book.get("title") or "").strip()
             author = (book.get("author") or "").strip()
+            weread_book_id = (book.get("book_id") or "").strip()
             weread_status = book.get("status") or ""  # "读完" / "在读" / ""
 
             if not title:
@@ -314,21 +323,49 @@ class TraktRatingsSync(_PluginBase):
                 logger.debug("跳过非在读/读完书目: %s (status=%s)", title, weread_status)
                 continue
 
-            # 搜索豆瓣图书 subject_id（用「书名 + 作者」精确匹配）
-            keyword = f"{title} {author}".strip() if author else title
-            try:
-                douban_title, subject_id = self._douban_helper.get_book_subject_id(keyword)
-            except Exception as e:
-                logger.warning("豆瓣图书搜索异常 [%s]: %s", keyword, e)
-                fail_count += 1
-                continue
+            # ── 方案 2：先查 weread_book_id 缓存映射 ──────────────────────
+            subject_id: Optional[str] = None
+            douban_title: Optional[str] = None
 
+            if weread_book_id and weread_book_id in book_id_map:
+                cached_map = book_id_map[weread_book_id]
+                subject_id = cached_map.get("subject_id")
+                douban_title = cached_map.get("douban_title")
+                logger.debug(
+                    "命中 book_id 缓存: %s → 豆瓣 %s (id=%s)",
+                    title, douban_title, subject_id,
+                )
+
+            # ── 方案 3：缓存未命中，执行 fallback 搜索 ────────────────────
             if not subject_id:
-                logger.debug("豆瓣未找到图书条目: %s", keyword)
-                fail_count += 1
-                continue
+                try:
+                    douban_title, subject_id = self._douban_helper.get_book_subject_id(
+                        title=title, author=author or None
+                    )
+                except Exception as e:
+                    logger.warning("豆瓣图书搜索异常 [%s]: %s", title, e)
+                    fail_count += 1
+                    continue
 
-            # 已同步且状态未变则跳过
+                if not subject_id:
+                    logger.debug("豆瓣未找到图书条目（含 fallback）: %s", title)
+                    fail_count += 1
+                    continue
+
+                # 搜索成功，写入 book_id 映射缓存
+                if weread_book_id:
+                    book_id_map[weread_book_id] = {
+                        "subject_id": subject_id,
+                        "douban_title": douban_title or title,
+                        "weread_title": title,
+                        "author": author,
+                    }
+                    logger.debug(
+                        "新增 book_id 缓存: %s (weread=%s) → 豆瓣 %s (id=%s)",
+                        title, weread_book_id, douban_title, subject_id,
+                    )
+
+            # ── 已同步且状态未变则跳过 ────────────────────────────────────
             cached = synced.get(subject_id) or {}
             if cached.get("douban_status") == douban_status:
                 logger.debug(
@@ -338,7 +375,7 @@ class TraktRatingsSync(_PluginBase):
                 skip_count += 1
                 continue
 
-            # 提交到豆瓣
+            # ── 提交到豆瓣 ────────────────────────────────────────────────
             ok = self._douban_helper.set_book_status(
                 subject_id=subject_id,
                 status=douban_status,
@@ -350,6 +387,7 @@ class TraktRatingsSync(_PluginBase):
                     "douban_id": subject_id,
                     "douban_title": douban_title or title,
                     "douban_status": douban_status,
+                    "weread_book_id": weread_book_id,
                     "weread_title": title,
                     "author": author,
                     "weread_status": weread_status,
@@ -366,7 +404,9 @@ class TraktRatingsSync(_PluginBase):
                 logger.warning("豆瓣图书提交失败: %s (id=%s)", title, subject_id)
                 fail_count += 1
 
+        # 持久化两份缓存
         self.save_data("weread_synced", synced)
+        self.save_data("weread_book_id_map", book_id_map)
         logger.info(
             "微信读书同步完成: 成功 %d，跳过 %d（已同步），失败/未匹配 %d",
             success_count, skip_count, fail_count,
@@ -377,7 +417,11 @@ class TraktRatingsSync(_PluginBase):
 
         流程：
         1. 拉取最近一周播放记录，按专辑聚合
-        2. 对每张专辑用豆瓣搜索（cat=1003）找到对应 subject_id
+        2. 对每张专辑：
+           a. 先查「专辑名+艺术家」→ douban_subject_id 缓存映射，命中则跳过搜索
+           b. 缓存未命中时，调用 get_music_subject_id(title, artist) 搜索豆瓣
+              （内部按「专辑+艺术家 → 纯专辑名」逐级 fallback）
+           c. 搜索成功后将映射写入缓存，下次直接复用
         3. 调用 set_music_status("collect") 标记为「听过」
         4. 结果持久化到插件数据 "netease_albums"
         """
@@ -386,7 +430,6 @@ class TraktRatingsSync(_PluginBase):
             return
 
         if not self._netease_helper:
-            # NeteaseHelper.__init__ 现在直接接受 Cookie 字符串
             self._netease_helper = NeteaseHelper(
                 cookies=self._netease_cookie,
                 notify_fn=self._send_bark_notification,
@@ -402,6 +445,10 @@ class TraktRatingsSync(_PluginBase):
         # 已同步缓存（key = 豆瓣 subject_id，避免重复提交）
         synced: Dict[str, Any] = self.get_data("netease_albums") or {}
 
+        # 「专辑名+艺术家」→ douban_subject_id 映射缓存（避免重复搜索豆瓣）
+        # 结构：{ "专辑名\tartist": { "subject_id": str, "douban_title": str } }
+        album_map: Dict[str, Any] = self.get_data("netease_album_map") or {}
+
         success_count = 0
         skip_count = 0
         fail_count = 0
@@ -412,29 +459,56 @@ class TraktRatingsSync(_PluginBase):
             if not album_name:
                 continue
 
-            # 用「专辑名 + 艺术家」拼接搜索关键词，精度更高
-            keyword = f"{album_name} {artist}".strip() if artist else album_name
+            # ── 方案 2：先查专辑缓存映射 ──────────────────────────────────
+            # 用 tab 分隔专辑名和艺术家作为缓存 key，避免拼接歧义
+            cache_key = f"{album_name}\t{artist}"
+            subject_id: Optional[str] = None
+            douban_title: Optional[str] = None
 
-            # 搜索豆瓣音乐 subject_id
-            try:
-                douban_title, subject_id = self._douban_helper.get_music_subject_id(keyword)
-            except Exception as e:
-                logger.warning("豆瓣音乐搜索异常 [%s]: %s", keyword, e)
-                fail_count += 1
-                continue
+            if cache_key in album_map:
+                cached_map = album_map[cache_key]
+                subject_id = cached_map.get("subject_id")
+                douban_title = cached_map.get("douban_title")
+                logger.debug(
+                    "命中专辑缓存: %s - %s → 豆瓣 %s (id=%s)",
+                    artist, album_name, douban_title, subject_id,
+                )
 
+            # ── 方案 3：缓存未命中，执行 fallback 搜索 ────────────────────
             if not subject_id:
-                logger.debug("豆瓣未找到音乐条目: %s", keyword)
-                fail_count += 1
-                continue
+                try:
+                    douban_title, subject_id = self._douban_helper.get_music_subject_id(
+                        title=album_name, artist=artist or None
+                    )
+                except Exception as e:
+                    logger.warning("豆瓣音乐搜索异常 [%s - %s]: %s", artist, album_name, e)
+                    fail_count += 1
+                    continue
 
-            # 已同步过则跳过
+                if not subject_id:
+                    logger.debug("豆瓣未找到音乐条目（含 fallback）: %s - %s", artist, album_name)
+                    fail_count += 1
+                    continue
+
+                # 搜索成功，写入专辑缓存
+                album_map[cache_key] = {
+                    "subject_id": subject_id,
+                    "douban_title": douban_title or album_name,
+                    "album": album_name,
+                    "artist": artist,
+                }
+                logger.debug(
+                    "新增专辑缓存: %s - %s → 豆瓣 %s (id=%s)",
+                    artist, album_name, douban_title, subject_id,
+                )
+
+            # ── 已同步过则跳过 ────────────────────────────────────────────
             if subject_id in synced:
                 logger.debug("豆瓣音乐已同步过，跳过: %s (id=%s)", douban_title or album_name, subject_id)
                 skip_count += 1
                 continue
 
-            # 提交「听过」状态
+            # ── 提交「听过」状态 ──────────────────────────────────────────
             ok = self._douban_helper.set_music_status(
                 subject_id=subject_id,
                 status="collect",
@@ -458,10 +532,12 @@ class TraktRatingsSync(_PluginBase):
                 )
                 success_count += 1
             else:
-                logger.warning("豆瓣音乐提交失败: %s (id=%s)", album_name, subject_id)
+                logger.warning("豆瓣音乐提交失败: %s - %s (id=%s)", artist, album_name, subject_id)
                 fail_count += 1
 
+        # 持久化两份缓存
         self.save_data("netease_albums", synced)
+        self.save_data("netease_album_map", album_map)
         logger.info(
             "网易云音乐同步完成: 成功 %d，跳过 %d（已同步），失败/未匹配 %d",
             success_count, skip_count, fail_count,
@@ -898,7 +974,7 @@ class TraktRatingsSync(_PluginBase):
                                 {
                                     "component": "div",
                                     "props": {"class": "text-h6 mb-2"},
-                                    "text": "📚 微信读书 · 最近阅读",
+                                    "text": "📚 微信读书 · 书籍",
                                 }
                             ],
                         }
@@ -1016,7 +1092,7 @@ class TraktRatingsSync(_PluginBase):
                                 {
                                     "component": "div",
                                     "props": {"class": "text-h6 mb-2"},
-                                    "text": "🎵 网易云音乐 · 听过专辑",
+                                    "text": "🎵 网易云音乐 · 音乐",
                                 }
                             ],
                         }
@@ -1111,7 +1187,25 @@ class TraktRatingsSync(_PluginBase):
                 }
             ] + weread_section + netease_section
 
-        trakt_table = [
+        # Trakt 同步历史区块（含标题）
+        trakt_section = [
+            {
+                "component": "VRow",
+                "props": {"class": "mt-4"},
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "text-h6 mb-2"},
+                                "text": "🎬 Trakt · 视频",
+                            }
+                        ],
+                    }
+                ],
+            },
             {
                 "component": "VTable",
                 "props": {"hover": True, "fixedHeader": True},
@@ -1210,4 +1304,4 @@ class TraktRatingsSync(_PluginBase):
                 ],
             }
         ]
-        return trakt_table + weread_section + netease_section
+        return trakt_section + weread_section + netease_section

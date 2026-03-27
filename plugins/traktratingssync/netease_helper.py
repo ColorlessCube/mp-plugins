@@ -3,6 +3,11 @@
 网易云音乐 API Helper
 用于查询用户最近听过的歌曲、喜欢的歌曲等信息。
 Cookie 失效时通过注入的 notify_fn 通知用户。
+
+直接运行本文件可快速测试：
+    python netease_helper.py
+或传入 Cookie 字符串：
+    NETEASE_COOKIE="MUSIC_U=xxx; __csrf=yyy" python netease_helper.py
 """
 import json
 import random
@@ -39,9 +44,9 @@ class NeteaseHelper:
     _SECRET_KEY_CHARSET = string.digits + string.ascii_letters
 
     def __init__(
-        self,
-        cookies: Optional[Any] = None,
-        notify_fn: Optional[Callable[[str, str], None]] = None,
+            self,
+            cookies: Optional[Any] = None,
+            notify_fn: Optional[Callable[[str, str], None]] = None,
     ):
         self._notify = notify_fn or (lambda title, body: None)
 
@@ -114,10 +119,10 @@ class NeteaseHelper:
     # ------------------------------------------------------------------
 
     def _request(
-        self,
-        endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
-        method: str = "POST",
+            self,
+            endpoint: str,
+            params: Optional[Dict[str, Any]] = None,
+            method: str = "POST",
     ) -> Optional[Dict[str, Any]]:
         """发送请求到网易云音乐 Weapi，自动加密参数。
 
@@ -340,11 +345,11 @@ class NeteaseHelper:
     # ------------------------------------------------------------------
 
     def search(
-        self,
-        keyword: str,
-        search_type: int = 1,
-        limit: int = 30,
-        offset: int = 0,
+            self,
+            keyword: str,
+            search_type: int = 1,
+            limit: int = 30,
+            offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """搜索音乐（1: 单曲, 10: 专辑, 100: 歌手, 1000: 歌单, 1002: 用户）"""
         result = self._request(
@@ -412,3 +417,153 @@ class NeteaseHelper:
 
         albums = sorted(album_map.values(), key=lambda x: x["total_play_count"], reverse=True)
         return albums[:limit]
+
+
+# ---------------------------------------------------------------------------
+# 本地测试入口（直接 python netease_helper.py 运行）
+# ---------------------------------------------------------------------------
+
+def _print_sep(title: str) -> None:
+    print(f"\n{'='*60}")
+    print(f"  {title}")
+    print(f"{'='*60}")
+
+
+def main() -> None:
+    """交互式测试 NeteaseHelper 各步骤，方便诊断 Cookie 问题。"""
+    import os
+    import sys
+    import logging
+
+    # 用标准 logging 替换 app.log，使其可独立运行
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(levelname)-8s %(name)s  %(message)s",
+        stream=sys.stdout,
+    )
+
+    # ------------------------------------------------------------------ #
+    # 1. 读取 Cookie
+    # ------------------------------------------------------------------ #
+    _print_sep("Step 1 · 读取 Cookie")
+
+    cookie_str = os.environ.get("NETEASE_COOKIE", "").strip()
+    if not cookie_str:
+        print("未通过环境变量 NETEASE_COOKIE 传入 Cookie，请手动粘贴（回车两次结束）：")
+        lines = []
+        while True:
+            line = input()
+            if line == "":
+                break
+            lines.append(line)
+        cookie_str = " ".join(lines).strip()
+
+    if not cookie_str:
+        print("[ERROR] 未提供任何 Cookie，退出。")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------ #
+    # 2. 解析 Cookie
+    # ------------------------------------------------------------------ #
+    _print_sep("Step 2 · 解析 Cookie（手动 split）")
+
+    parsed: Dict[str, str] = {}
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            key, _, value = part.partition("=")
+            parsed[key.strip()] = value.strip()
+
+    print(f"共解析到 {len(parsed)} 个 Cookie 字段：")
+    for k, v in parsed.items():
+        display_v = v[:20] + "..." if len(v) > 20 else v
+        print(f"  {k:30s} = {display_v}")
+
+    if "MUSIC_U" not in parsed:
+        print("\n[ERROR] Cookie 中不含 MUSIC_U，请重新从浏览器复制完整 Cookie。")
+        sys.exit(1)
+    else:
+        print(f"\n[OK] MUSIC_U 已找到，长度 {len(parsed['MUSIC_U'])} 字符")
+
+    # ------------------------------------------------------------------ #
+    # 3. 初始化 NeteaseHelper
+    # ------------------------------------------------------------------ #
+    _print_sep("Step 3 · 初始化 NeteaseHelper")
+
+    def _notify(title: str, body: str) -> None:
+        print(f"[NOTIFY] {title}: {body}")
+
+    helper = NeteaseHelper(cookies=parsed, notify_fn=_notify)
+    print(f"MUSIC_U in helper.cookies: {bool(helper.cookies.get('MUSIC_U'))}")
+    print(f"__csrf  in helper.cookies: {helper.cookies.get('__csrf', '(未找到)')}")
+
+    # ------------------------------------------------------------------ #
+    # 4. 获取当前登录用户 uid
+    # ------------------------------------------------------------------ #
+    _print_sep("Step 4 · 获取当前用户 uid（nuser/account/get）")
+
+    uid = helper.get_current_uid()
+    if not uid:
+        print("[ERROR] 获取 uid 失败，Cookie 可能已失效或被风控，退出。")
+        sys.exit(1)
+    print(f"[OK] uid = {uid}")
+
+    # ------------------------------------------------------------------ #
+    # 5. 拉取最近一周播放记录（原始）
+    # ------------------------------------------------------------------ #
+    _print_sep("Step 5 · 拉取最近一周听歌排行（v1/play/record?type=1）")
+
+    raw_result = helper._request("v1/play/record", {"uid": uid, "type": 1})
+    if raw_result is None:
+        print("[ERROR] v1/play/record 接口返回 None，可能被风控或需要登录。")
+        sys.exit(1)
+
+    week_data = raw_result.get("weekData") or []
+    print(f"[OK] weekData 条数：{len(week_data)}")
+    if not week_data:
+        print("[WARN] weekData 为空，可能近一周没有播放记录，尝试拉取全部时间（type=0）...")
+        raw_all = helper._request("v1/play/record", {"uid": uid, "type": 0})
+        all_data = (raw_all or {}).get("allData") or []
+        print(f"      allData 条数：{len(all_data)}")
+        if not all_data:
+            print("[ERROR] allData 也为空，账号可能关闭了听歌记录权限。请到网易云 App：")
+            print("        设置 → 隐私 → 允许他人查看我的播放记录 → 开启")
+            sys.exit(1)
+        week_data = all_data  # 降级使用全部记录继续测试
+
+    # 打印前 5 条原始记录
+    print("\n前 5 条原始记录示例：")
+    for i, rec in enumerate(week_data[:5], 1):
+        song = rec.get("song", {})
+        artists = [a.get("name") for a in song.get("ar", [])]
+        album = song.get("al", {}).get("name", "-")
+        print(f"  {i}. {song.get('name', '-')} - {'/'.join(artists)} "
+              f"| 专辑: {album} | 播放次数: {rec.get('playCount', 0)}")
+
+    # ------------------------------------------------------------------ #
+    # 6. 通过 get_recent_played 整合接口获取
+    # ------------------------------------------------------------------ #
+    _print_sep("Step 6 · 通过 get_recent_played() 获取格式化记录")
+
+    records = helper.get_recent_played(limit=100)
+    print(f"[OK] 格式化记录数：{len(records)}")
+    for i, r in enumerate(records[:5], 1):
+        print(f"  {i}. {r.get('name', '-')} | 专辑: {r.get('album', '-')} "
+              f"| 播放次数: {r.get('play_count', 0)}")
+
+    # ------------------------------------------------------------------ #
+    # 7. 按专辑聚合
+    # ------------------------------------------------------------------ #
+    _print_sep("Step 7 · 专辑聚合（get_recent_albums）")
+
+    albums = helper.get_recent_albums(limit=20)
+    print(f"[OK] 聚合专辑数：{len(albums)}")
+    for i, alb in enumerate(albums[:10], 1):
+        print(f"  {i:2d}. 《{alb['album']}》 - {alb['artist']} "
+              f"| 曲目: {alb['song_count']} 首 | 累计播放: {alb['total_play_count']} 次")
+
+    _print_sep("全部测试通过 ✅")
+
+
+if __name__ == "__main__":
+    main()

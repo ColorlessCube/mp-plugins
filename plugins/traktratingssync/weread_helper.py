@@ -3,10 +3,12 @@
 微信读书 API Helper
 用于查询用户最近阅读的书籍及阅读进度。
 Cookie 失效时通过注入的 notify_fn 通知用户。
+
+直接运行本文件可快速测试：
+    python weread_helper.py
 """
 import hashlib
 import re
-from http.cookies import SimpleCookie
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
@@ -69,10 +71,16 @@ class WereadHelper:
 
     @staticmethod
     def _parse_cookie_string(cookie_string: str) -> requests.cookies.RequestsCookieJar:
-        """将浏览器复制的 Cookie 字符串转为 RequestsCookieJar"""
-        cookie = SimpleCookie()
-        cookie.load(cookie_string)
-        cookies_dict = {k: m.value for k, m in cookie.items()}
+        """将浏览器复制的 Cookie 字符串转为 RequestsCookieJar。
+
+        使用手动 split 解析，避免 SimpleCookie 对含特殊字符的字段静默丢弃。
+        """
+        cookies_dict: Dict[str, str] = {}
+        for part in cookie_string.split(";"):
+            part = part.strip()
+            if "=" in part:
+                key, _, value = part.partition("=")
+                cookies_dict[key.strip()] = value.strip()
         return cookiejar_from_dict(cookies_dict, cookiejar=None, overwrite=True)
 
     def _refresh_session(self) -> None:
@@ -339,3 +347,155 @@ class WereadHelper:
         if minutes:
             parts.append(f"{minutes} 分钟")
         return " ".join(parts) if parts else "不足 1 分钟"
+
+
+# ---------------------------------------------------------------------------
+# 本地测试入口（直接 python weread_helper.py 运行）
+# ---------------------------------------------------------------------------
+
+def _sep(title: str) -> None:
+    print(f"\n{'='*60}\n  {title}\n{'='*60}")
+
+
+def main() -> None:
+    """交互式测试 WereadHelper 各步骤，方便诊断 Cookie 问题。"""
+    import os
+    import sys
+    import logging
+
+    # 用标准 logging 替换 app.log，使其可独立运行
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(levelname)-8s %(name)s  %(message)s",
+        stream=sys.stdout,
+    )
+
+    # ------------------------------------------------------------------ #
+    # 1. 读取 Cookie
+    # ------------------------------------------------------------------ #
+    _sep("Step 1 · 读取 Cookie")
+
+    cookie_str = os.environ.get("WEREAD_COOKIE", "").strip()
+    if not cookie_str:
+        print("未通过环境变量 WEREAD_COOKIE 传入 Cookie，请手动粘贴（回车两次结束）：")
+        lines = []
+        while True:
+            line = input()
+            if line == "":
+                break
+            lines.append(line)
+        cookie_str = " ".join(lines).strip()
+
+    if not cookie_str:
+        print("[ERROR] 未提供任何 Cookie，退出。")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------ #
+    # 2. 解析 Cookie
+    # ------------------------------------------------------------------ #
+    _sep("Step 2 · 解析 Cookie（手动 split）")
+
+    parsed: Dict[str, str] = {}
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            key, _, value = part.partition("=")
+            parsed[key.strip()] = value.strip()
+
+    print(f"共解析到 {len(parsed)} 个 Cookie 字段：")
+    for k, v in parsed.items():
+        display_v = v[:20] + "..." if len(v) > 20 else v
+        print(f"  {k:30s} = {display_v}")
+
+    if "wr_skey" not in parsed:
+        print("\n[ERROR] Cookie 中不含 wr_skey，请重新从浏览器复制完整 Cookie。")
+        sys.exit(1)
+    else:
+        print(f"\n[OK] wr_skey 已找到，长度 {len(parsed['wr_skey'])} 字符")
+
+    # ------------------------------------------------------------------ #
+    # 3. 初始化 WereadHelper
+    # ------------------------------------------------------------------ #
+    _sep("Step 3 · 初始化 WereadHelper")
+
+    def _notify(title: str, body: str) -> None:
+        print(f"[NOTIFY] {title}: {body}")
+
+    helper = WereadHelper(cookie_string=cookie_str, notify_fn=_notify)
+    jar = helper.session.cookies
+    key_fields = ["wr_skey", "wr_localId", "wr_vid", "wr_name"]
+    print("关键 Cookie 字段验证：")
+    for f in key_fields:
+        val = jar.get(f, default="(未找到)")
+        display = (val[:20] + "...") if isinstance(val, str) and len(val) > 20 else val
+        print(f"  {f:20s} = {display}")
+
+    # ------------------------------------------------------------------ #
+    # 4. 拉取书架（shelf/sync）
+    # ------------------------------------------------------------------ #
+    _sep("Step 4 · 拉取书架（shelf/sync）")
+
+    helper._refresh_session()
+    raw_shelf = helper._get(helper._url_shelf_sync, params={"synckey": 0})
+    if raw_shelf is None:
+        print("[ERROR] shelf/sync 接口返回 None，Cookie 可能已失效，退出。")
+        sys.exit(1)
+
+    shelf_books = raw_shelf.get("books", [])
+    shelf_books.sort(key=lambda x: x.get("readUpdateTime", 0), reverse=True)
+    print(f"[OK] 书架共 {len(shelf_books)} 本，按最近阅读时间排序")
+    print("\n前 3 条原始字段（shelf/sync 返回的字段）：")
+    for item in shelf_books[:3]:
+        book = item.get("book") or item
+        print(f"\n  书名      : {book.get('title', '-')}")
+        print(f"  bookId    : {book.get('bookId', '-')}")
+        print(f"  readingProgress (shelf): {item.get('readingProgress', '(无)')}")
+        print(f"  readUpdateTime: {item.get('readUpdateTime', '(无)')}")
+        print(f"  注：markedStatus 需要调用 read_info 接口获取（见 Step 5）")
+
+    # ------------------------------------------------------------------ #
+    # 5. 对前 5 本调用 read_info，打印原始字段
+    # ------------------------------------------------------------------ #
+    _sep("Step 5 · read_info 原始返回（前 5 本）")
+
+    for item in shelf_books[:5]:
+        book = item.get("book") or item
+        book_id = book.get("bookId", "")
+        title = book.get("title", "-")
+        if not book_id:
+            continue
+
+        info = helper.get_read_info(book_id)
+        if info is None:
+            print(f"\n  《{title}》 → read_info 返回 None（接口失败或被限流）")
+            continue
+
+        marked = info.get("markedStatus", "(无)")
+        progress = info.get("readingProgress", "(无)")
+        reading_time = info.get("readingTime", 0)
+        finished_date = info.get("finishedDate", "(无)")
+
+        print(f"\n  《{title}》 (bookId={book_id})")
+        print(f"    markedStatus    : {marked}  → {WereadHelper._MARKED_STATUS.get(marked, '未知')}")
+        print(f"    readingProgress : {progress}")
+        print(f"    readingTime     : {reading_time}s = {WereadHelper.format_reading_time(reading_time)}")
+        print(f"    finishedDate    : {finished_date}")
+
+    # ------------------------------------------------------------------ #
+    # 6. 通过 get_recent_books 整合接口获取
+    # ------------------------------------------------------------------ #
+    _sep("Step 6 · get_recent_books() 整合结果")
+
+    books = helper.get_recent_books(limit=10, include_progress=True)
+    print(f"[OK] 整合书籍数：{len(books)}")
+    for i, b in enumerate(books, 1):
+        print(f"  {i:2d}. 【{b['status']:3s}】{b['title']} - {b['author']}"
+              f" | 进度 {b['reading_progress']}%"
+              f" | 累计 {WereadHelper.format_reading_time(b['reading_time'])}"
+              f" | 读完日期: {b['finished_date'] or '-'}")
+
+    _sep("全部测试通过 ✅")
+
+
+if __name__ == "__main__":
+    main()

@@ -178,16 +178,67 @@ class DoubanHelper:
             return None, None
         return self._search_subject(title, "1002")
 
-    def get_book_subject_id(self, title: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-        """搜索图书条目，返回 (subject_name, subject_id)"""
-        if not title:
-            return None, None
-        return self._search_subject(title, "1001")
+    def get_book_subject_id(
+        self,
+        title: Optional[str] = None,
+        author: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """搜索图书条目，返回 (subject_name, subject_id)。
 
-    def get_music_subject_id(self, title: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-        """搜索音乐条目，返回 (subject_name, subject_id)"""
+        搜索策略（逐级 fallback，找到即返回）：
+        1. 「书名 + 作者」（精度最高）
+        2. 纯书名（去掉作者，兼容作者名不一致的情况）
+        3. 书名逐字截断（每次去掉最后一个字，最短保留 4 字），
+           用于处理微信读书书名含版本号/括号等后缀的情况
+        """
         if not title:
             return None, None
+
+        # 策略 1：书名 + 作者
+        if author:
+            result = self._search_subject(f"{title} {author}", "1001")
+            if result[1]:
+                return result
+            logger.debug("豆瓣图书「书名+作者」未命中，降级为纯书名: %s", title)
+
+        # 策略 2：纯书名
+        result = self._search_subject(title, "1001")
+        if result[1]:
+            return result
+        logger.debug("豆瓣图书纯书名未命中，尝试截断搜索: %s", title)
+
+        # 策略 3：书名逐字截断（最短保留 4 字）
+        for length in range(len(title) - 1, 3, -1):
+            short_title = title[:length]
+            result = self._search_subject(short_title, "1001")
+            if result[1]:
+                logger.debug("豆瓣图书截断命中 [%s → %s]", title, short_title)
+                return result
+
+        return None, None
+
+    def get_music_subject_id(
+        self,
+        title: Optional[str] = None,
+        artist: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """搜索音乐条目，返回 (subject_name, subject_id)。
+
+        搜索策略（逐级 fallback，找到即返回）：
+        1. 「专辑名 + 艺术家」（精度最高）
+        2. 纯专辑名（去掉艺术家，兼容艺术家名在豆瓣/网易云不一致的情况）
+        """
+        if not title:
+            return None, None
+
+        # 策略 1：专辑名 + 艺术家
+        if artist:
+            result = self._search_subject(f"{title} {artist}", "1003")
+            if result[1]:
+                return result
+            logger.debug("豆瓣音乐「专辑+艺术家」未命中，降级为纯专辑名: %s", title)
+
+        # 策略 2：纯专辑名
         return self._search_subject(title, "1003")
 
     # ------------------------------------------------------------------
