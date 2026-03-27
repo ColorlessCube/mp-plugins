@@ -30,6 +30,7 @@ class DoubanHelper:
     _URL_MOVIE_INTEREST = "https://movie.douban.com/j/subject/{subject_id}/interest"
     _URL_BOOK_INTEREST = "https://book.douban.com/j/subject/{subject_id}/interest"
     _URL_MUSIC_INTEREST = "https://music.douban.com/j/subject/{subject_id}/interest"
+    _URL_PODCAST_INTEREST = "https://www.douban.com/j/subject/{subject_id}/interest"
     _URL_SEARCH = "https://www.douban.com/search"
 
     def __init__(
@@ -318,5 +319,50 @@ class DoubanHelper:
             url,
             referer=f"https://music.douban.com/subject/{subject_id}/",
             host="music.douban.com",
+            data=data,
+        )
+
+    def get_podcast_subject_id(self, title: str) -> Tuple[Optional[str], Optional[str]]:
+        """搜索豆瓣播客条目，返回 (豆瓣标题, subject_id)。
+        
+        Args:
+            title: 播客名称
+            
+        Returns:
+            (豆瓣标题, subject_id) 或 (None, None)
+        """
+        if not title:
+            return None, None
+
+        # 直接搜索播客名称
+        douban_title, subject_id = self._search_subject(title, cat="podcast")
+        if subject_id:
+            return douban_title, subject_id
+
+        logger.debug("豆瓣播客搜索未找到: %s", title)
+        return None, None
+
+    def set_podcast_status(
+        self,
+        subject_id: str,
+        status: str = "do",
+        private: bool = True,
+        rating: Optional[int] = None,
+    ) -> bool:
+        """设置豆瓣播客状态（wish/do/collect），可选 1–5 星评分"""
+        url = self._URL_PODCAST_INTEREST.format(subject_id=subject_id)
+        data = {
+            "ck": self.ck,
+            "interest": status,
+            "rating": str(rating) if rating is not None and 1 <= rating <= 5 else "",
+            "tags": "",
+            "comment": "",
+        }
+        if private:
+            data["private"] = "on"
+        return self._post_interest(
+            url,
+            referer=f"https://www.douban.com/subject/{subject_id}/",
+            host="www.douban.com",
             data=data,
         )

@@ -4,10 +4,11 @@
 
 插件定义、配置读取和任务调度入口。
 所有业务逻辑分别由对应 helper 实现：
-  - TraktHelper   → Trakt API 封装（评分拉取、播放进度、OAuth 授权）
-  - DoubanHelper  → 豆瓣 Cookie 操作（标记看过/在看、写入评分）
-  - WereadHelper  → 微信读书 Web API（书架、阅读进度）
-  - NeteaseHelper → 网易云音乐 Web API（最近播放记录，按专辑聚合）
+  - TraktHelper      → Trakt API 封装（评分拉取、播放进度、OAuth 授权）
+  - DoubanHelper     → 豆瓣 Cookie 操作（标记看过/在看、写入评分）
+  - WereadHelper     → 微信读书 Web API（书架、阅读进度）
+  - NeteaseHelper    → 网易云音乐 Web API（最近播放记录，按专辑聚合）
+  - XiaoyuzhouHelper → 小宇宙 FM API（播客听取历史）
 """
 import time
 from datetime import datetime
@@ -21,13 +22,14 @@ from .douban_helper import DoubanHelper
 from .netease_helper import NeteaseHelper
 from .trakt_helper import TraktHelper
 from .weread_helper import WereadHelper
+from .xiaoyuzhou_helper import XiaoyuzhouHelper
 
 
 class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
-    plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑。"
+    plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.7.0"
+    plugin_version = "3.8.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -44,6 +46,8 @@ class TraktRatingsSync(_PluginBase):
     _weread_limit: int = 20
     _netease_cookie: str = ""
     _netease_limit: int = 20
+    _xiaoyuzhou_cookie: str = ""
+    _xiaoyuzhou_limit: int = 20
     _private: bool = True
     _sync_type: str = "all"   # all | movies | shows
     _max_sync_count: int = 0  # 0 = 不限制
@@ -55,6 +59,7 @@ class TraktRatingsSync(_PluginBase):
     _trakt_helper: Optional[TraktHelper] = None
     _weread_helper: Optional[WereadHelper] = None
     _netease_helper: Optional[NeteaseHelper] = None
+    _xiaoyuzhou_helper: Optional[XiaoyuzhouHelper] = None
 
     # ------------------------------------------------------------------
     # 插件生命周期
@@ -72,6 +77,8 @@ class TraktRatingsSync(_PluginBase):
         self._weread_limit = int(config.get("weread_limit") or 20)
         self._netease_cookie = (config.get("netease_cookie") or "").strip()
         self._netease_limit = int(config.get("netease_limit") or 20)
+        self._xiaoyuzhou_cookie = (config.get("xiaoyuzhou_cookie") or "").strip()
+        self._xiaoyuzhou_limit = int(config.get("xiaoyuzhou_limit") or 20)
         self._private = config.get("private", True)
         self._sync_type = config.get("sync_type", "all") or "all"
         self._max_sync_count = int(config.get("max_sync_count") or 0)
@@ -83,9 +90,10 @@ class TraktRatingsSync(_PluginBase):
         self._trakt_helper = None
         self._weread_helper = None
         self._netease_helper = None
+        self._xiaoyuzhou_helper = None
 
     def run(self):
-        """定时/手动触发入口：依次执行 Trakt 同步、微信读书同步、网易云音乐同步。"""
+        """定时/手动触发入口：依次执行 Trakt 同步、微信读书同步、网易云音乐同步、小宇宙播客同步。"""
         if not self._enable:
             logger.debug("豆瓣书影音同步插件未启用，跳过")
             return
@@ -120,6 +128,13 @@ class TraktRatingsSync(_PluginBase):
                 self._sync_netease()
             except Exception as e:
                 logger.error("同步网易云音乐记录失败: %s", e, exc_info=True)
+
+        # 同步小宇宙播客最近听取记录到豆瓣「听过」
+        if self._xiaoyuzhou_cookie:
+            try:
+                self._sync_xiaoyuzhou()
+            except Exception as e:
+                logger.error("同步小宇宙播客记录失败: %s", e, exc_info=True)
 
         logger.info("豆瓣书影音同步完成")
 
@@ -543,9 +558,182 @@ class TraktRatingsSync(_PluginBase):
             success_count, skip_count, fail_count,
         )
 
-    # ------------------------------------------------------------------
-    # 辅助工具
-    # ------------------------------------------------------------------
+    def _sync_xiaoyuzhou(self) -> None:
+        """同步小宇宙播客最近听取记录到豆瓣。
+
+        流程：
+        1. 拉取最近听取的播客单集（含播放进度 is_finished 字段）
+        2. 按播客去重，取该播客最后一集的 is_finished 判断整体状态：
+           - is_finished = True  → 豆瓣「听过」(collect)
+           - is_finished = False 且有进度 → 豆瓣「在听」(do)
+           - 无进度记录（listen_pct = 0）→ 出现在历史则认为「听过」(collect)
+        3. 对每个播客：
+           a. 先查「播客名」→ douban_subject_id 缓存映射，命中则跳过搜索
+           b. 缓存未命中时，调用 get_podcast_subject_id(title) 搜索豆瓣
+           c. 搜索成功后将映射写入缓存，下次直接复用
+        4. 根据状态调用 set_podcast_status()，已同步且状态未变则跳过
+        5. 结果持久化到插件数据 "xiaoyuzhou_episodes"
+        """
+        if not self._xiaoyuzhou_cookie:
+            logger.debug("未配置小宇宙 Cookie，跳过同步")
+            return
+
+        if not self._xiaoyuzhou_helper:
+            self._xiaoyuzhou_helper = XiaoyuzhouHelper(
+                access_token=self._xiaoyuzhou_cookie,
+                notify_fn=self._send_bark_notification,
+            )
+
+        logger.info("开始同步小宇宙播客最近听取记录到豆瓣...")
+
+        episodes = self._xiaoyuzhou_helper.get_recent_episodes(limit=self._xiaoyuzhou_limit)
+        if not episodes:
+            logger.info("小宇宙未获取到最近听取记录（Cookie 可能已失效或暂无听取记录）")
+            return
+
+        # 持久化播客列表（供详情页展示）
+        self.save_data("xiaoyuzhou_episodes", episodes)
+
+        # 已同步缓存（key = 豆瓣 subject_id）
+        # 结构：{ subject_id: { ..., "status": "collect" | "do" } }
+        synced: Dict[str, Any] = self.get_data("xiaoyuzhou_podcasts") or {}
+
+        # 「播客名」→ douban_subject_id 映射缓存（避免重复搜索豆瓣）
+        # 结构：{ "播客名": { "subject_id": str, "douban_title": str } }
+        podcast_map: Dict[str, Any] = self.get_data("xiaoyuzhou_podcast_map") or {}
+
+        success_count = 0
+        skip_count = 0
+        fail_count = 0
+
+        # ── 按播客去重，同时确定最佳状态 ──────────────────────────────────
+        # 对同一播客，取所有单集中 is_finished=True 最优先；其次取 listen_pct 最大的
+        seen_podcasts: Dict[str, Dict[str, Any]] = {}
+        for ep in episodes:
+            podcast_id = ep.get("podcast_id", "")
+            podcast_name = ep.get("podcast_name", "")
+            if not (podcast_id and podcast_name):
+                continue
+            if podcast_id not in seen_podcasts:
+                seen_podcasts[podcast_id] = ep
+            else:
+                existing = seen_podcasts[podcast_id]
+                # 已听完优先级最高，无需替换
+                if existing.get("is_finished"):
+                    continue
+                # 替换为进度更高的那条
+                if ep.get("is_finished") or ep.get("listen_pct", 0) > existing.get("listen_pct", 0):
+                    seen_podcasts[podcast_id] = ep
+
+        for podcast_id, ep_info in seen_podcasts.items():
+            podcast_name = ep_info.get("podcast_name", "")
+            if not podcast_name:
+                continue
+
+            # ── 确定要同步到豆瓣的状态 ────────────────────────────────────
+            # is_finished=True 或 listen_pct=0（无进度记录）→ collect（听过）
+            # is_finished=False 且有进度 → do（在听）
+            listen_pct = ep_info.get("listen_pct", 0.0)
+            is_finished = ep_info.get("is_finished", False)
+            if is_finished or listen_pct == 0.0:
+                target_status = "collect"
+            else:
+                target_status = "do"
+
+            # ── 先查播客缓存映射 ───────────────────────────────────────────
+            subject_id: Optional[str] = None
+            douban_title: Optional[str] = None
+
+            if podcast_name in podcast_map:
+                cached_map = podcast_map[podcast_name]
+                subject_id = cached_map.get("subject_id")
+                douban_title = cached_map.get("douban_title")
+                logger.debug(
+                    "命中播客缓存: %s → 豆瓣 %s (id=%s)",
+                    podcast_name, douban_title, subject_id,
+                )
+
+            # ── 缓存未命中，执行搜索 ─────────────────────────────────────
+            if not subject_id:
+                try:
+                    douban_title, subject_id = self._douban_helper.get_podcast_subject_id(
+                        title=podcast_name
+                    )
+                except Exception as e:
+                    logger.warning("豆瓣播客搜索异常 [%s]: %s", podcast_name, e)
+                    fail_count += 1
+                    continue
+
+                if not subject_id:
+                    logger.debug("豆瓣未找到播客条目: %s", podcast_name)
+                    fail_count += 1
+                    continue
+
+                # 搜索成功，写入播客缓存
+                podcast_map[podcast_name] = {
+                    "subject_id": subject_id,
+                    "douban_title": douban_title or podcast_name,
+                    "podcast_name": podcast_name,
+                }
+                logger.debug(
+                    "新增播客缓存: %s → 豆瓣 %s (id=%s)",
+                    podcast_name, douban_title, subject_id,
+                )
+
+            # ── 已同步且状态相同则跳过 ────────────────────────────────────
+            if subject_id in synced:
+                cached_status = synced[subject_id].get("status", "collect")
+                if cached_status == target_status:
+                    logger.debug(
+                        "豆瓣播客已同步（%s），状态无变化，跳过: %s (id=%s)",
+                        target_status, douban_title or podcast_name, subject_id,
+                    )
+                    skip_count += 1
+                    continue
+                # 状态有变化（例如从「在听」升级为「听过」），继续提交
+                logger.info(
+                    "播客状态变更 %s → %s，重新提交: %s (id=%s)",
+                    cached_status, target_status, douban_title or podcast_name, subject_id,
+                )
+
+            # ── 提交豆瓣状态 ─────────────────────────────────────────────
+            ok = self._douban_helper.set_podcast_status(
+                subject_id=subject_id,
+                status=target_status,
+                private=self._private,
+                rating=None,
+            )
+            status_label = "听过" if target_status == "collect" else "在听"
+            if ok:
+                synced[subject_id] = {
+                    "douban_id": subject_id,
+                    "douban_title": douban_title or podcast_name,
+                    "podcast_name": podcast_name,
+                    "podcast_id": podcast_id,
+                    "status": target_status,
+                    "listen_pct": listen_pct,
+                    "sync_time": int(time.time()),
+                }
+                logger.info(
+                    "小宇宙 → 豆瓣 %s: %s (id=%s)",
+                    status_label, douban_title or podcast_name, subject_id,
+                )
+                success_count += 1
+            else:
+                logger.warning("豆瓣播客提交失败: %s (id=%s)", podcast_name, subject_id)
+                fail_count += 1
+
+        # 持久化两份缓存
+        self.save_data("xiaoyuzhou_podcasts", synced)
+        self.save_data("xiaoyuzhou_podcast_map", podcast_map)
+        logger.info(
+            "小宇宙播客同步完成: 成功 %d，跳过 %d（已同步且状态无变化），失败/未匹配 %d",
+            success_count, skip_count, fail_count,
+        )
+
+# ------------------------------------------------------------------
+# 辅助工具
+# ------------------------------------------------------------------
 
     def _merge_update_config(self, patch: Dict[str, Any]) -> None:
         """将 patch 合并到当前配置后调用 update_config（避免覆盖其他字段）。"""
@@ -560,6 +748,8 @@ class TraktRatingsSync(_PluginBase):
             "weread_limit": self._weread_limit,
             "netease_cookie": self._netease_cookie,
             "netease_limit": self._netease_limit,
+            "xiaoyuzhou_cookie": self._xiaoyuzhou_cookie,
+            "xiaoyuzhou_limit": self._xiaoyuzhou_limit,
             "private": self._private,
             "sync_type": self._sync_type,
             "max_sync_count": self._max_sync_count,
@@ -883,6 +1073,35 @@ class TraktRatingsSync(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 10},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "xiaoyuzhou_cookie",
+                                            "label": "小宇宙 FM Token（可选）",
+                                            "placeholder": "从浏览器 DevTools → Application → Cookies 中复制 x-jike-access-token 的值",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 2},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "xiaoyuzhou_limit",
+                                            "label": "小宇宙同步播客数",
+                                            "placeholder": "20",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -904,7 +1123,8 @@ class TraktRatingsSync(_PluginBase):
                                                 "3. 授权成功后，Access Token 会自动回填到配置中\n"
                                                 "4. 豆瓣 Cookie 需从浏览器手动复制，失效时会通过 Bark 推送通知提醒更新\n"
                                                 "5. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
-                                                "6. 网易云音乐 Cookie 填写后，会将最近一周听歌记录按专辑聚合，同步到豆瓣音乐「听过」"
+                                                "6. 网易云音乐 Cookie 填写后，会将最近一周听歌记录按专辑聚合，同步到豆瓣音乐「听过」\n"
+                                                "7. 小宇宙 FM Token 填写后，会将最近听取的播客同步到豆瓣「听过」（Token 从浏览器 Cookie 中的 x-jike-access-token 获取）"
                                             ),
                                         },
                                     }
@@ -925,6 +1145,8 @@ class TraktRatingsSync(_PluginBase):
             "weread_limit": 20,
             "netease_cookie": "",
             "netease_limit": 20,
+            "xiaoyuzhou_cookie": "",
+            "xiaoyuzhou_limit": 20,
             "private": True,
             "sync_type": "all",
             "max_sync_count": 0,
@@ -933,7 +1155,7 @@ class TraktRatingsSync(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """插件详情页：展示 Trakt 同步历史（看完/在看）、微信读书最近阅读、网易云音乐同步记录。"""
+        """插件详情页：展示 Trakt 同步历史（看完/在看）、微信读书最近阅读、网易云音乐同步记录、小宇宙播客同步记录。"""
         finished = self.get_data("finished") or {}
         watching = self.get_data("watching") or {}
 
@@ -1175,6 +1397,95 @@ class TraktRatingsSync(_PluginBase):
                 },
             ]
 
+        # 小宇宙播客同步记录区块
+        xiaoyuzhou_episodes: List[Dict[str, Any]] = self.get_data("xiaoyuzhou_episodes") or []
+        xiaoyuzhou_section: List[dict] = []
+        if xiaoyuzhou_episodes:
+            xiaoyuzhou_section = [
+                {
+                    "component": "VRow",
+                    "props": {"class": "mt-4"},
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-h6 mb-2"},
+                                    "text": "🎙️ 小宇宙 FM · 播客",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "component": "VTable",
+                    "props": {"hover": True, "fixedHeader": True},
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "单集"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "播客"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "时长"},
+                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "播放状态"},
+                            ],
+                        },
+                        {
+                            "component": "tbody",
+                            "content": [
+                                {
+                                    "component": "tr",
+                                    "props": {"key": f"xiaoyuzhou_{idx}"},
+                                    "content": [
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": ep.get("title", ""),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": ep.get("podcast_name", "-"),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "text": XiaoyuzhouHelper.format_duration(ep.get("duration", 0)),
+                                        },
+                                        {
+                                            "component": "td",
+                                            "props": {"class": "text-start ps-4"},
+                                            "content": [
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {
+                                                        "size": "small",
+                                                        "color": (
+                                                            "success" if ep.get("is_finished")
+                                                            else "primary" if ep.get("listen_pct", 0) > 0
+                                                            else "default"
+                                                        ),
+                                                        "variant": "flat",
+                                                    },
+                                                    "text": (
+                                                        "已听完" if ep.get("is_finished")
+                                                        else f"听了 {ep.get('listen_pct', 0)*100:.0f}%" if ep.get("listen_pct", 0) > 0
+                                                        else "无记录"
+                                                    ),
+                                                }
+                                            ],
+                                        },
+                                    ],
+                                }
+                                for idx, ep in enumerate(xiaoyuzhou_episodes)
+                            ],
+                        },
+                    ],
+                },
+            ]
+
         if not history_list:
             return [
                 {
@@ -1185,7 +1496,7 @@ class TraktRatingsSync(_PluginBase):
                         "text": "暂无 Trakt 同步历史记录",
                     },
                 }
-            ] + weread_section + netease_section
+            ] + weread_section + netease_section + xiaoyuzhou_section
 
         # Trakt 同步历史区块（含标题）
         trakt_section = [
@@ -1304,4 +1615,4 @@ class TraktRatingsSync(_PluginBase):
                 ],
             }
         ]
-        return trakt_section + weread_section + netease_section
+        return trakt_section + weread_section + netease_section + xiaoyuzhou_section
