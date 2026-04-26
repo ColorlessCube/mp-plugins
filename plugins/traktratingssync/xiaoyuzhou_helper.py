@@ -8,6 +8,7 @@ Token 失效时通过注入的 notify_fn 通知用户。
     python xiaoyuzhou_helper.py
 """
 import time
+import random
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import requests
@@ -35,6 +36,7 @@ class XiaoyuzhouHelper:
     _URL_EPISODE_DETAIL = f"{_BASE_URL}/v1/episode/get"
     _URL_PODCAST_DETAIL = f"{_BASE_URL}/v1/podcast/get"
     _URL_PLAYBACK_PROGRESS = f"{_BASE_URL}/v1/playback-progress/list"
+    _REQUEST_JITTER_RANGE = (0.8, 2.0)
 
     # 已听完判定阈值（已播放秒数 / 总时长 >= 此值则视为听完）
     FINISHED_THRESHOLD = 0.90
@@ -86,9 +88,16 @@ class XiaoyuzhouHelper:
         """生成当前时间的 ISO 8601 字符串，供 Local-Time 请求头使用。"""
         return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime())
 
+    def _sleep_before_request(self, action: str) -> None:
+        """请求前随机等待，降低周期同步的固定节奏。"""
+        delay = random.uniform(*self._REQUEST_JITTER_RANGE)
+        logger.debug("小宇宙%s前随机等待 %.2f 秒", action, delay)
+        time.sleep(delay)
+
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """GET 请求封装。"""
         try:
+            self._sleep_before_request("GET")
             self.session.headers["Local-Time"] = self._now_iso()
             resp = self.session.get(url, params=params, timeout=10)
             if resp.status_code == 200:
@@ -102,6 +111,7 @@ class XiaoyuzhouHelper:
     def _post(self, url: str, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """POST 请求封装。"""
         try:
+            self._sleep_before_request("POST")
             self.session.headers["Local-Time"] = self._now_iso()
             resp = self.session.post(url, json=data or {}, timeout=10)
             if resp.status_code == 200:

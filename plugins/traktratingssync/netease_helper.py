@@ -12,6 +12,7 @@ Cookie 失效时通过注入的 notify_fn 通知用户。
 import json
 import random
 import string
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
@@ -42,6 +43,7 @@ class NeteaseHelper:
         "3ece0462db0a22b8e7"
     )
     _SECRET_KEY_CHARSET = string.digits + string.ascii_letters
+    _REQUEST_JITTER_RANGE = (0.8, 2.0)
 
     def __init__(
             self,
@@ -114,6 +116,12 @@ class NeteaseHelper:
         second = self._aes_encrypt(first, secret_key_bytes)
         return {"params": second, "encSecKey": self._rsa_encrypt(secret_key)}
 
+    def _sleep_before_request(self, endpoint: str) -> None:
+        """请求前随机等待，降低批量任务的固定节奏。"""
+        delay = random.uniform(*self._REQUEST_JITTER_RANGE)
+        logger.debug("网易云请求前随机等待 %.2f 秒: %s", delay, endpoint)
+        time.sleep(delay)
+
     # ------------------------------------------------------------------
     # 网络请求
     # ------------------------------------------------------------------
@@ -139,6 +147,7 @@ class NeteaseHelper:
         request_params["csrf_token"] = self.cookies.get("__csrf", "")
 
         try:
+            self._sleep_before_request(endpoint)
             if method.upper() == "POST":
                 encrypted = self._encrypt_params(request_params)
                 response = requests.post(

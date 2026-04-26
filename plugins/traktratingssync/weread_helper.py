@@ -8,8 +8,10 @@
     python weread_helper.py
 """
 import hashlib
+import random
 import re
 import shlex
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
@@ -33,6 +35,7 @@ class WereadHelper:
         2: "在读",
         4: "读完",
     }
+    _REQUEST_JITTER_RANGE = (0.8, 2.0)
 
     def __init__(
         self,
@@ -136,13 +139,21 @@ class WereadHelper:
     def _refresh_session(self) -> None:
         """访问首页以刷新 Session，防止登录态过期"""
         try:
+            self._sleep_before_request("刷新 Session")
             self.session.get(self._base_url, timeout=10)
         except Exception:
             pass
 
+    def _sleep_before_request(self, action: str) -> None:
+        """请求前随机等待，降低批量同步的固定节奏。"""
+        delay = random.uniform(*self._REQUEST_JITTER_RANGE)
+        logger.debug("微信读书%s前随机等待 %.2f 秒", action, delay)
+        time.sleep(delay)
+
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """GET 请求封装，自动检测登录态失效并通知，失败返回 None"""
         try:
+            self._sleep_before_request("GET")
             resp = self.session.get(url, params=params, timeout=15)
             resp.raise_for_status()
             data = resp.json()

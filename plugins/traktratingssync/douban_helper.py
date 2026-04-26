@@ -4,7 +4,9 @@
 用于提交「看过/在看」「读过/在读」「听过」状态及评分到豆瓣。
 Cookie 需在插件配置中手动填写，失效时通过注入的 notify_fn 通知用户。
 """
+import random
 import re
+import time
 from typing import Callable, List, Optional, Tuple
 from urllib.parse import unquote
 
@@ -33,6 +35,9 @@ class DoubanHelper:
     _URL_PODCAST_INTEREST = "https://www.douban.com/j/subject/{subject_id}/interest"
     _URL_SEARCH = "https://www.douban.com/search"
     _URL_PODCAST_SEARCH = "https://www.douban.com/podcast/"
+    _SEARCH_MIN_INTERVAL = 2.5
+    _SEARCH_FORBIDDEN_COOLDOWN = 600
+    _REQUEST_JITTER_RANGE = (1.0, 3.0)
 
     def __init__(
         self,
@@ -81,6 +86,10 @@ class DoubanHelper:
         else:
             self.ck = None
 
+        self._last_search_ts = 0.0
+        self._search_forbidden_until = 0.0
+        self._search_forbidden_count = 0
+
     @property
     def is_authenticated(self) -> bool:
         """返回豆瓣 Cookie 是否有效（ck 已成功获取）"""
@@ -94,6 +103,7 @@ class DoubanHelper:
         """访问豆瓣首页刷新 ck Cookie"""
         self.headers["Cookie"] = ";".join(f"{k}={v}" for k, v in self.cookies.items())
         try:
+            self._sleep_before_request("刷新 ck")
             response = requests.get(self._URL_DOUBAN, headers=self.headers, timeout=10)
         except Exception as e:
             logger.warning("刷新豆瓣 ck 请求失败: %s", e)
@@ -117,10 +127,58 @@ class DoubanHelper:
             "Cookie": ";".join(f"{k}={v}" for k, v in self.cookies.items()),
         }
 
+    def _build_search_headers(self, referer: str) -> dict:
+        """构造搜索请求头。"""
+        return {
+            **self.headers,
+            "Referer": referer,
+            "Host": "www.douban.com",
+        }
+
+    def _sleep_before_request(self, action: str) -> None:
+        """所有豆瓣请求前加随机等待，降低周期任务的突发特征。"""
+        delay = random.uniform(*self._REQUEST_JITTER_RANGE)
+        logger.debug("豆瓣%s前随机等待 %.2f 秒", action, delay)
+        time.sleep(delay)
+
+    def _throttle_search(self) -> None:
+        """对豆瓣搜索做最小间隔，降低连续命中风控的概率。"""
+        now = time.time()
+        wait = self._last_search_ts + self._SEARCH_MIN_INTERVAL - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        self._last_search_ts = now
+
+    def _is_search_blocked(self) -> bool:
+        """搜索被 403 熔断后，在冷却窗口内直接跳过，避免继续触发风控。"""
+        if self._search_forbidden_until <= time.time():
+            return False
+        logger.warning(
+            "豆瓣搜索处于冷却期，跳过本次请求，%.0f 秒后再试",
+            self._search_forbidden_until - time.time(),
+        )
+        return True
+
+    def _mark_search_response(self, status_code: Optional[int], keyword: str) -> None:
+        """记录搜索响应状态，用于 403 熔断。"""
+        if status_code == 403:
+            self._search_forbidden_count += 1
+            if self._search_forbidden_count >= 2:
+                self._search_forbidden_until = time.time() + self._SEARCH_FORBIDDEN_COOLDOWN
+                logger.warning(
+                    "豆瓣搜索连续返回 403，已暂停搜索 %d 秒。通常是频率过高、IP 风控或搜索页反爬，不一定是 Cookie 失效。最后关键词: %s",
+                    self._SEARCH_FORBIDDEN_COOLDOWN,
+                    keyword,
+                )
+            return
+        self._search_forbidden_count = 0
+
     def _post_interest(self, url: str, referer: str, host: str, data: dict) -> bool:
         """向豆瓣提交 interest 请求，统一处理响应和 Cookie 失效检测"""
         headers = self._build_headers(referer, host)
         try:
+            self._sleep_before_request("提交状态")
             response = requests.post(url=url, headers=headers, data=data, timeout=10)
         except Exception as e:
             logger.error("请求豆瓣失败: %s", e)
@@ -144,12 +202,26 @@ class DoubanHelper:
 
     def _search_subject(self, keyword: str, cat: str) -> Tuple[Optional[str], Optional[str]]:
         """通用豆瓣搜索（cat=1001图书/1002影视/1003音乐），返回 (title, subject_id)"""
+        if self._is_search_blocked():
+            return None, None
+        self._sleep_before_request("搜索")
+        self._throttle_search()
         url = self._URL_SEARCH
-        response = RequestUtils(headers=self.headers, timeout=10).get_res(
+        response = RequestUtils(
+            headers=self._build_search_headers(referer=url),
+            cookies=self.cookies,
+            timeout=10,
+        ).get_res(
             url=url, params={"cat": cat, "q": keyword}
         )
+        self._mark_search_response(getattr(response, "status_code", None), keyword)
         if not response or response.status_code != 200:
-            logger.error("搜索 [%s] 失败: HTTP %s", keyword, getattr(response, "status_code", None))
+            logger.error(
+                "搜索 [%s] 失败: HTTP %s%s",
+                keyword,
+                getattr(response, "status_code", None),
+                "（可能是频率过高或搜索页风控）" if getattr(response, "status_code", None) == 403 else "",
+            )
             return None, None
         soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
         for div in soup.find_all("div", class_="title"):
@@ -166,15 +238,25 @@ class DoubanHelper:
 
     def _search_podcast_subject(self, keyword: str) -> Tuple[Optional[str], Optional[str]]:
         """搜索豆瓣播客条目，返回 (title, subject_id)。"""
-        response = RequestUtils(headers=self.headers, timeout=10).get_res(
+        if self._is_search_blocked():
+            return None, None
+        self._sleep_before_request("播客搜索")
+        self._throttle_search()
+        response = RequestUtils(
+            headers=self._build_search_headers(referer=self._URL_PODCAST_SEARCH),
+            cookies=self.cookies,
+            timeout=10,
+        ).get_res(
             url=self._URL_PODCAST_SEARCH,
             params={"q": keyword},
         )
+        self._mark_search_response(getattr(response, "status_code", None), keyword)
         if not response or response.status_code != 200:
             logger.error(
-                "搜索播客 [%s] 失败: HTTP %s",
+                "搜索播客 [%s] 失败: HTTP %s%s",
                 keyword,
                 getattr(response, "status_code", None),
+                "（可能是频率过高或搜索页风控）" if getattr(response, "status_code", None) == 403 else "",
             )
             return None, None
 
@@ -257,21 +339,15 @@ class DoubanHelper:
     ) -> Tuple[Optional[str], Optional[str]]:
         """搜索音乐条目，返回 (subject_name, subject_id)。
 
-        搜索策略（逐级 fallback，找到即返回）：
-        1. 「专辑名 + 艺术家」（精度最高）
-        2. 纯专辑名（去掉艺术家，兼容艺术家名在豆瓣/网易云不一致的情况）
+        保守策略：只发起一次搜索。
+        - 有艺术家时搜「专辑名 + 艺术家」
+        - 无艺术家时搜纯专辑名
         """
         if not title:
             return None, None
 
-        # 策略 1：专辑名 + 艺术家
         if artist:
-            result = self._search_subject(f"{title} {artist}", "1003")
-            if result[1]:
-                return result
-            logger.debug("豆瓣音乐「专辑+艺术家」未命中，降级为纯专辑名: %s", title)
-
-        # 策略 2：纯专辑名
+            return self._search_subject(f"{title} {artist}", "1003")
         return self._search_subject(title, "1003")
 
     # ------------------------------------------------------------------

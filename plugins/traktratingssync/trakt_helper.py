@@ -7,6 +7,7 @@ __init__.py 只需实例化 TraktHelper 并调用其方法即可，不包含任�
 """
 import asyncio
 import math
+import random
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -34,6 +35,7 @@ class TraktHelper:
     # 协议固定常量，保持类级
     _API_BASE = "https://api.trakt.tv"
     _API_VERSION = "2"
+    _REQUEST_JITTER_RANGE = (0.5, 1.5)
 
     def __init__(
         self,
@@ -81,6 +83,12 @@ class TraktHelper:
             headers.update(extra)
         return headers
 
+    def _sleep_before_request(self, action: str) -> None:
+        """请求前随机等待，降低周期任务的固定节奏。"""
+        delay = random.uniform(*self._REQUEST_JITTER_RANGE)
+        logger.debug("Trakt %s 前随机等待 %.2f 秒", action, delay)
+        time.sleep(delay)
+
     @staticmethod
     def _trakt_rating_to_douban(trakt_rating: int) -> int:
         """Trakt 1-10 评分转为豆瓣 1-5 星。"""
@@ -113,6 +121,7 @@ class TraktHelper:
             return []
 
         try:
+            self._sleep_before_request(f"fetch_ratings/{media_type}")
             resp = RequestUtils(timeout=30, headers=self._headers).get_res(url=url)
             if not resp:
                 logger.warning("Trakt API 请求失败（网络或超时）")
@@ -153,6 +162,7 @@ class TraktHelper:
         headers = self._build_headers({"Authorization": f"Bearer {access_token}"})
         url = f"{self._API_BASE}{path}"
         try:
+            self._sleep_before_request(f"fetch_playback/{path}")
             resp = RequestUtils(timeout=20, headers=headers).get_res(url=url)
             if not resp:
                 logger.debug("Trakt 播放进度请求失败: %s", path)
