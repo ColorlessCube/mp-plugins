@@ -16,6 +16,7 @@ import shlex
 import string
 import time
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from Crypto.Cipher import AES
@@ -53,12 +54,19 @@ class NeteaseHelper:
             notify_fn: Optional[Callable[[str, str], None]] = None,
     ):
         self._notify = notify_fn or (lambda title, body: None)
+        parsed_headers: Dict[str, str] = {}
+        self._csrf_token = ""
+        self._cookie_parse_warnings: List[str] = []
 
         # 支持字符串或字典两种形式的 Cookie
         # 使用手动 split 解析而非 SimpleCookie，后者对浏览器复制的 Cookie 字符串
         # 解析不可靠（遇到值含 = 等特殊字符时会静默跳过整个字段）
         if isinstance(cookies, str):
-            self.cookies = self._parse_cookie_input(cookies)
+            parsed = self._parse_input(cookies)
+            self.cookies = parsed.get("cookies", {})
+            parsed_headers = parsed.get("headers", {})
+            self._csrf_token = parsed.get("csrf_token", "")
+            self._cookie_parse_warnings = parsed.get("warnings", [])
         elif isinstance(cookies, dict):
             self.cookies = dict(cookies)
         else:
@@ -79,9 +87,16 @@ class NeteaseHelper:
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer": "https://music.163.com/",
         }
+        if parsed_headers:
+            self._headers.update(parsed_headers)
 
         if not self.cookies.get("MUSIC_U"):
             logger.warning("未提供网易云音乐 Cookie（MUSIC_U），某些接口可能无法使用")
+        if self._cookie_parse_warnings:
+            for warning in self._cookie_parse_warnings:
+                logger.warning("网易云 Cookie 解析警告: %s", warning)
+        if self._csrf_token:
+            logger.debug("网易云将优先使用 URL 中的 csrf_token，值长度 %d", len(self._csrf_token))
 
     # ------------------------------------------------------------------
     # 加密工具
@@ -130,46 +145,97 @@ class NeteaseHelper:
                 cookies[key.strip()] = value.strip()
         return cookies
 
+    @staticmethod
+    def _extract_cookie_values(cookie_string: str, key: str) -> List[str]:
+        """从 Cookie 字符串中提取指定 key 的所有值，保留重复项。"""
+        values: List[str] = []
+        for part in cookie_string.split(";"):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            name, _, value = part.partition("=")
+            if name.strip() == key:
+                values.append(value.strip())
+        return values
+
     @classmethod
-    def _parse_cookie_input(cls, raw_value: str) -> Dict[str, str]:
-        """兼容纯 Cookie 字符串或完整 curl，提取网易云 Cookie。"""
+    def _parse_input(cls, raw_value: str) -> Dict[str, Any]:
+        """兼容纯 Cookie 字符串或完整 curl，提取网易云 Cookie 和关键请求头。"""
         text = (raw_value or "").strip()
         if not text:
-            return {}
+            return {"cookies": {}, "headers": {}, "csrf_token": "", "warnings": []}
         if not text.lower().startswith("curl "):
-            return cls._cookie_string_to_dict(text)
+            return {"cookies": cls._cookie_string_to_dict(text), "headers": {}, "csrf_token": "", "warnings": []}
 
         normalized = re.sub(r"\\\n\s*", " ", text).strip()
         try:
             parts = shlex.split(normalized)
         except Exception:
             logger.warning("解析网易云 cURL 失败，回退为原始 Cookie 字符串")
-            return cls._cookie_string_to_dict(text)
+            return {"cookies": cls._cookie_string_to_dict(text), "headers": {}, "csrf_token": "", "warnings": []}
 
         cookie_string = ""
+        headers: Dict[str, str] = {}
+        csrf_token = ""
+        warnings: List[str] = []
+        allow_headers = {
+            "Accept",
+            "Accept-Language",
+            "Content-Type",
+            "Origin",
+            "Referer",
+            "User-Agent",
+        }
+        for part in parts:
+            if part.startswith("http://") or part.startswith("https://"):
+                parsed_url = urlparse(part)
+                qs = parse_qs(parsed_url.query)
+                csrf_token = (qs.get("csrf_token") or [""])[0].strip()
+                if csrf_token:
+                    break
         for i, part in enumerate(parts):
             if part in ("-b", "--cookie") and i + 1 < len(parts):
                 cookie_string = parts[i + 1].strip()
-                break
+                continue
             if part in ("-H", "--header") and i + 1 < len(parts):
                 header = parts[i + 1]
                 if header.lower().startswith("cookie:"):
                     cookie_string = header.split(":", 1)[1].strip()
-                    break
+                    continue
+                if ":" in header:
+                    key, value = header.split(":", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key in allow_headers:
+                        headers[key] = value
 
         if cookie_string:
-            logger.debug("已从网易云 cURL 中提取 Cookie")
-            return cls._cookie_string_to_dict(cookie_string)
+            csrf_values = cls._extract_cookie_values(cookie_string, "__csrf")
+            if len(csrf_values) > 1:
+                unique_values = list(dict.fromkeys(csrf_values))
+                warnings.append(f"检测到重复 __csrf，值为 {unique_values}")
+            if csrf_token and csrf_values and csrf_token != csrf_values[-1]:
+                warnings.append(
+                    f"URL 中 csrf_token={csrf_token} 与 Cookie 中最终 __csrf={csrf_values[-1]} 不一致，将优先使用 URL 参数"
+                )
+            logger.debug("已从网易云 cURL 中提取 Cookie、请求头和 csrf_token")
+            return {
+                "cookies": cls._cookie_string_to_dict(cookie_string),
+                "headers": headers,
+                "csrf_token": csrf_token,
+                "warnings": warnings,
+            }
 
         logger.warning("未能从网易云 cURL 中提取 Cookie")
-        return {}
+        return {"cookies": {}, "headers": headers, "csrf_token": csrf_token, "warnings": warnings}
 
     def _auth_context(self) -> str:
         """返回当前网易云鉴权上下文摘要。"""
         return (
             f"cookie_count={len(self.cookies)}, "
             f"has_music_u={bool(self.cookies.get('MUSIC_U'))}, "
-            f"has_csrf={bool(self.cookies.get('__csrf'))}, "
+            f"has_csrf={bool(self.cookies.get('__csrf') or self._csrf_token)}, "
+            f"csrf_source={'url' if self._csrf_token else 'cookie'}, "
             f"user_agent={self._headers.get('User-Agent', '')[:120]}"
         )
 
@@ -200,7 +266,7 @@ class NeteaseHelper:
         """
         url = f"{self._api_url}/{endpoint}"
         request_params = dict(params or {})
-        request_params["csrf_token"] = self.cookies.get("__csrf", "")
+        request_params["csrf_token"] = self._csrf_token or self.cookies.get("__csrf", "")
 
         try:
             self._sleep_before_request(endpoint)
@@ -324,6 +390,13 @@ class NeteaseHelper:
             uid = (result.get("account") or {}).get("id")
             if uid:
                 return int(uid)
+            logger.warning(
+                "网易云 nuser/account/get 返回成功但未包含 account.id: keys=%s, %s",
+                list(result.keys())[:20],
+                self._auth_context(),
+            )
+        else:
+            logger.warning("网易云 nuser/account/get 未返回有效数据: %s", self._auth_context())
         return None
 
     def get_recent_played(self, limit: int = 100) -> List[Dict[str, Any]]:
