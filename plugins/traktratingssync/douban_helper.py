@@ -32,6 +32,7 @@ class DoubanHelper:
     _URL_MUSIC_INTEREST = "https://music.douban.com/j/subject/{subject_id}/interest"
     _URL_PODCAST_INTEREST = "https://www.douban.com/j/subject/{subject_id}/interest"
     _URL_SEARCH = "https://www.douban.com/search"
+    _URL_PODCAST_SEARCH = "https://www.douban.com/podcast/"
 
     def __init__(
         self,
@@ -161,6 +162,37 @@ class DoubanHelper:
             if match:
                 return (a.string or "").strip(), match.group(1)
         logger.debug("豆瓣未找到 [%s] 相关条目 (cat=%s)", keyword, cat)
+        return None, None
+
+    def _search_podcast_subject(self, keyword: str) -> Tuple[Optional[str], Optional[str]]:
+        """搜索豆瓣播客条目，返回 (title, subject_id)。"""
+        response = RequestUtils(headers=self.headers, timeout=10).get_res(
+            url=self._URL_PODCAST_SEARCH,
+            params={"q": keyword},
+        )
+        if not response or response.status_code != 200:
+            logger.error(
+                "搜索播客 [%s] 失败: HTTP %s",
+                keyword,
+                getattr(response, "status_code", None),
+            )
+            return None, None
+
+        soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
+        for a in soup.find_all("a", href=True):
+            link = unquote(a.get("href", ""))
+            match = re.search(r"/podcast/(\d+)/", link)
+            if not match:
+                continue
+            title = a.get_text(strip=True) or keyword
+            return title, match.group(1)
+
+        match = re.search(r"/podcast/(\d+)/", response.text)
+        if match:
+            logger.debug("豆瓣播客搜索命中，但未解析到标题，回退为原始关键词: %s", keyword)
+            return keyword, match.group(1)
+
+        logger.debug("豆瓣未找到播客条目: %s", keyword)
         return None, None
 
     # ------------------------------------------------------------------
@@ -334,8 +366,7 @@ class DoubanHelper:
         if not title:
             return None, None
 
-        # 直接搜索播客名称
-        douban_title, subject_id = self._search_subject(title, cat="podcast")
+        douban_title, subject_id = self._search_podcast_subject(title)
         if subject_id:
             return douban_title, subject_id
 

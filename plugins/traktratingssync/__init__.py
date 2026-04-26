@@ -6,7 +6,7 @@
 所有业务逻辑分别由对应 helper 实现：
   - TraktHelper      → Trakt API 封装（评分拉取、播放进度、OAuth 授权）
   - DoubanHelper     → 豆瓣 Cookie 操作（标记看过/在看、写入评分）
-  - WereadHelper     → 微信读书 Web API（书架、阅读进度）
+  - WereadHelper     → 微信读书 Web API（notebook、getProgress）
   - NeteaseHelper    → 网易云音乐 Web API（最近播放记录，按专辑聚合）
   - XiaoyuzhouHelper → 小宇宙 FM API（播客听取历史）
 """
@@ -29,7 +29,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.8.0"
+    plugin_version = "3.9.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -42,7 +42,7 @@ class TraktRatingsSync(_PluginBase):
     _trakt_client_secret: str = ""
     _trakt_access_token: str = ""
     _douban_cookie: str = ""
-    _weread_cookie: str = ""
+    _weread_curl: str = ""
     _weread_limit: int = 20
     _netease_cookie: str = ""
     _netease_limit: int = 20
@@ -73,7 +73,7 @@ class TraktRatingsSync(_PluginBase):
         self._trakt_client_secret = (config.get("trakt_client_secret") or "").strip()
         self._trakt_access_token = (config.get("trakt_access_token") or "").strip()
         self._douban_cookie = (config.get("douban_cookie") or "").strip()
-        self._weread_cookie = (config.get("weread_cookie") or "").strip()
+        self._weread_curl = (config.get("weread_curl") or "").strip()
         self._weread_limit = int(config.get("weread_limit") or 20)
         self._netease_cookie = (config.get("netease_cookie") or "").strip()
         self._netease_limit = int(config.get("netease_limit") or 20)
@@ -116,7 +116,7 @@ class TraktRatingsSync(_PluginBase):
                 logger.error("同步 Trakt 评分失败: %s", e, exc_info=True)
 
         # 同步微信读书最近阅读记录
-        if self._weread_cookie:
+        if self._weread_curl:
             try:
                 self._sync_weread()
             except Exception as e:
@@ -276,13 +276,13 @@ class TraktRatingsSync(_PluginBase):
         4. 「读完」→ 豆瓣「读过」(collect)；「在读」→ 豆瓣「在读」(do)；其余跳过
         5. 已同步过（相同 subject_id + 状态未变）则跳过，避免重复提交
         """
-        if not self._weread_cookie:
-            logger.debug("未配置微信读书 Cookie，跳过同步")
+        if not self._weread_curl:
+            logger.debug("未配置微信读书阅读页 cURL，跳过同步")
             return
 
         if not self._weread_helper:
             self._weread_helper = WereadHelper(
-                cookie_string=self._weread_cookie,
+                curl_string=self._weread_curl,
                 notify_fn=self._send_bark_notification,
             )
 
@@ -293,7 +293,7 @@ class TraktRatingsSync(_PluginBase):
         )
 
         if not books:
-            logger.info("微信读书未获取到最近阅读记录（Cookie 可能已失效或书架为空）")
+            logger.info("微信读书未获取到最近阅读记录（cURL 可能已失效或 notebook 为空）")
             return
 
         # 持久化书单（供详情页展示）
@@ -744,7 +744,7 @@ class TraktRatingsSync(_PluginBase):
             "trakt_client_secret": self._trakt_client_secret,
             "trakt_access_token": self._trakt_access_token,
             "douban_cookie": self._douban_cookie,
-            "weread_cookie": self._weread_cookie,
+            "weread_curl": self._weread_curl,
             "weread_limit": self._weread_limit,
             "netease_cookie": self._netease_cookie,
             "netease_limit": self._netease_limit,
@@ -1020,11 +1020,13 @@ class TraktRatingsSync(_PluginBase):
                                 "props": {"cols": 12, "md": 10},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VTextarea",
                                         "props": {
-                                            "model": "weread_cookie",
-                                            "label": "微信读书 Cookie（可选）",
-                                            "placeholder": "从浏览器打开 weread.qq.com，复制完整 Cookie 粘贴到此处（需包含 wr_skey）",
+                                            "model": "weread_curl",
+                                            "label": "微信读书阅读页 cURL（可选）",
+                                            "placeholder": "在微信读书阅读页打开 DevTools → Network，筛选 read，翻页后复制 web/book/read 的 Copy as cURL (bash) 完整内容粘贴到此处",
+                                            "rows": 6,
+                                            "auto-grow": True,
                                         },
                                     }
                                 ],
@@ -1122,9 +1124,10 @@ class TraktRatingsSync(_PluginBase):
                                                 "2. 填写 Client Secret 启用自动授权（首次同步时会通过 Bark 发送授权链接，系统阻塞等待10分钟）\n"
                                                 "3. 授权成功后，Access Token 会自动回填到配置中\n"
                                                 "4. 豆瓣 Cookie 需从浏览器手动复制，失效时会通过 Bark 推送通知提醒更新\n"
-                                                "5. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
-                                                "6. 网易云音乐 Cookie 填写后，会将最近一周听歌记录按专辑聚合，同步到豆瓣音乐「听过」\n"
-                                                "7. 小宇宙 FM Token 填写后，会将最近听取的播客同步到豆瓣「听过」（Token 从浏览器 Cookie 中的 x-jike-access-token 获取）"
+                                                "5. 微信读书请填写阅读页中 web/book/read 请求的完整 cURL，而不是只填 Cookie\n"
+                                                "6. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
+                                                "7. 网易云音乐 Cookie 填写后，会将最近一周听歌记录按专辑聚合，同步到豆瓣音乐「听过」\n"
+                                                "8. 小宇宙 FM Token 填写后，会将最近听取的播客同步到豆瓣「听过」（Token 从浏览器 Cookie 中的 x-jike-access-token 获取）"
                                             ),
                                         },
                                     }
@@ -1141,7 +1144,7 @@ class TraktRatingsSync(_PluginBase):
             "trakt_client_secret": "",
             "trakt_access_token": "",
             "douban_cookie": "",
-            "weread_cookie": "",
+            "weread_curl": "",
             "weread_limit": 20,
             "netease_cookie": "",
             "netease_limit": 20,

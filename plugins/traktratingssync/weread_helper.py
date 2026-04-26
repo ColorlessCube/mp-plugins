@@ -2,13 +2,14 @@
 """
 微信读书 API Helper
 用于查询用户最近阅读的书籍及阅读进度。
-Cookie 失效时通过注入的 notify_fn 通知用户。
+通过阅读页 cURL 复用真实浏览器请求上下文，避免仅凭 Cookie 无法访问进度接口。
 
 直接运行本文件可快速测试：
     python weread_helper.py
 """
 import hashlib
 import re
+import shlex
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
@@ -21,8 +22,8 @@ class WereadHelper:
     """微信读书 API 封装类。
 
     Args:
-        cookie_string: 从浏览器复制的微信读书 Cookie 字符串，需包含 wr_skey
-        notify_fn: Cookie 失效等异常时的通知回调，签名 ``(title: str, body: str) -> None``
+        curl_string: 从浏览器复制的 ``web/book/read`` 完整 cURL 字符串
+        notify_fn: 登录态失效等异常时的通知回调，签名 ``(title: str, body: str) -> None``
     """
 
     # markedStatus → 中文标签
@@ -35,7 +36,7 @@ class WereadHelper:
 
     def __init__(
         self,
-        cookie_string: Optional[str] = None,
+        curl_string: Optional[str] = None,
         notify_fn: Optional[Callable[[str, str], None]] = None,
     ):
         self._notify = notify_fn or (lambda title, body: None)
@@ -43,26 +44,30 @@ class WereadHelper:
         # 实例级 URL 常量（便于测试替换）
         self._base_url = "https://weread.qq.com"
         self._url_notebooks = f"{self._base_url}/api/user/notebook"
-        self._url_read_info = f"{self._base_url}/web/book/readinfo"
+        self._url_book_progress = f"{self._base_url}/web/book/getProgress"
         self._url_book_info = f"{self._base_url}/web/book/info"
-        self._url_shelf_sync = f"{self._base_url}/web/shelf/sync"
 
         self.session = requests.Session()
-        if cookie_string:
-            self.session.cookies = self._parse_cookie_string(cookie_string)
+        if curl_string:
+            parsed = self._parse_curl_string(curl_string)
+            self.session.cookies = self._parse_cookie_string(parsed.get("cookie", ""))
+            self.session.headers.update(parsed.get("headers", {}))
         else:
-            logger.warning("未提供微信读书 Cookie，个人数据接口将无法使用")
+            logger.warning("未提供微信读书阅读页 cURL，个人数据接口将无法使用")
 
         self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": self.session.headers.get(
+                "User-Agent",
+                (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
             ),
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Referer": "https://weread.qq.com/",
-            "Origin": "https://weread.qq.com",
+            "Accept": self.session.headers.get("Accept", "application/json, text/plain, */*"),
+            "Accept-Language": self.session.headers.get("Accept-Language", "zh-CN,zh;q=0.9"),
+            "Referer": self.session.headers.get("Referer", "https://weread.qq.com/"),
+            "Origin": self.session.headers.get("Origin", "https://weread.qq.com"),
         })
 
     # ------------------------------------------------------------------
@@ -83,15 +88,60 @@ class WereadHelper:
                 cookies_dict[key.strip()] = value.strip()
         return cookiejar_from_dict(cookies_dict, cookiejar=None, overwrite=True)
 
+    @staticmethod
+    def _parse_curl_string(curl_string: str) -> Dict[str, Any]:
+        """解析浏览器复制的 cURL，提取 Cookie 与关键请求头。"""
+        if not curl_string:
+            return {"cookie": "", "headers": {}}
+
+        normalized = re.sub(r"\\\n\s*", " ", curl_string).strip()
+        parts = shlex.split(normalized)
+        headers: Dict[str, str] = {}
+        cookie_string = ""
+
+        i = 0
+        while i < len(parts):
+            part = parts[i]
+            if part in ("-H", "--header") and i + 1 < len(parts):
+                header = parts[i + 1]
+                if ":" in header:
+                    key, value = header.split(":", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key.lower() == "cookie":
+                        cookie_string = value
+                    else:
+                        headers[key] = value
+                i += 2
+                continue
+            if part in ("-b", "--cookie") and i + 1 < len(parts):
+                cookie_string = parts[i + 1].strip()
+                i += 2
+                continue
+            i += 1
+
+        # 只保留进度接口必需的浏览器上下文，避免带入无关噪音头。
+        allow_headers = {
+            "Accept",
+            "Accept-Language",
+            "Content-Type",
+            "Origin",
+            "Referer",
+            "User-Agent",
+            "x-wrpa-0",
+        }
+        filtered = {k: v for k, v in headers.items() if k in allow_headers}
+        return {"cookie": cookie_string, "headers": filtered}
+
     def _refresh_session(self) -> None:
-        """访问首页以刷新 Session，防止 Cookie 过期"""
+        """访问首页以刷新 Session，防止登录态过期"""
         try:
             self.session.get(self._base_url, timeout=10)
         except Exception:
             pass
 
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        """GET 请求封装，自动检测 Cookie 失效并通知，失败返回 None"""
+        """GET 请求封装，自动检测登录态失效并通知，失败返回 None"""
         try:
             resp = self.session.get(url, params=params, timeout=15)
             resp.raise_for_status()
@@ -99,25 +149,33 @@ class WereadHelper:
 
             if isinstance(data, dict):
                 errcode = data.get("errcode")
-                if errcode and errcode != 0:
-                    # -2012 / -2010 通常表示未登录或 Cookie 失效
+                errmsg = data.get("errmsg", "")
+                if errcode is None and "errCode" in data:
+                    errcode = data.get("errCode")
+                    errmsg = data.get("errMsg", "")
+
+                if errcode is not None and errcode != 0:
+                    # -2012 / -2010 通常表示未登录或登录态失效
                     if errcode in (-2012, -2010, -1012):
-                        msg = "微信读书 Cookie 已失效，请重新从浏览器复制并更新配置（需包含 wr_skey）。"
+                        msg = "微信读书登录态已失效，请重新从浏览器阅读页复制完整 cURL 并更新配置。"
                         logger.error(msg)
-                        self._notify("微信读书 Cookie 已失效", msg)
+                        self._notify("微信读书登录态已失效", msg)
                     else:
                         logger.warning(
                             "微信读书 API 返回错误: url=%s, errcode=%s, errmsg=%s",
-                            url, errcode, data.get("errmsg", ""),
+                            url, errcode, errmsg,
                         )
                     return None
+
+                if "info" in data and isinstance(data.get("info"), dict):
+                    return data.get("info")
             return data
 
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
-                msg = "微信读书 Cookie 已失效（HTTP 401），请重新从浏览器复制并更新配置。"
+                msg = "微信读书登录态已失效（HTTP 401），请重新从浏览器阅读页复制完整 cURL 并更新配置。"
                 logger.error(msg)
-                self._notify("微信读书 Cookie 已失效", msg)
+                self._notify("微信读书登录态已失效", msg)
             else:
                 logger.error("微信读书 HTTP 错误: %s", e)
         except requests.RequestException as e:
@@ -178,29 +236,9 @@ class WereadHelper:
             return books
         return []
 
-    def get_shelf_books(self, sync_key: int = 0) -> List[Dict[str, Any]]:
-        """获取书架书籍列表（/web/shelf/sync），含最近阅读时间和进度。
-
-        Args:
-            sync_key: 增量同步 key，传 0 获取全量数据
-
-        Returns:
-            按最近阅读时间倒序的书籍列表
-        """
-        self._refresh_session()
-        data = self._get(self._url_shelf_sync, params={"synckey": sync_key})
-        if not data:
-            return []
-        books = data.get("books", [])
-        books.sort(key=lambda x: x.get("readUpdateTime", 0), reverse=True)
-        return books
-
-    def get_read_info(self, book_id: str) -> Optional[Dict[str, Any]]:
-        """获取单本书的阅读详情（累计时长、进度百分比、状态、读完时间）"""
-        return self._get(
-            self._url_read_info,
-            params={"bookId": book_id, "readingDetail": 1, "readingBookIndex": 1, "finishedDate": 1},
-        )
+    def get_book_progress(self, book_id: str) -> Optional[Dict[str, Any]]:
+        """获取单本书当前阅读进度（百分比、阅读时长、最后阅读位置）。"""
+        return self._get(self._url_book_progress, params={"bookId": book_id})
 
     def get_book_info(self, book_id: str) -> Optional[Dict[str, Any]]:
         """获取书籍详细信息（封面、ISBN、评分等）"""
@@ -217,12 +255,12 @@ class WereadHelper:
     ) -> List[Dict[str, Any]]:
         """获取最近阅读的书籍列表，可选附带每本书的阅读进度。
 
-        优先使用 /web/shelf/sync 接口（含 readUpdateTime/readingProgress），
-        若该接口返回为空则回退到 /api/user/notebook。
+        当前实现固定使用 ``/api/user/notebook`` 获取最近交互书单，
+        再逐本调用 ``/web/book/getProgress`` 获取进度。
 
         Args:
             limit: 最多返回几本（默认 20）
-            include_progress: 是否补充调用 get_read_info 获取详细进度
+            include_progress: 是否补充调用 get_book_progress 获取详细进度
 
         Returns:
             书籍列表，每项结构：
@@ -240,20 +278,12 @@ class WereadHelper:
                 "weread_url"      : str,
             }
         """
-        shelf_books = self.get_shelf_books()
         result: List[Dict[str, Any]] = []
 
-        if shelf_books:
-            for item in shelf_books[:limit]:
-                book = item.get("book") or item
-                book_id = book.get("bookId") or item.get("bookId", "")
-                result.append(self._build_entry_from_shelf(book_id, book, item))
-        else:
-            logger.info("shelf/sync 接口未返回数据，回退到 notebook 接口")
-            for item in self.get_notebook_list()[:limit]:
-                book = item.get("book", {})
-                book_id = book.get("bookId", "")
-                result.append(self._build_entry_from_notebook(book_id, book))
+        for item in self.get_notebook_list()[:limit]:
+            book = item.get("book", {})
+            book_id = book.get("bookId", "")
+            result.append(self._build_entry_from_notebook(book_id, book))
 
         if include_progress:
             for entry in result:
@@ -261,9 +291,9 @@ class WereadHelper:
                 if not book_id:
                     continue
                 try:
-                    info = self.get_read_info(book_id)
-                    if info:
-                        self._enrich_with_read_info(entry, info)
+                    progress_info = self.get_book_progress(book_id)
+                    if progress_info:
+                        self._enrich_with_book_progress(entry, progress_info)
                 except Exception as e:
                     logger.debug("获取 %s 阅读详情失败: %s", entry.get("title"), e)
 
@@ -272,27 +302,6 @@ class WereadHelper:
     # ------------------------------------------------------------------
     # 私有辅助方法
     # ------------------------------------------------------------------
-
-    def _build_entry_from_shelf(
-        self,
-        book_id: str,
-        book: Dict[str, Any],
-        shelf_item: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """从 shelf/sync 条目构造统一数据结构"""
-        return {
-            "book_id": book_id,
-            "title": book.get("title", ""),
-            "author": book.get("author", ""),
-            "cover": self._normalize_cover(book.get("cover", "")),
-            "category": book.get("category", ""),
-            "read_update_time": shelf_item.get("readUpdateTime", 0),
-            "reading_time": 0,
-            "reading_progress": shelf_item.get("readingProgress", 0),
-            "status": self._MARKED_STATUS.get(shelf_item.get("markedStatus", 0), "在读"),
-            "finished_date": None,
-            "weread_url": self._build_weread_url(book_id),
-        }
 
     def _build_entry_from_notebook(self, book_id: str, book: Dict[str, Any]) -> Dict[str, Any]:
         """从 notebook 条目构造统一数据结构"""
@@ -310,19 +319,95 @@ class WereadHelper:
             "weread_url": self._build_weread_url(book_id),
         }
 
-    def _enrich_with_read_info(self, entry: Dict[str, Any], info: Dict[str, Any]) -> None:
-        """用 read_info 数据补充进度字段（原地修改 entry）"""
-        entry["reading_time"] = info.get("readingTime", 0)
-        entry["reading_progress"] = info.get("readingProgress", 0)
-        marked_status = info.get("markedStatus", 0)
-        entry["status"] = self._MARKED_STATUS.get(marked_status, "在读")
-        if marked_status == 4 and info.get("finishedDate"):
-            from datetime import datetime, timezone
+    def _enrich_with_book_progress(self, entry: Dict[str, Any], payload: Dict[str, Any]) -> None:
+        """用 getProgress 数据补充进度与阅读时长。"""
+        book = payload.get("book") if isinstance(payload.get("book"), dict) else payload
+
+        reading_time = self._extract_reading_time(book)
+        if reading_time is not None:
+            entry["reading_time"] = reading_time
+
+        reading_progress = self._extract_progress(book)
+        if reading_progress is not None:
+            entry["reading_progress"] = reading_progress
+            if reading_progress >= 100:
+                entry["status"] = "读完"
+                if not entry.get("finished_date"):
+                    entry["finished_date"] = None
+            elif reading_progress > 0 and entry.get("status") != "读完":
+                entry["status"] = "在读"
+
+        update_time = self._extract_read_update_time(book)
+        if update_time > 0:
+            entry["read_update_time"] = update_time
+
+    @classmethod
+    def _extract_progress(cls, payload: Dict[str, Any]) -> Optional[int]:
+        """从不同接口结构中提取阅读进度百分比。"""
+        candidates = [
+            payload.get("readingProgress"),
+            payload.get("progress"),
+        ]
+        reading_detail = payload.get("readingDetail")
+        if isinstance(reading_detail, dict):
+            candidates.extend([
+                reading_detail.get("readingProgress"),
+                reading_detail.get("progress"),
+            ])
+        for value in candidates:
+            progress = cls._normalize_progress_value(value)
+            if progress is not None:
+                return progress
+        return None
+
+    @staticmethod
+    def _extract_reading_time(payload: Dict[str, Any]) -> Optional[int]:
+        for value in (
+            payload.get("readingTime"),
+            (payload.get("readingDetail") or {}).get("readingTime") if isinstance(payload.get("readingDetail"), dict) else None,
+        ):
+            if value is None:
+                continue
             try:
-                dt = datetime.fromtimestamp(info["finishedDate"], tz=timezone.utc)
-                entry["finished_date"] = dt.strftime("%Y-%m-%d")
-            except Exception:
-                entry["finished_date"] = None
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _extract_read_update_time(payload: Dict[str, Any]) -> int:
+        candidates = [
+            payload.get("readUpdateTime"),
+            payload.get("updateTime"),
+        ]
+        book = payload.get("book")
+        if isinstance(book, dict):
+            candidates.extend([book.get("readUpdateTime"), book.get("updateTime")])
+        for value in candidates:
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    @staticmethod
+    def _normalize_progress_value(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if 0 < number <= 1 and not float(number).is_integer():
+            number *= 100
+        progress = int(round(number))
+        if progress < 0:
+            return 0
+        if progress > 100:
+            return 100
+        return progress
 
     def _build_weread_url(self, book_id: str) -> str:
         if not book_id:
@@ -358,7 +443,7 @@ def _sep(title: str) -> None:
 
 
 def main() -> None:
-    """交互式测试 WereadHelper 各步骤，方便诊断 Cookie 问题。"""
+    """交互式测试 WereadHelper 各步骤，方便诊断 cURL 问题。"""
     import os
     import sys
     import logging
@@ -371,47 +456,39 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------ #
-    # 1. 读取 Cookie
+    # 1. 读取 cURL
     # ------------------------------------------------------------------ #
-    _sep("Step 1 · 读取 Cookie")
+    _sep("Step 1 · 读取 cURL")
 
-    cookie_str = os.environ.get("WEREAD_COOKIE", "").strip()
-    if not cookie_str:
-        print("未通过环境变量 WEREAD_COOKIE 传入 Cookie，请手动粘贴（回车两次结束）：")
+    curl_str = os.environ.get("WEREAD_CURL", "").strip()
+    if not curl_str:
+        print("未通过环境变量 WEREAD_CURL 传入阅读页 cURL，请手动粘贴（回车两次结束）：")
         lines = []
         while True:
             line = input()
             if line == "":
                 break
             lines.append(line)
-        cookie_str = " ".join(lines).strip()
+        curl_str = "\n".join(lines).strip()
 
-    if not cookie_str:
-        print("[ERROR] 未提供任何 Cookie，退出。")
+    if not curl_str:
+        print("[ERROR] 未提供任何 cURL，退出。")
         sys.exit(1)
 
     # ------------------------------------------------------------------ #
-    # 2. 解析 Cookie
+    # 2. 解析 cURL
     # ------------------------------------------------------------------ #
-    _sep("Step 2 · 解析 Cookie（手动 split）")
+    _sep("Step 2 · 解析 cURL")
 
-    parsed: Dict[str, str] = {}
-    for part in cookie_str.split(";"):
-        part = part.strip()
-        if "=" in part:
-            key, _, value = part.partition("=")
-            parsed[key.strip()] = value.strip()
+    parsed = WereadHelper._parse_curl_string(curl_str)
+    cookie_str = parsed.get("cookie", "")
+    header_map = parsed.get("headers", {})
+    print(f"解析到 Cookie 长度: {len(cookie_str)}")
+    print(f"解析到关键请求头: {sorted(header_map.keys())}")
 
-    print(f"共解析到 {len(parsed)} 个 Cookie 字段：")
-    for k, v in parsed.items():
-        display_v = v[:20] + "..." if len(v) > 20 else v
-        print(f"  {k:30s} = {display_v}")
-
-    if "wr_skey" not in parsed:
-        print("\n[ERROR] Cookie 中不含 wr_skey，请重新从浏览器复制完整 Cookie。")
+    if "x-wrpa-0" not in header_map:
+        print("\n[ERROR] cURL 中不含 x-wrpa-0，请从阅读页重新复制完整 web/book/read 请求。")
         sys.exit(1)
-    else:
-        print(f"\n[OK] wr_skey 已找到，长度 {len(parsed['wr_skey'])} 字符")
 
     # ------------------------------------------------------------------ #
     # 3. 初始化 WereadHelper
@@ -421,9 +498,9 @@ def main() -> None:
     def _notify(title: str, body: str) -> None:
         print(f"[NOTIFY] {title}: {body}")
 
-    helper = WereadHelper(cookie_string=cookie_str, notify_fn=_notify)
+    helper = WereadHelper(curl_string=curl_str, notify_fn=_notify)
     jar = helper.session.cookies
-    key_fields = ["wr_skey", "wr_localId", "wr_vid", "wr_name"]
+    key_fields = ["wr_skey", "wr_vid", "wr_rt", "wr_fp"]
     print("关键 Cookie 字段验证：")
     for f in key_fields:
         val = jar.get(f, default="(未找到)")
@@ -431,55 +508,52 @@ def main() -> None:
         print(f"  {f:20s} = {display}")
 
     # ------------------------------------------------------------------ #
-    # 4. 拉取书架（shelf/sync）
+    # 4. 拉取 notebook
     # ------------------------------------------------------------------ #
-    _sep("Step 4 · 拉取书架（shelf/sync）")
+    _sep("Step 4 · 拉取 notebook")
 
-    helper._refresh_session()
-    raw_shelf = helper._get(helper._url_shelf_sync, params={"synckey": 0})
-    if raw_shelf is None:
-        print("[ERROR] shelf/sync 接口返回 None，Cookie 可能已失效，退出。")
+    notebooks = helper.get_notebook_list()
+    if not notebooks:
+        print("[ERROR] notebook 接口返回空，登录态可能已失效，退出。")
         sys.exit(1)
 
-    shelf_books = raw_shelf.get("books", [])
-    shelf_books.sort(key=lambda x: x.get("readUpdateTime", 0), reverse=True)
-    print(f"[OK] 书架共 {len(shelf_books)} 本，按最近阅读时间排序")
-    print("\n前 3 条原始字段（shelf/sync 返回的字段）：")
-    for item in shelf_books[:3]:
-        book = item.get("book") or item
+    print(f"[OK] notebook 共 {len(notebooks)} 本，按最近交互时间排序")
+    print("\n前 3 条原始字段（notebook 返回的字段）：")
+    for item in notebooks[:3]:
+        book = item.get("book") or {}
         print(f"\n  书名      : {book.get('title', '-')}")
         print(f"  bookId    : {book.get('bookId', '-')}")
-        print(f"  readingProgress (shelf): {item.get('readingProgress', '(无)')}")
-        print(f"  readUpdateTime: {item.get('readUpdateTime', '(无)')}")
-        print(f"  注：markedStatus 需要调用 read_info 接口获取（见 Step 5）")
+        print(f"  sort      : {item.get('sort', '(无)')}")
+        print(f"  noteCount : {item.get('noteCount', '(无)')}")
 
     # ------------------------------------------------------------------ #
-    # 5. 对前 5 本调用 read_info，打印原始字段
+    # 5. 对前 5 本调用 getProgress，打印原始字段
     # ------------------------------------------------------------------ #
-    _sep("Step 5 · read_info 原始返回（前 5 本）")
+    _sep("Step 5 · getProgress 原始返回（前 5 本）")
 
-    for item in shelf_books[:5]:
-        book = item.get("book") or item
+    for item in notebooks[:5]:
+        book = item.get("book") or {}
         book_id = book.get("bookId", "")
         title = book.get("title", "-")
         if not book_id:
             continue
 
-        info = helper.get_read_info(book_id)
+        info = helper.get_book_progress(book_id)
         if info is None:
-            print(f"\n  《{title}》 → read_info 返回 None（接口失败或被限流）")
+            print(f"\n  《{title}》 → getProgress 返回 None（接口失败或被限流）")
             continue
 
-        marked = info.get("markedStatus", "(无)")
-        progress = info.get("readingProgress", "(无)")
-        reading_time = info.get("readingTime", 0)
-        finished_date = info.get("finishedDate", "(无)")
+        book_info = info.get("book") if isinstance(info.get("book"), dict) else info
+        progress = book_info.get("progress", "(无)")
+        reading_time = book_info.get("readingTime", 0)
+        chapter_uid = book_info.get("chapterUid", "(无)")
+        update_time = book_info.get("updateTime", "(无)")
 
         print(f"\n  《{title}》 (bookId={book_id})")
-        print(f"    markedStatus    : {marked}  → {WereadHelper._MARKED_STATUS.get(marked, '未知')}")
-        print(f"    readingProgress : {progress}")
+        print(f"    progress        : {progress}")
         print(f"    readingTime     : {reading_time}s = {WereadHelper.format_reading_time(reading_time)}")
-        print(f"    finishedDate    : {finished_date}")
+        print(f"    chapterUid      : {chapter_uid}")
+        print(f"    updateTime      : {update_time}")
 
     # ------------------------------------------------------------------ #
     # 6. 通过 get_recent_books 整合接口获取
