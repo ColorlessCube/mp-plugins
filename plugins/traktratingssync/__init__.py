@@ -29,7 +29,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.10.0"
+    plugin_version = "3.11.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -996,7 +996,7 @@ class TraktRatingsSync(_PluginBase):
                                         "props": {
                                             "model": "douban_cookie",
                                             "label": "豆瓣 Cookie",
-                                            "placeholder": "从浏览器复制豆瓣 Cookie 粘贴到此处",
+                                            "placeholder": "可直接填豆瓣 Cookie，或粘贴包含 Cookie 的完整豆瓣 cURL",
                                         },
                                     }
                                 ],
@@ -1055,7 +1055,7 @@ class TraktRatingsSync(_PluginBase):
                                         "props": {
                                             "model": "netease_cookie",
                                             "label": "网易云音乐 Cookie（可选）",
-                                            "placeholder": "从浏览器 DevTools → Application → Cookies 中复制 MUSIC_U 等字段",
+                                            "placeholder": "可直接填网易云 Cookie，或粘贴包含 Cookie 的完整网易云 cURL",
                                         },
                                     }
                                 ],
@@ -1084,7 +1084,7 @@ class TraktRatingsSync(_PluginBase):
                                         "props": {
                                             "model": "xiaoyuzhou_cookie",
                                             "label": "小宇宙 FM Token（可选）",
-                                            "placeholder": "从浏览器 DevTools → Application → Cookies 中复制 x-jike-access-token 的值",
+                                            "placeholder": "可直接填 x-jike-access-token，或粘贴包含该字段的完整小宇宙 cURL",
                                         },
                                     }
                                 ],
@@ -1123,11 +1123,11 @@ class TraktRatingsSync(_PluginBase):
                                                 "1. 在 https://trakt.tv/oauth/applications 创建应用获取 Client ID\n"
                                                 "2. 填写 Client Secret 启用自动授权（首次同步时会通过 Bark 发送授权链接，系统阻塞等待10分钟）\n"
                                                 "3. 授权成功后，Access Token 会自动回填到配置中\n"
-                                                "4. 豆瓣 Cookie 需从浏览器手动复制，失效时会通过 Bark 推送通知提醒更新\n"
+                                                "4. 豆瓣支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；失效时会通过 Bark 推送通知提醒更新\n"
                                                 "5. 微信读书请填写阅读页中 web/book/read 请求的完整 cURL，而不是只填 Cookie\n"
                                                 "6. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
-                                                "7. 网易云音乐 Cookie 填写后，会将最近一周听歌记录按专辑聚合，同步到豆瓣音乐「听过」\n"
-                                                "8. 小宇宙 FM Token 填写后，会将最近听取的播客同步到豆瓣「听过」（Token 从浏览器 Cookie 中的 x-jike-access-token 获取）"
+                                                "7. 网易云支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；会将最近一周听歌记录按专辑聚合，同步到豆瓣音乐「听过」\n"
+                                                "8. 小宇宙支持两种填写方式：直接填 x-jike-access-token，或粘贴包含该字段的完整 cURL"
                                             ),
                                         },
                                     }

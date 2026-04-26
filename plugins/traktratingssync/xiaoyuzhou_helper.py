@@ -7,8 +7,10 @@ Token 失效时通过注入的 notify_fn 通知用户。
 直接运行本文件可快速测试：
     python xiaoyuzhou_helper.py
 """
-import time
 import random
+import re
+import shlex
+import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import requests
@@ -69,7 +71,7 @@ class XiaoyuzhouHelper:
         notify_fn: Optional[Callable[[str, str], None]] = None,
     ):
         self._notify = notify_fn or (lambda title, body: None)
-        self._access_token = (access_token or "").strip()
+        self._access_token = self._extract_access_token(access_token)
 
         if not self._access_token:
             logger.warning("未提供小宇宙 access_token，个人数据接口将无法使用")
@@ -94,6 +96,63 @@ class XiaoyuzhouHelper:
         logger.debug("小宇宙%s前随机等待 %.2f 秒", action, delay)
         time.sleep(delay)
 
+    @staticmethod
+    def _extract_cookie_value(cookie_string: str, key: str) -> str:
+        """从 Cookie 字符串中提取指定字段值。"""
+        if not cookie_string or not key:
+            return ""
+        match = re.search(rf"(?:^|;\s*){re.escape(key)}=([^;]+)", cookie_string)
+        return match.group(1).strip() if match else ""
+
+    @classmethod
+    def _extract_access_token(cls, raw_value: Optional[str]) -> str:
+        """兼容纯 token 或完整 curl，提取 x-jike-access-token。"""
+        text = (raw_value or "").strip()
+        if not text:
+            return ""
+
+        if not text.lower().startswith("curl "):
+            if text.startswith("x-jike-access-token="):
+                return text.split("=", 1)[1].strip()
+            return text
+
+        normalized = re.sub(r"\\\n\s*", " ", text).strip()
+        try:
+            parts = shlex.split(normalized)
+        except Exception:
+            logger.warning("解析小宇宙 cURL 失败，回退为原始文本")
+            return text
+
+        for i, part in enumerate(parts):
+            if part in ("-b", "--cookie") and i + 1 < len(parts):
+                cookie_string = parts[i + 1].strip()
+                token = cls._extract_cookie_value(cookie_string, "x-jike-access-token")
+                if token:
+                    logger.debug("已从小宇宙 cURL Cookie 中提取 x-jike-access-token")
+                    return token
+                jt = cls._extract_cookie_value(cookie_string, "_jt")
+                if jt:
+                    match = re.search(r'"accessToken":"([^"]+)"', jt)
+                    if match:
+                        logger.debug("已从小宇宙 cURL 的 _jt 字段中提取 accessToken")
+                        return match.group(1).strip()
+
+        logger.warning("未能从小宇宙 cURL 中提取 x-jike-access-token")
+        return ""
+
+    def _handle_auth_error(self, method: str, url: str) -> None:
+        """统一处理 401，明确提示 Token 问题并通知用户。"""
+        msg = (
+            "小宇宙 Token 失效或填写错误，请重新从浏览器复制 x-jike-access-token，"
+            "或直接粘贴包含该字段的完整 cURL。"
+        )
+        detail = (
+            f"method={method}, url={url}, "
+            f"has_token={bool(self._access_token)}, token_length={len(self._access_token)}"
+        )
+        logger.error("小宇宙 %s 请求失败: %s (HTTP 401)；%s；%s", method, url, msg, detail)
+        self._notify("小宇宙 Token 已失效", f"{msg}\n{detail}")
+
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """GET 请求封装。"""
         try:
@@ -102,6 +161,9 @@ class XiaoyuzhouHelper:
             resp = self.session.get(url, params=params, timeout=10)
             if resp.status_code == 200:
                 return resp.json()
+            if resp.status_code == 401:
+                self._handle_auth_error("GET", url)
+                return None
             logger.error("小宇宙 GET 请求失败: %s (HTTP %d)", url, resp.status_code)
             return None
         except Exception as e:
@@ -116,6 +178,9 @@ class XiaoyuzhouHelper:
             resp = self.session.post(url, json=data or {}, timeout=10)
             if resp.status_code == 200:
                 return resp.json()
+            if resp.status_code == 401:
+                self._handle_auth_error("POST", url)
+                return None
             logger.error("小宇宙 POST 请求失败: %s (HTTP %d)", url, resp.status_code)
             return None
         except Exception as e:

@@ -11,6 +11,8 @@ Cookie 失效时通过注入的 notify_fn 通知用户。
 """
 import json
 import random
+import re
+import shlex
 import string
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -56,12 +58,7 @@ class NeteaseHelper:
         # 使用手动 split 解析而非 SimpleCookie，后者对浏览器复制的 Cookie 字符串
         # 解析不可靠（遇到值含 = 等特殊字符时会静默跳过整个字段）
         if isinstance(cookies, str):
-            self.cookies: Dict[str, str] = {}
-            for part in cookies.split(";"):
-                part = part.strip()
-                if "=" in part:
-                    key, _, value = part.partition("=")
-                    self.cookies[key.strip()] = value.strip()
+            self.cookies = self._parse_cookie_input(cookies)
         elif isinstance(cookies, dict):
             self.cookies = dict(cookies)
         else:
@@ -122,6 +119,65 @@ class NeteaseHelper:
         logger.debug("网易云请求前随机等待 %.2f 秒: %s", delay, endpoint)
         time.sleep(delay)
 
+    @staticmethod
+    def _cookie_string_to_dict(cookie_string: str) -> Dict[str, str]:
+        """将 Cookie 字符串转为字典。"""
+        cookies: Dict[str, str] = {}
+        for part in cookie_string.split(";"):
+            part = part.strip()
+            if "=" in part:
+                key, _, value = part.partition("=")
+                cookies[key.strip()] = value.strip()
+        return cookies
+
+    @classmethod
+    def _parse_cookie_input(cls, raw_value: str) -> Dict[str, str]:
+        """兼容纯 Cookie 字符串或完整 curl，提取网易云 Cookie。"""
+        text = (raw_value or "").strip()
+        if not text:
+            return {}
+        if not text.lower().startswith("curl "):
+            return cls._cookie_string_to_dict(text)
+
+        normalized = re.sub(r"\\\n\s*", " ", text).strip()
+        try:
+            parts = shlex.split(normalized)
+        except Exception:
+            logger.warning("解析网易云 cURL 失败，回退为原始 Cookie 字符串")
+            return cls._cookie_string_to_dict(text)
+
+        cookie_string = ""
+        for i, part in enumerate(parts):
+            if part in ("-b", "--cookie") and i + 1 < len(parts):
+                cookie_string = parts[i + 1].strip()
+                break
+            if part in ("-H", "--header") and i + 1 < len(parts):
+                header = parts[i + 1]
+                if header.lower().startswith("cookie:"):
+                    cookie_string = header.split(":", 1)[1].strip()
+                    break
+
+        if cookie_string:
+            logger.debug("已从网易云 cURL 中提取 Cookie")
+            return cls._cookie_string_to_dict(cookie_string)
+
+        logger.warning("未能从网易云 cURL 中提取 Cookie")
+        return {}
+
+    def _auth_context(self) -> str:
+        """返回当前网易云鉴权上下文摘要。"""
+        return (
+            f"cookie_count={len(self.cookies)}, "
+            f"has_music_u={bool(self.cookies.get('MUSIC_U'))}, "
+            f"has_csrf={bool(self.cookies.get('__csrf'))}, "
+            f"user_agent={self._headers.get('User-Agent', '')[:120]}"
+        )
+
+    def _notify_auth_failure(self, message: str, detail: str) -> None:
+        """统一记录并通知网易云鉴权失败。"""
+        logger.error("%s 详情: %s", message, detail)
+        self._notify("网易云 Cookie 已失效", f"{message}\n{detail}")
+
     # ------------------------------------------------------------------
     # 网络请求
     # ------------------------------------------------------------------
@@ -175,9 +231,12 @@ class NeteaseHelper:
             code = data.get("code")
             # 301 / 401 通常表示未登录或 Cookie 失效
             if code in (301, 401):
-                msg = "网易云音乐 Cookie 已失效，请重新从浏览器复制 MUSIC_U 并更新配置。"
-                logger.error(msg)
-                self._notify("网易云 Cookie 已失效", msg)
+                msg = "网易云音乐 Cookie 已失效或填写错误，请重新从浏览器复制 MUSIC_U / __csrf，或直接粘贴包含 Cookie 的完整 cURL。"
+                detail = (
+                    f"endpoint={endpoint}, code={code}, api_msg={data.get('msg', data.get('message', ''))}, "
+                    f"{self._auth_context()}"
+                )
+                self._notify_auth_failure(msg, detail)
                 return None
 
             logger.warning(
@@ -187,7 +246,15 @@ class NeteaseHelper:
             return None
 
         except requests.HTTPError as e:
-            logger.error("网易云音乐 API HTTP 错误: %s", e)
+            if e.response is not None and e.response.status_code in (401, 403):
+                msg = "网易云音乐请求被拒绝，Cookie 可能已失效、填写错误或被风控，请重新复制 Cookie 或完整 cURL。"
+                detail = (
+                    f"endpoint={endpoint}, status={e.response.status_code}, body={(e.response.text or '')[:200]}, "
+                    f"{self._auth_context()}"
+                )
+                self._notify_auth_failure(msg, detail)
+            else:
+                logger.error("网易云音乐 API HTTP 错误: %s", e)
         except requests.RequestException as e:
             logger.error("网易云音乐 API 请求异常: %s", e)
         except Exception as e:
@@ -271,16 +338,16 @@ class NeteaseHelper:
             播放记录列表，每项含 id / name / artists / album / play_count / score
         """
         if not self.cookies.get("MUSIC_U"):
-            logger.error("获取最近播放记录需要登录，请提供 MUSIC_U Cookie")
+            msg = "获取最近播放记录需要登录，请提供有效的网易云 Cookie 或完整 cURL。"
+            detail = self._auth_context()
+            self._notify_auth_failure(msg, detail)
             return []
 
         uid = self.get_current_uid()
         if not uid:
-            logger.error("无法获取当前用户 uid，请检查 Cookie 是否有效")
-            self._notify(
-                "网易云 Cookie 已失效",
-                "无法获取当前用户 uid，Cookie 可能已失效，请重新复制 MUSIC_U 并更新配置。",
-            )
+            msg = "无法获取当前用户 uid，Cookie 可能已失效、填写错误或缺少 __csrf。"
+            detail = self._auth_context()
+            self._notify_auth_failure(msg, detail)
             return []
 
         records = self.get_user_record(uid, record_type=1)

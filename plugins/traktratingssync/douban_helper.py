@@ -6,6 +6,7 @@ Cookie 需在插件配置中手动填写，失效时通过注入的 notify_fn �
 """
 import random
 import re
+import shlex
 import time
 from typing import Callable, List, Optional, Tuple
 from urllib.parse import unquote
@@ -47,14 +48,7 @@ class DoubanHelper:
         self._notify = notify_fn or (lambda title, body: None)
 
         if user_cookie:
-            # 手动 split 解析，兼容浏览器复制的 Cookie 字符串
-            # SimpleCookie 对值含特殊字符的字段会静默跳过，导致关键字段丢失
-            self.cookies = {}
-            for part in user_cookie.split(";"):
-                part = part.strip()
-                if "=" in part:
-                    key, _, value = part.partition("=")
-                    self.cookies[key.strip()] = value.strip()
+            self.cookies = self._parse_cookie_input(user_cookie)
         else:
             self.cookies = {}
             logger.warning("未配置豆瓣 Cookie，请在插件配置中填写")
@@ -80,9 +74,8 @@ class DoubanHelper:
                 self._authenticated = True
                 logger.debug("豆瓣认证成功 ck:%s", self.ck)
             else:
-                msg = "豆瓣 Cookie 已失效，请重新从浏览器复制并更新配置。"
-                logger.error(msg)
-                self._notify("豆瓣 Cookie 已失效", msg)
+                msg = "豆瓣 Cookie 已失效或填写错误，请重新从浏览器复制 Cookie 或完整 cURL 并更新配置。"
+                self._notify_auth_failure("豆瓣 Cookie 已失效", msg, self._auth_context())
         else:
             self.ck = None
 
@@ -106,7 +99,7 @@ class DoubanHelper:
             self._sleep_before_request("刷新 ck")
             response = requests.get(self._URL_DOUBAN, headers=self.headers, timeout=10)
         except Exception as e:
-            logger.warning("刷新豆瓣 ck 请求失败: %s", e)
+            logger.warning("刷新豆瓣 ck 请求失败: %s；%s", e, self._auth_context())
             self.cookies["ck"] = ""
             return
         ck_str = response.headers.get("Set-Cookie", "")
@@ -140,6 +133,66 @@ class DoubanHelper:
         delay = random.uniform(*self._REQUEST_JITTER_RANGE)
         logger.debug("豆瓣%s前随机等待 %.2f 秒", action, delay)
         time.sleep(delay)
+
+    def _auth_context(self) -> str:
+        """返回当前豆瓣鉴权上下文摘要。"""
+        return (
+            f"cookie_count={len(self.cookies)}, "
+            f"has_dbcl2={bool(self.cookies.get('dbcl2'))}, "
+            f"has_ck={bool(self.cookies.get('ck') or getattr(self, 'ck', ''))}, "
+            f"has_bid={bool(self.cookies.get('bid'))}, "
+            f"user_agent={self.headers.get('User-Agent', '')[:120]}"
+        )
+
+    def _notify_auth_failure(self, title: str, message: str, detail: str) -> None:
+        """统一记录并通知豆瓣鉴权失败。"""
+        logger.error("%s 详情: %s", message, detail)
+        self._notify(title, f"{message}\n{detail}")
+
+    @staticmethod
+    def _cookie_string_to_dict(cookie_string: str) -> dict:
+        """将 Cookie 字符串转为字典。"""
+        cookies = {}
+        for part in cookie_string.split(";"):
+            part = part.strip()
+            if "=" in part:
+                key, _, value = part.partition("=")
+                cookies[key.strip()] = value.strip()
+        return cookies
+
+    @classmethod
+    def _parse_cookie_input(cls, raw_value: str) -> dict:
+        """兼容纯 Cookie 字符串或完整 curl，提取豆瓣 Cookie。"""
+        text = (raw_value or "").strip()
+        if not text:
+            return {}
+        if not text.lower().startswith("curl "):
+            return cls._cookie_string_to_dict(text)
+
+        normalized = re.sub(r"\\\n\s*", " ", text).strip()
+        try:
+            parts = shlex.split(normalized)
+        except Exception:
+            logger.warning("解析豆瓣 cURL 失败，回退为原始 Cookie 字符串")
+            return cls._cookie_string_to_dict(text)
+
+        cookie_string = ""
+        for i, part in enumerate(parts):
+            if part in ("-b", "--cookie") and i + 1 < len(parts):
+                cookie_string = parts[i + 1].strip()
+                break
+            if part in ("-H", "--header") and i + 1 < len(parts):
+                header = parts[i + 1]
+                if header.lower().startswith("cookie:"):
+                    cookie_string = header.split(":", 1)[1].strip()
+                    break
+
+        if cookie_string:
+            logger.debug("已从豆瓣 cURL 中提取 Cookie")
+            return cls._cookie_string_to_dict(cookie_string)
+
+        logger.warning("未能从豆瓣 cURL 中提取 Cookie")
+        return {}
 
     def _throttle_search(self) -> None:
         """对豆瓣搜索做最小间隔，降低连续命中风控的概率。"""
@@ -187,9 +240,12 @@ class DoubanHelper:
             logger.error("豆瓣未返回内容")
             return False
         if response.status_code == 403:
-            msg = "豆瓣返回 403，Cookie 可能已失效，请重新从浏览器复制并更新配置。"
-            logger.error(msg)
-            self._notify("豆瓣 Cookie 已失效", msg)
+            msg = "豆瓣返回 403，Cookie 可能已失效、填写错误，或当前请求被风控。请重新复制 Cookie 或完整 cURL 后重试。"
+            detail = (
+                f"url={url}, host={host}, status=403, body={(response.text or '')[:200]}, "
+                f"{self._auth_context()}"
+            )
+            self._notify_auth_failure("豆瓣 Cookie 已失效", msg, detail)
             return False
         if response.status_code == 200:
             ret = response.json().get("r")

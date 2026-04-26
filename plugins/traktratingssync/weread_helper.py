@@ -144,6 +144,23 @@ class WereadHelper:
         except Exception:
             pass
 
+    def _auth_context(self) -> str:
+        """返回当前微信读书鉴权上下文摘要。"""
+        cookie_keys = sorted(self.session.cookies.keys())
+        return (
+            f"cookie_count={len(cookie_keys)}, "
+            f"has_wr_skey={'wr_skey' in self.session.cookies}, "
+            f"has_wr_vid={'wr_vid' in self.session.cookies}, "
+            f"has_wr_rt={'wr_rt' in self.session.cookies}, "
+            f"has_x_wrpa_0={bool(self.session.headers.get('x-wrpa-0'))}, "
+            f"referer={self.session.headers.get('Referer', '')[:120]}"
+        )
+
+    def _notify_auth_failure(self, title: str, message: str, detail: str) -> None:
+        """统一记录并通知微信读书鉴权失败。"""
+        logger.error("%s 详情: %s", message, detail)
+        self._notify(title, f"{message}\n{detail}")
+
     def _sleep_before_request(self, action: str) -> None:
         """请求前随机等待，降低批量同步的固定节奏。"""
         delay = random.uniform(*self._REQUEST_JITTER_RANGE)
@@ -168,9 +185,12 @@ class WereadHelper:
                 if errcode is not None and errcode != 0:
                     # -2012 / -2010 通常表示未登录或登录态失效
                     if errcode in (-2012, -2010, -1012):
-                        msg = "微信读书登录态已失效，请重新从浏览器阅读页复制完整 cURL 并更新配置。"
-                        logger.error(msg)
-                        self._notify("微信读书登录态已失效", msg)
+                        msg = "微信读书登录态已失效或 cURL 鉴权上下文不完整，请重新从浏览器阅读页复制完整 cURL 并更新配置。"
+                        detail = (
+                            f"url={url}, errcode={errcode}, errmsg={errmsg}, "
+                            f"{self._auth_context()}"
+                        )
+                        self._notify_auth_failure("微信读书登录态已失效", msg, detail)
                     else:
                         logger.warning(
                             "微信读书 API 返回错误: url=%s, errcode=%s, errmsg=%s",
@@ -184,9 +204,12 @@ class WereadHelper:
 
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
-                msg = "微信读书登录态已失效（HTTP 401），请重新从浏览器阅读页复制完整 cURL 并更新配置。"
-                logger.error(msg)
-                self._notify("微信读书登录态已失效", msg)
+                msg = "微信读书登录态已失效（HTTP 401）或 cURL 鉴权上下文不完整，请重新从浏览器阅读页复制完整 cURL 并更新配置。"
+                detail = (
+                    f"url={url}, status=401, body={(e.response.text or '')[:200]}, "
+                    f"{self._auth_context()}"
+                )
+                self._notify_auth_failure("微信读书登录态已失效", msg, detail)
             else:
                 logger.error("微信读书 HTTP 错误: %s", e)
         except requests.RequestException as e:
