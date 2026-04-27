@@ -10,6 +10,7 @@
   - NeteaseHelper    → 网易云音乐 Web API（最近播放记录，按专辑聚合）
   - XiaoyuzhouHelper → 小宇宙 FM API（播客听取历史）
 """
+import hashlib
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,7 +30,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.12.0"
+    plugin_version = "3.13.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -53,6 +54,7 @@ class TraktRatingsSync(_PluginBase):
     _max_sync_count: int = 0  # 0 = 不限制
     _cron: str = "0 2 * * *"
     _bark_webhook_url: str = ""
+    _weread_auth_notify_cooldown: int = 6 * 60 * 60
 
     # helper 实例（延迟初始化）
     _douban_helper: Optional[DoubanHelper] = None
@@ -283,7 +285,7 @@ class TraktRatingsSync(_PluginBase):
         if not self._weread_helper:
             self._weread_helper = WereadHelper(
                 curl_string=self._weread_curl,
-                notify_fn=self._send_bark_notification,
+                notify_fn=self._send_weread_auth_notification,
             )
 
         logger.info("开始同步微信读书最近阅读记录...")
@@ -787,6 +789,33 @@ class TraktRatingsSync(_PluginBase):
         except Exception as e:
             logger.error("❌ Bark 通知发送异常: %s", e)
             return False
+
+    def _send_weread_auth_notification(self, title: str, content: str) -> bool:
+        """发送微信读书鉴权失败通知，并按 cURL 指纹做持久化冷却。"""
+        fingerprint = hashlib.sha256(self._weread_curl.encode("utf-8")).hexdigest()[:16]
+        state = self.get_data("weread_auth_notify_state") or {}
+        now = int(time.time())
+        try:
+            last_notified_at = int(state.get("last_notified_at") or 0)
+        except (TypeError, ValueError):
+            last_notified_at = 0
+
+        if (
+            state.get("fingerprint") == fingerprint
+            and now - last_notified_at < self._weread_auth_notify_cooldown
+        ):
+            logger.warning(
+                "微信读书鉴权失败通知仍在冷却期内，跳过 Bark 推送: cooldown=%ss",
+                self._weread_auth_notify_cooldown,
+            )
+            return False
+
+        self.save_data("weread_auth_notify_state", {
+            "fingerprint": fingerprint,
+            "last_notified_at": now,
+            "title": title,
+        })
+        return self._send_bark_notification(title, content)
 
     # ------------------------------------------------------------------
     # 插件接口

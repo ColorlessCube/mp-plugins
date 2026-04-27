@@ -36,6 +36,7 @@ class WereadHelper:
         4: "读完",
     }
     _REQUEST_JITTER_RANGE = (0.8, 2.0)
+    _AUTH_FAILURE_NOTIFY_COOLDOWN = 6 * 60 * 60
 
     def __init__(
         self,
@@ -43,6 +44,8 @@ class WereadHelper:
         notify_fn: Optional[Callable[[str, str], None]] = None,
     ):
         self._notify = notify_fn or (lambda title, body: None)
+        self._auth_failed = False
+        self._last_auth_failure_notify_at = 0.0
 
         # 实例级 URL 常量（便于测试替换）
         self._base_url = "https://weread.qq.com"
@@ -138,6 +141,9 @@ class WereadHelper:
 
     def _refresh_session(self) -> None:
         """访问首页以刷新 Session，防止登录态过期"""
+        if self._auth_failed:
+            logger.debug("微信读书登录态已标记失效，跳过刷新 Session")
+            return
         try:
             self._sleep_before_request("刷新 Session")
             self.session.get(self._base_url, timeout=10)
@@ -159,6 +165,17 @@ class WereadHelper:
     def _notify_auth_failure(self, title: str, message: str, detail: str) -> None:
         """统一记录并通知微信读书鉴权失败。"""
         logger.error("%s 详情: %s", message, detail)
+        self._auth_failed = True
+
+        now = time.time()
+        if now - self._last_auth_failure_notify_at < self._AUTH_FAILURE_NOTIFY_COOLDOWN:
+            logger.warning(
+                "微信读书鉴权失败通知已在冷却期内，跳过重复推送: title=%s, cooldown=%ss",
+                title, self._AUTH_FAILURE_NOTIFY_COOLDOWN,
+            )
+            return
+
+        self._last_auth_failure_notify_at = now
         self._notify(title, f"{message}\n{detail}")
 
     def _sleep_before_request(self, action: str) -> None:
@@ -169,6 +186,10 @@ class WereadHelper:
 
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """GET 请求封装，自动检测登录态失效并通知，失败返回 None"""
+        if self._auth_failed:
+            logger.warning("微信读书登录态已标记失效，跳过请求: url=%s", url)
+            return None
+
         try:
             self._sleep_before_request("GET")
             resp = self.session.get(url, params=params, timeout=15)
@@ -203,10 +224,11 @@ class WereadHelper:
             return data
 
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 401:
-                msg = "微信读书登录态已失效（HTTP 401）或 cURL 鉴权上下文不完整，请重新从浏览器阅读页复制完整 cURL 并更新配置。"
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code in (401, 403):
+                msg = f"微信读书登录态已失效（HTTP {status_code}）或 cURL 鉴权上下文不完整，请重新从浏览器阅读页复制完整 cURL 并更新配置。"
                 detail = (
-                    f"url={url}, status=401, body={(e.response.text or '')[:200]}, "
+                    f"url={url}, status={status_code}, body={(e.response.text or '')[:200]}, "
                     f"{self._auth_context()}"
                 )
                 self._notify_auth_failure("微信读书登录态已失效", msg, detail)
@@ -321,6 +343,9 @@ class WereadHelper:
 
         if include_progress:
             for entry in result:
+                if self._auth_failed:
+                    logger.warning("微信读书登录态已失效，停止继续拉取单本阅读进度")
+                    break
                 book_id = entry.get("book_id", "")
                 if not book_id:
                     continue
