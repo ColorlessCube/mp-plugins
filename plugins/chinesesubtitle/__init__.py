@@ -36,7 +36,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -454,8 +454,13 @@ class ChineseSubtitle(_PluginBase):
             logger.info(f"ASSRT 字幕详情无可下载文件，ID：{sub_id}")
             return None
         detail = details[0]
-        urls = [f.get("url") for f in detail.get("filelist") or [] if f.get("url")]
-        if detail.get("url"):
+        file_urls = [f.get("url") for f in detail.get("filelist") or [] if f.get("url")]
+        supported_file_urls = [url for url in file_urls if not self._unsupported_subtitle_url_suffix(url)]
+        if file_urls and not supported_file_urls:
+            logger.info(f"ASSRT 字幕详情仅包含不支持的字幕文件，跳过候选，ID：{sub_id}")
+            return None
+        urls = supported_file_urls
+        if not file_urls and detail.get("url"):
             urls.append(detail.get("url"))
         if not urls:
             logger.info(f"ASSRT 字幕详情未返回下载地址，ID：{sub_id}")
