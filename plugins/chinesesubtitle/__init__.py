@@ -7,7 +7,7 @@ from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from apscheduler.triggers.cron import CronTrigger
 
@@ -36,7 +36,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -189,6 +189,7 @@ class ChineseSubtitle(_PluginBase):
                     logger.info(f"{source} 未找到匹配中文字幕：{video_path.name}")
                     continue
                 for candidate in candidates[: self._max_candidates]:
+                    logger.info(f"尝试下载中文字幕候选：{video_path.name} - {candidate.source} - {candidate.title}")
                     saved = self._download_candidate(candidate, video_path)
                     if saved:
                         logger.info(f"中文字幕下载完成：{saved}")
@@ -444,19 +445,27 @@ class ChineseSubtitle(_PluginBase):
             params={"token": self._assrt_token, "id": sub_id},
         )
         if not res or res.status_code != 200:
+            status_code = res.status_code if res is not None else "无响应"
+            logger.warn(f"ASSRT 字幕详情获取失败，ID：{sub_id}，状态：{status_code}")
             return None
         data = res.json()
         details = ((data.get("sub") or {}).get("subs") or []) if data.get("status") == 0 else []
         if not details:
+            logger.info(f"ASSRT 字幕详情无可下载文件，ID：{sub_id}")
             return None
         detail = details[0]
         urls = [f.get("url") for f in detail.get("filelist") or [] if f.get("url")]
         if detail.get("url"):
             urls.append(detail.get("url"))
+        if not urls:
+            logger.info(f"ASSRT 字幕详情未返回下载地址，ID：{sub_id}")
+            return None
         for url in urls:
+            logger.info(f"开始下载 ASSRT 字幕文件，ID：{sub_id}，地址：{self._safe_url_for_log(url)}")
             saved = self._download_url(url, video_path)
             if saved:
                 return saved
+            logger.info(f"ASSRT 字幕文件下载未成功，ID：{sub_id}，地址：{self._safe_url_for_log(url)}")
         return None
 
     def _download_opensubtitles(self, candidate: SubtitleCandidate, video_path: Path) -> Optional[Path]:
@@ -490,6 +499,8 @@ class ChineseSubtitle(_PluginBase):
     def _download_url(self, url: str, video_path: Path) -> Optional[Path]:
         res = RequestUtils(timeout=self._timeout).get_res(url)
         if not res or res.status_code != 200 or not res.content:
+            status_code = res.status_code if res is not None else "无响应"
+            logger.warn(f"字幕文件下载失败，状态：{status_code}，地址：{self._safe_url_for_log(url)}")
             return None
         content = res.content
         content_type = (res.headers.get("Content-Type") or "").lower()
@@ -501,6 +512,13 @@ class ChineseSubtitle(_PluginBase):
         target = self._target_subtitle_path(video_path, suffix)
         target.write_bytes(content)
         return target
+
+    @staticmethod
+    def _safe_url_for_log(url: str) -> str:
+        parsed = urlparse(url or "")
+        if not parsed.netloc:
+            return ""
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
     def _save_from_zip(self, content: bytes, video_path: Path) -> Optional[Path]:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:

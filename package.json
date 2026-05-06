@@ -34,7 +34,7 @@
   "ChineseSubtitle" : {
     "name": "中文字幕下载",
     "description": "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "icon": "subtitle.png",
     "author": "ColorlessCube",
     "level": 1,
@@ -43,7 +43,8 @@
     "history": {
       "v1.0.0": "首次发布：从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕",
       "v1.1.0": "优化 ASSRT 搜索结果",
-      "v1.2.0": "增加 ASSRT 搜素节流"
+      "v1.2.0": "增加 ASSRT 搜素节流",
+      "v1.2.1": "增加 ASSRT 候选详情与字幕文件下载诊断日志"
     }
   }
 }
