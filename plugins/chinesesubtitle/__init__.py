@@ -37,7 +37,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.5"
+    plugin_version = "1.2.6"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -70,6 +70,7 @@ class ChineseSubtitle(_PluginBase):
     _assrt_last_request_time: float = 0
     _assrt_backoff_until: float = 0
     _assrt_request_lock = threading.Lock()
+    _subtitle_task_lock = threading.RLock()
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -123,50 +124,55 @@ class ChineseSubtitle(_PluginBase):
             "name": "中文字幕目录扫描",
             "trigger": trigger,
             "func": self.scan_library,
-            "kwargs": {},
+            "kwargs": {
+                "coalesce": True,
+                "max_instances": 1,
+            },
         }]
 
     @eventmanager.register(EventType.TransferComplete)
     def transfer_complete(self, event: Event):
-        if not self._enable:
-            return
-        event_data = event.event_data or {}
-        fileitem = event_data.get("fileitem")
-        mediainfo = event_data.get("mediainfo")
-        meta = event_data.get("meta")
-        transferinfo = event_data.get("transferinfo")
+        with type(self)._subtitle_task_lock:
+            if not self._enable:
+                return
+            event_data = event.event_data or {}
+            fileitem = event_data.get("fileitem")
+            mediainfo = event_data.get("mediainfo")
+            meta = event_data.get("meta")
+            transferinfo = event_data.get("transferinfo")
 
-        target_item = getattr(transferinfo, "target_item", None) if transferinfo else None
-        video_path = Path((target_item or fileitem).path) if (target_item or fileitem) else None
-        storage = getattr(target_item or fileitem, "storage", "local") if (target_item or fileitem) else "local"
-        self._process_video(video_path=video_path, mediainfo=mediainfo, meta=meta, storage=storage)
+            target_item = getattr(transferinfo, "target_item", None) if transferinfo else None
+            video_path = Path((target_item or fileitem).path) if (target_item or fileitem) else None
+            storage = getattr(target_item or fileitem, "storage", "local") if (target_item or fileitem) else "local"
+            self._process_video(video_path=video_path, mediainfo=mediainfo, meta=meta, storage=storage)
 
     def scan_library(self):
-        if not self._enable or not self._scan_enable:
-            return
-        scan_dirs = self._scan_directories()
-        if not scan_dirs:
-            logger.warn("中文字幕目录扫描未配置扫描目录")
-            return
-        attempted = 0
-        downloaded = 0
-        missing = 0
-        logger.info(f"开始扫描缺失中文字幕视频，目录数：{len(scan_dirs)}")
-        for scan_dir in scan_dirs:
-            if not scan_dir.exists() or not scan_dir.is_dir():
-                logger.warn(f"中文字幕扫描目录不存在或不是目录：{scan_dir}")
-                continue
-            for video_path in self._iter_video_files(scan_dir):
-                if attempted >= self._scan_limit:
-                    logger.info(f"中文字幕目录扫描达到单次尝试上限：{self._scan_limit}")
-                    return
-                if self._has_existing_subtitle(video_path):
+        with type(self)._subtitle_task_lock:
+            if not self._enable or not self._scan_enable:
+                return
+            scan_dirs = self._scan_directories()
+            if not scan_dirs:
+                logger.warn("中文字幕目录扫描未配置扫描目录")
+                return
+            attempted = 0
+            downloaded = 0
+            missing = 0
+            logger.info(f"开始扫描缺失中文字幕视频，目录数：{len(scan_dirs)}")
+            for scan_dir in scan_dirs:
+                if not scan_dir.exists() or not scan_dir.is_dir():
+                    logger.warn(f"中文字幕扫描目录不存在或不是目录：{scan_dir}")
                     continue
-                missing += 1
-                attempted += 1
-                if self._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local"):
-                    downloaded += 1
-        logger.info(f"中文字幕目录扫描完成，发现缺字幕视频 {missing} 个，尝试 {attempted} 个，成功下载 {downloaded} 个")
+                for video_path in self._iter_video_files(scan_dir):
+                    if attempted >= self._scan_limit:
+                        logger.info(f"中文字幕目录扫描达到单次尝试上限：{self._scan_limit}")
+                        return
+                    if self._has_existing_subtitle(video_path):
+                        continue
+                    missing += 1
+                    attempted += 1
+                    if self._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local"):
+                        downloaded += 1
+            logger.info(f"中文字幕目录扫描完成，发现缺字幕视频 {missing} 个，尝试 {attempted} 个，成功下载 {downloaded} 个")
 
     def _process_video(self, video_path: Optional[Path], mediainfo: Any = None,
                        meta: Any = None, storage: str = "local") -> bool:
