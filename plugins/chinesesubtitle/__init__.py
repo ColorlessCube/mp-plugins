@@ -36,7 +36,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -497,6 +497,10 @@ class ChineseSubtitle(_PluginBase):
         return res
 
     def _download_url(self, url: str, video_path: Path) -> Optional[Path]:
+        url_suffix = Path(urlparse(url or "").path).suffix.lower()
+        if url_suffix and url_suffix != ".zip" and url_suffix not in settings.RMT_SUBEXT:
+            logger.info(f"跳过不支持的字幕文件格式：{url_suffix}，地址：{self._safe_url_for_log(url)}")
+            return None
         res = RequestUtils(timeout=self._timeout).get_res(url)
         if not res or res.status_code != 200 or not res.content:
             status_code = res.status_code if res is not None else "无响应"
