@@ -30,5 +30,18 @@
       "v3.12.0": "优化多平台凭证兼容性与鉴权诊断：支持豆瓣、网易云、小宇宙完整 cURL 直贴；增强网易云 Cookie、请求头与 csrf_token 提取及冲突检测；完善微信读书、小宇宙、网易云、豆瓣鉴权失败日志与推送通知",
       "v3.13.0": "优化微信读书鉴权失效处理：识别 read API cURL 失效后停止后续进度请求，并按 cURL 指纹对 Bark 推送做持久化冷却，避免定时触发时重复通知"
     }
+  },
+  "ChineseSubtitle" : {
+    "name": "中文字幕下载",
+    "description": "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕",
+    "version": "1.0.0",
+    "icon": "subtitle.png",
+    "author": "ColorlessCube",
+    "level": 1,
+    "v2": true,
+    "labels": "同步,字幕",
+    "history": {
+      "v1.0.0": "首次发布：从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕"
+    }
   }
 }
