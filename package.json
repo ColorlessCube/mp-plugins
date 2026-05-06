@@ -34,7 +34,7 @@
   "ChineseSubtitle" : {
     "name": "中文字幕下载",
     "description": "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕",
-    "version": "1.2.4",
+    "version": "1.2.5",
     "icon": "subtitle.png",
     "author": "ColorlessCube",
     "level": 1,
@@ -47,7 +47,8 @@
       "v1.2.1": "增加 ASSRT 候选详情与字幕文件下载诊断日志",
       "v1.2.2": "跳过 ASSRT 返回的非文本字幕文件，避免下载 SUP 等大文件导致扫描长时间阻塞",
       "v1.2.3": "前置过滤 ASSRT 非文本字幕地址，避免 SUP 文件进入下载流程",
-      "v1.2.4": "ASSRT 候选仅包含 SUP 等非文本字幕时跳过整个候选，避免继续请求异常压缩包地址"
+      "v1.2.4": "ASSRT 候选仅包含 SUP 等非文本字幕时跳过整个候选，避免继续请求异常压缩包地址",
+      "v1.2.5": "增加线程安全的 ASSRT 全局请求节流，触发 509 后自动退避"
     }
   }
 }

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import io
 import re
+import threading
 import time
 import zipfile
 from difflib import SequenceMatcher
@@ -36,7 +37,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.5"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -67,6 +68,8 @@ class ChineseSubtitle(_PluginBase):
     _opensubtitles_token: str = ""
     _opensubtitles_token_time: float = 0
     _assrt_last_request_time: float = 0
+    _assrt_backoff_until: float = 0
+    _assrt_request_lock = threading.Lock()
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -496,13 +499,26 @@ class ChineseSubtitle(_PluginBase):
         return self._download_url(link, video_path)
 
     def _assrt_get_res(self, url: str, params: dict):
-        if self._assrt_interval > 0 and self._assrt_last_request_time:
-            wait_seconds = self._assrt_interval - (time.time() - self._assrt_last_request_time)
+        cls = type(self)
+        with cls._assrt_request_lock:
+            now = time.time()
+            interval_wait = 0
+            if self._assrt_interval > 0 and cls._assrt_last_request_time:
+                interval_wait = self._assrt_interval - (now - cls._assrt_last_request_time)
+            wait_seconds = max(
+                cls._assrt_backoff_until - now,
+                interval_wait,
+            )
             if wait_seconds > 0:
+                logger.info(f"ASSRT 请求节流等待 {wait_seconds:.1f} 秒")
                 time.sleep(wait_seconds)
-        res = RequestUtils(timeout=self._timeout).get_res(url, params=params)
-        self._assrt_last_request_time = time.time()
-        return res
+            res = RequestUtils(timeout=self._timeout).get_res(url, params=params)
+            cls._assrt_last_request_time = time.time()
+            if res is not None and res.status_code == 509:
+                backoff_seconds = self._assrt_backoff_seconds(res)
+                cls._assrt_backoff_until = time.time() + backoff_seconds
+                logger.warn(f"ASSRT 触发流控 509，暂停请求 {backoff_seconds} 秒")
+            return res
 
     def _download_url(self, url: str, video_path: Path) -> Optional[Path]:
         if self._unsupported_subtitle_url_suffix(url):
@@ -535,6 +551,12 @@ class ChineseSubtitle(_PluginBase):
     def _unsupported_subtitle_url_suffix(url: str) -> bool:
         url_suffix = Path(urlparse(url or "").path).suffix.lower()
         return bool(url_suffix and url_suffix != ".zip" and url_suffix not in settings.RMT_SUBEXT)
+
+    def _assrt_backoff_seconds(self, res) -> int:
+        retry_after = (res.headers.get("Retry-After") or "").strip() if getattr(res, "headers", None) else ""
+        if retry_after.isdigit():
+            return max(10, min(int(retry_after), 300))
+        return max(30, min(self._assrt_interval * 10, 300))
 
     def _save_from_zip(self, content: bytes, video_path: Path) -> Optional[Path]:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:
