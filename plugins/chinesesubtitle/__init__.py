@@ -36,7 +36,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -56,6 +56,7 @@ class ChineseSubtitle(_PluginBase):
     _scan_limit: int = 50
 
     _assrt_token: str = ""
+    _assrt_interval: int = 3
     _opensubtitles_api_key: str = ""
     _opensubtitles_username: str = ""
     _opensubtitles_password: str = ""
@@ -65,7 +66,7 @@ class ChineseSubtitle(_PluginBase):
 
     _opensubtitles_token: str = ""
     _opensubtitles_token_time: float = 0
-    _assrt_limited_until: float = 0
+    _assrt_last_request_time: float = 0
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -82,6 +83,7 @@ class ChineseSubtitle(_PluginBase):
         self._scan_dirs = (config.get("scan_dirs") or "").strip()
         self._scan_limit = int(config.get("scan_limit") or 50)
         self._assrt_token = (config.get("assrt_token") or "").strip()
+        self._assrt_interval = max(0, int(config.get("assrt_interval") or 3))
         self._opensubtitles_api_key = (config.get("opensubtitles_api_key") or "").strip()
         self._opensubtitles_username = (config.get("opensubtitles_username") or "").strip()
         self._opensubtitles_password = (config.get("opensubtitles_password") or "").strip()
@@ -258,66 +260,61 @@ class ChineseSubtitle(_PluginBase):
         return []
 
     def _search_assrt(self, video_path: Path, mediainfo: Any, meta: Any) -> List[SubtitleCandidate]:
-        if self._assrt_limited_until and time.time() < self._assrt_limited_until:
-            logger.warn("ASSRT 请求仍在限流冷却中，跳过本次搜索")
-            return []
-        candidates = []
         seen_ids = set()
         target_title = self._target_title(video_path, mediainfo, meta)
         target_year = self._target_year(video_path, mediainfo, meta)
         target_resolution = self._target_resolution(video_path)
-        for query, is_file in self._assrt_queries(video_path, mediainfo, meta):
-            params = {
-                "token": self._assrt_token,
-                "q": query,
-                "cnt": 15,
-                "pos": 0,
-                "is_file": 1 if is_file else 0,
-            }
-            res = RequestUtils(timeout=self._timeout).get_res("https://api.assrt.net/v1/sub/search", params=params)
-            if not res or res.status_code != 200:
-                if res is not None:
-                    logger.warn(f"ASSRT 搜索失败，状态码：{res.status_code}")
-                    if res.status_code in (429, 509):
-                        self._assrt_limited_until = time.time() + 60
-                        logger.warn("ASSRT 触发限流，60 秒内暂停 ASSRT 搜索")
-                        return []
+        query = self._assrt_query(video_path, mediainfo, meta)
+        params = {
+            "token": self._assrt_token,
+            "q": query,
+            "cnt": 15,
+            "pos": 0,
+            "is_file": 0,
+        }
+        res = self._assrt_get_res("https://api.assrt.net/v1/sub/search", params=params)
+        if not res or res.status_code != 200:
+            if res is not None:
+                logger.warn(f"ASSRT 搜索失败，状态码：{res.status_code}")
+            return []
+        data = res.json()
+        subs = ((data.get("sub") or {}).get("subs") or []) if data.get("status") == 0 else []
+        if isinstance(subs, dict):
+            subs = []
+        candidates = []
+        for item in subs:
+            sub_id = item.get("id")
+            if sub_id in seen_ids:
                 continue
-            data = res.json()
-            subs = ((data.get("sub") or {}).get("subs") or []) if data.get("status") == 0 else []
-            if isinstance(subs, dict):
-                subs = []
-            for item in subs:
-                sub_id = item.get("id")
-                if sub_id in seen_ids:
-                    continue
-                lang_desc = ((item.get("lang") or {}).get("desc") or "")
-                text = f"{item.get('native_name') or ''} {item.get('release_site') or ''} {lang_desc}"
-                if not self._looks_chinese(text):
-                    continue
-                match_text = f"{item.get('native_name') or ''} {item.get('videoname') or ''}"
-                score_filter = self._assrt_candidate_score(
-                    target_title=target_title,
-                    target_year=target_year,
-                    target_resolution=target_resolution,
-                    query=query,
-                    match_text=match_text,
-                )
-                if score_filter is None:
-                    continue
-                seen_ids.add(sub_id)
-                score = (
-                        score_filter
-                        + float(item.get("vote_score") or 0) * 5
-                        + min(float(item.get("down_count") or 0), 10000) / 100
-                )
-                candidates.append(SubtitleCandidate(
-                    source="ASSRT",
-                    title=item.get("native_name") or str(sub_id),
-                    language=lang_desc,
-                    score=score,
-                    raw=item,
-                ))
+            lang_desc = ((item.get("lang") or {}).get("desc") or "")
+            text = f"{item.get('native_name') or ''} {item.get('release_site') or ''} {lang_desc}"
+            if not self._looks_chinese(text):
+                continue
+            match_text = f"{item.get('native_name') or ''} {item.get('videoname') or ''}"
+            score_filter = self._assrt_candidate_score(
+                target_title=target_title,
+                target_year=target_year,
+                target_resolution=target_resolution,
+                query=query,
+                match_text=match_text,
+            )
+            if score_filter is None:
+                continue
+            seen_ids.add(sub_id)
+            score = (
+                    score_filter
+                    + float(item.get("vote_score") or 0) * 5
+                    + min(float(item.get("down_count") or 0), 10000) / 100
+            )
+            candidates.append(SubtitleCandidate(
+                source="ASSRT",
+                title=item.get("native_name") or str(sub_id),
+                language=lang_desc,
+                score=score,
+                raw=item,
+            ))
+        if candidates:
+            logger.info(f"ASSRT 通过片名 `{query}` 找到 {len(candidates)} 条候选：{video_path.name}")
         return sorted(candidates, key=lambda x: x.score, reverse=True)
 
     def _search_opensubtitles(self, video_path: Path, mediainfo: Any, meta: Any) -> List[SubtitleCandidate]:
@@ -442,7 +439,7 @@ class ChineseSubtitle(_PluginBase):
         sub_id = (candidate.raw or {}).get("id")
         if not sub_id:
             return None
-        res = RequestUtils(timeout=self._timeout).get_res(
+        res = self._assrt_get_res(
             "https://api.assrt.net/v1/sub/detail",
             params={"token": self._assrt_token, "id": sub_id},
         )
@@ -480,6 +477,15 @@ class ChineseSubtitle(_PluginBase):
         if not link:
             return None
         return self._download_url(link, video_path)
+
+    def _assrt_get_res(self, url: str, params: dict):
+        if self._assrt_interval > 0 and self._assrt_last_request_time:
+            wait_seconds = self._assrt_interval - (time.time() - self._assrt_last_request_time)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+        res = RequestUtils(timeout=self._timeout).get_res(url, params=params)
+        self._assrt_last_request_time = time.time()
+        return res
 
     def _download_url(self, url: str, video_path: Path) -> Optional[Path]:
         res = RequestUtils(timeout=self._timeout).get_res(url)
@@ -532,38 +538,13 @@ class ChineseSubtitle(_PluginBase):
     def _looks_chinese(text: str) -> bool:
         return bool(re.search(r"中|简|繁|双语|字幕组|人人|YYeTs|CHS|CHT|Chinese|zh", text, re.IGNORECASE))
 
-    def _assrt_queries(self, video_path: Path, mediainfo: Any, meta: Any) -> List[Tuple[str, bool]]:
-        queries = []
-
-        def add(query: Optional[str], is_file: bool = False):
-            query = (query or "").strip()
-            if not query:
-                return
-            item = (query, is_file)
-            if item not in queries:
-                queries.append(item)
-
-        add(self._target_title(video_path, mediainfo, meta), False)
-        add(self._clean_query_title(video_path.parent.name), False)
-        add(self._clean_query_title(video_path.stem), False)
-
-        for value in (
-                getattr(mediainfo, "en_title", None),
-                getattr(mediainfo, "original_title", None),
-                getattr(mediainfo, "title", None),
-                getattr(meta, "en_name", None),
-                getattr(meta, "cn_name", None),
-        ):
-            add(value, False)
-
+    def _assrt_query(self, video_path: Path, mediainfo: Any, meta: Any) -> str:
+        query = self._target_title(video_path, mediainfo, meta)
         if self._is_tv(mediainfo, meta):
             season_episode = self._season_episode_from_path(video_path) or self._season_episode_from_meta(mediainfo, meta)
             if season_episode:
-                base_queries = [query for query, is_file in queries if not is_file]
-                for query in base_queries[:4]:
-                    add(f"{query} {season_episode}", False)
-        add(video_path.stem, True)
-        return queries[:7]
+                return f"{query} {season_episode}"
+        return query
 
     def _assrt_candidate_score(self, target_title: str, target_year: str, target_resolution: str,
                                query: str, match_text: str) -> Optional[float]:
@@ -576,7 +557,7 @@ class ChineseSubtitle(_PluginBase):
             return None
 
         candidate_years = set(re.findall(r"\b(19\d{2}|20\d{2})\b", match_text))
-        if target_year and candidate_years and target_year not in candidate_years:
+        if target_year and candidate_years and not self._year_matches(target_year, candidate_years):
             return None
 
         candidate_resolutions = {
@@ -589,7 +570,7 @@ class ChineseSubtitle(_PluginBase):
             if normalized_resolution in {self._normalize_resolution(res) for res in candidate_resolutions}:
                 resolution_score = 20
 
-        year_score = 20 if target_year and target_year in candidate_years else 0
+        year_score = 20 if target_year and self._year_matches(target_year, candidate_years) else 0
         return title_score + year_score + resolution_score
 
     @staticmethod
@@ -641,6 +622,20 @@ class ChineseSubtitle(_PluginBase):
         if resolution == "4k":
             return "2160p"
         return resolution
+
+    @staticmethod
+    def _year_matches(target_year: str, candidate_years: set) -> bool:
+        try:
+            target = int(target_year)
+        except (TypeError, ValueError):
+            return False
+        for year in candidate_years:
+            try:
+                if abs(int(year) - target) <= 1:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     @staticmethod
     def _season_episode_from_path(video_path: Path) -> str:
@@ -818,8 +813,11 @@ class ChineseSubtitle(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
                                 {"component": "VTextField", "props": {"model": "assrt_token", "label": "ASSRT Token", "placeholder": "assrt.net 用户面板中的 API Token"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                                {"component": "VTextField", "props": {"model": "assrt_interval", "label": "ASSRT 请求间隔秒数", "type": "number"}}
                             ]},
                         ],
                     },
@@ -867,6 +865,7 @@ class ChineseSubtitle(_PluginBase):
             "scan_dirs": "",
             "scan_limit": 50,
             "assrt_token": "",
+            "assrt_interval": 3,
             "opensubtitles_api_key": "",
             "opensubtitles_username": "",
             "opensubtitles_password": "",
