@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from urllib.parse import urljoin, urlparse
 
 from apscheduler.triggers.cron import CronTrigger
 
+from app.core.context import MediaInfo
 from app.core.config import settings
 from app.core.event import Event, eventmanager
 from app.helper.directory import DirectoryHelper
@@ -37,7 +39,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.6"
+    plugin_version = "1.2.7"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -170,7 +172,8 @@ class ChineseSubtitle(_PluginBase):
                         continue
                     missing += 1
                     attempted += 1
-                    if self._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local"):
+                    mediainfo = self._mediainfo_from_local_nfo(video_path)
+                    if self._process_video(video_path=video_path, mediainfo=mediainfo, meta=None, storage="local"):
                         downloaded += 1
             logger.info(f"中文字幕目录扫描完成，发现缺字幕视频 {missing} 个，尝试 {attempted} 个，成功下载 {downloaded} 个")
 
@@ -246,6 +249,126 @@ class ChineseSubtitle(_PluginBase):
         for item in scan_dir.rglob("*"):
             if item.is_file() and item.suffix.lower() in settings.RMT_MEDIAEXT:
                 yield item
+
+    def _mediainfo_from_local_nfo(self, video_path: Path) -> Optional[MediaInfo]:
+        fallback_mediainfo = None
+        for nfo_path in self._nfo_candidates(video_path):
+            try:
+                mediainfo = self._parse_nfo_mediainfo(nfo_path)
+            except Exception as err:
+                logger.warn(f"中文字幕扫描解析 NFO 失败：{nfo_path} - {err}")
+                continue
+            if mediainfo and mediainfo.imdb_id:
+                logger.info(
+                    f"中文字幕扫描从 NFO 读取媒体ID：{video_path.name} "
+                    f"imdb={mediainfo.imdb_id or '-'} tmdb={mediainfo.tmdb_id or '-'}"
+                )
+                return mediainfo
+            if mediainfo and mediainfo.tmdb_id and not fallback_mediainfo:
+                fallback_mediainfo = mediainfo
+        if fallback_mediainfo:
+            logger.info(
+                f"中文字幕扫描从 NFO 读取媒体ID：{video_path.name} "
+                f"imdb=- tmdb={fallback_mediainfo.tmdb_id}"
+            )
+        return fallback_mediainfo
+
+    @staticmethod
+    def _nfo_candidates(video_path: Path) -> List[Path]:
+        candidates = []
+        same_stem = video_path.with_suffix(".nfo")
+        if same_stem.exists():
+            candidates.append(same_stem)
+
+        preferred_names = ("movie.nfo", "tvshow.nfo")
+        for name in preferred_names:
+            path = video_path.parent / name
+            if path.exists() and path not in candidates:
+                candidates.append(path)
+
+        for path in sorted(video_path.parent.glob("*.nfo")):
+            if path not in candidates:
+                candidates.append(path)
+        return candidates
+
+    def _parse_nfo_mediainfo(self, nfo_path: Path) -> Optional[MediaInfo]:
+        root = ET.parse(nfo_path).getroot()
+        root_tag = self._strip_xml_namespace(root.tag).lower()
+        imdb_id = self._nfo_first_text(root, "imdbid") or self._nfo_uniqueid(root, "imdb")
+        tmdb_id = self._nfo_first_text(root, "tmdbid") or self._nfo_uniqueid(root, "tmdb")
+        tvdb_id = self._nfo_first_text(root, "tvdbid") or self._nfo_uniqueid(root, "tvdb")
+
+        if not imdb_id:
+            for element in root.findall(".//"):
+                if self._strip_xml_namespace(element.tag).lower() == "uniqueid" and element.text:
+                    value = element.text.strip()
+                    if re.fullmatch(r"tt\d+", value, re.IGNORECASE):
+                        imdb_id = value
+                        break
+
+        tmdb_id_int = self._safe_int(tmdb_id)
+        tvdb_id_int = self._safe_int(tvdb_id)
+        mtype = None
+        if root_tag == "movie":
+            mtype = MediaType.MOVIE
+        elif root_tag in {"tvshow", "episodedetails"}:
+            mtype = MediaType.TV
+
+        title = (
+            self._nfo_first_text(root, "title")
+            or self._nfo_first_text(root, "originaltitle")
+            or self._nfo_first_text(root, "showtitle")
+        )
+        year = self._nfo_first_text(root, "year")
+        if not year:
+            premiered = self._nfo_first_text(root, "premiered") or self._nfo_first_text(root, "aired")
+            if premiered:
+                match = re.search(r"\b(19\d{2}|20\d{2})\b", premiered)
+                year = match.group(1) if match else None
+
+        season = self._safe_int(self._nfo_first_text(root, "season"))
+        return MediaInfo(
+            source="nfo",
+            type=mtype,
+            title=title,
+            year=year,
+            season=season,
+            tmdb_id=tmdb_id_int,
+            imdb_id=imdb_id.strip() if imdb_id else None,
+            tvdb_id=tvdb_id_int,
+        )
+
+    @classmethod
+    def _nfo_first_text(cls, root: ET.Element, tag_name: str) -> Optional[str]:
+        for element in root.findall(".//"):
+            if cls._strip_xml_namespace(element.tag).lower() == tag_name and element.text:
+                value = element.text.strip()
+                if value:
+                    return value
+        return None
+
+    @classmethod
+    def _nfo_uniqueid(cls, root: ET.Element, id_type: str) -> Optional[str]:
+        for element in root.findall(".//"):
+            if cls._strip_xml_namespace(element.tag).lower() != "uniqueid":
+                continue
+            if (element.attrib.get("type") or "").lower() != id_type:
+                continue
+            value = (element.text or "").strip()
+            if value:
+                return value
+        return None
+
+    @staticmethod
+    def _strip_xml_namespace(tag_name: str) -> str:
+        return tag_name.rsplit("}", 1)[-1]
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
 
     def _enabled_sources(self) -> List[str]:
         sources = []
