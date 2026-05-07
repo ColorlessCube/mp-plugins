@@ -39,7 +39,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.9"
+    plugin_version = "1.2.12"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -74,6 +74,7 @@ class ChineseSubtitle(_PluginBase):
     _assrt_backoff_until: float = 0
     _assrt_request_lock = threading.Lock()
     _subtitle_task_lock = threading.RLock()
+    _assrt_season_cache: Dict[str, List[str]] = {}
 
     _sources = {
         "assrt": "_assrt_token",
@@ -222,6 +223,17 @@ class ChineseSubtitle(_PluginBase):
         logger.info(f"开始搜索中文字幕：{video_path.name}")
         for source in self._enabled_sources():
             try:
+                if source == "assrt":
+                    saved = self._download_assrt_season_episode(video_path, mediainfo, meta)
+                    if saved:
+                        logger.info(f"中文字幕下载完成：{saved}")
+                        if self._notify:
+                            self.systemmessage.put(
+                                title="中文字幕下载完成",
+                                message=f"{video_path.name}\nASSRT: 整季字幕包",
+                                role="plugin",
+                            )
+                        return True
                 candidates = self._search_source(source, video_path, mediainfo, meta)
                 if not candidates:
                     logger.info(f"{source} 未找到匹配中文字幕：{video_path.name}")
@@ -309,11 +321,18 @@ class ChineseSubtitle(_PluginBase):
         imdb_id = self._nfo_id(root, "imdb")
         tmdb_id = self._safe_int(self._nfo_id(root, "tmdb"))
         tvdb_id = self._safe_int(self._nfo_id(root, "tvdb"))
-        title = self._first_value(
-            self._nfo_first_text(root, "title"),
-            self._nfo_first_text(root, "originaltitle"),
-            self._nfo_first_text(root, "showtitle"),
-        )
+        if root_tag == "episodedetails":
+            title = self._first_value(
+                self._nfo_first_text(root, "showtitle"),
+                self._nfo_first_text(root, "originaltitle"),
+                self._nfo_first_text(root, "title"),
+            )
+        else:
+            title = self._first_value(
+                self._nfo_first_text(root, "title"),
+                self._nfo_first_text(root, "originaltitle"),
+                self._nfo_first_text(root, "showtitle"),
+            )
         original_title = self._nfo_first_text(root, "originaltitle")
         year = self._nfo_year(root)
         return MediaInfo(
@@ -447,6 +466,72 @@ class ChineseSubtitle(_PluginBase):
             if candidates:
                 return candidates
         return []
+
+    def _download_assrt_season_episode(self, video_path: Path, mediainfo: Any, meta: Any) -> Optional[Path]:
+        if not self._is_tv(mediainfo, meta):
+            return None
+        season, episode = self._season_episode_numbers(video_path, mediainfo, meta)
+        if not season or not episode:
+            return None
+        cache_key = self._assrt_season_cache_key(video_path, mediainfo, meta, season)
+        cached_urls = type(self)._assrt_season_cache.get(cache_key)
+        if cached_urls is None:
+            cached_urls = self._assrt_season_file_urls(video_path, mediainfo, meta, season)
+            type(self)._assrt_season_cache[cache_key] = cached_urls
+        if not cached_urls:
+            return None
+        urls = self._assrt_episode_urls(cached_urls, season, episode)
+        if not urls:
+            logger.info(f"ASSRT 整季缓存未找到当前集字幕：{video_path.name}")
+            return None
+        for url in urls:
+            logger.info(f"开始下载 ASSRT 整季匹配字幕：{video_path.name}，地址：{self._safe_url_for_log(url)}")
+            saved = self._download_url(url, video_path)
+            if saved:
+                return saved
+        return None
+
+    def _assrt_season_file_urls(self, video_path: Path, mediainfo: Any, meta: Any, season: int) -> List[str]:
+        target_title = self._target_title(video_path, mediainfo, meta)
+        target_year = self._target_year(video_path, mediainfo, meta)
+        target_resolution = self._target_resolution(video_path)
+        for query in self._assrt_season_queries(video_path, mediainfo, meta, season):
+            candidates = self._search_assrt_by_query(
+                video_path=video_path,
+                target_title=target_title,
+                target_year=target_year,
+                target_resolution=target_resolution,
+                query=query,
+            )
+            for candidate in candidates[: self._max_candidates]:
+                urls = self._assrt_candidate_file_urls(candidate)
+                if self._assrt_season_package_matches(urls, season):
+                    logger.info(f"ASSRT 通过整季查询 `{query}` 找到整季候选：{candidate.title}")
+                    return urls
+        return []
+
+    def _assrt_candidate_file_urls(self, candidate: SubtitleCandidate) -> List[str]:
+        sub_id = (candidate.raw or {}).get("id")
+        if not sub_id:
+            return []
+        res = self._assrt_get_res(
+            "https://api.assrt.net/v1/sub/detail",
+            params={"token": self._assrt_token, "id": sub_id},
+        )
+        if not res or res.status_code != 200:
+            status_code = res.status_code if res is not None else "无响应"
+            logger.warn(f"ASSRT 整季字幕详情获取失败，ID：{sub_id}，状态：{status_code}")
+            return []
+        data = res.json()
+        details = ((data.get("sub") or {}).get("subs") or []) if data.get("status") == 0 else []
+        if not details:
+            return []
+        detail = details[0]
+        file_urls = [f.get("url") for f in detail.get("filelist") or [] if f.get("url")]
+        supported_urls = [url for url in file_urls if not self._unsupported_subtitle_url_suffix(url)]
+        if not file_urls and detail.get("url") and not self._unsupported_subtitle_url_suffix(detail.get("url")):
+            supported_urls.append(detail.get("url"))
+        return supported_urls
 
     def _search_assrt_by_query(self, video_path: Path, target_title: str, target_year: str,
                                target_resolution: str, query: str) -> List[SubtitleCandidate]:
@@ -859,6 +944,48 @@ class ChineseSubtitle(_PluginBase):
                 queries.append(query)
         return queries
 
+    def _assrt_season_queries(self, video_path: Path, mediainfo: Any, meta: Any, season: int) -> List[str]:
+        queries = []
+        for title in self._title_candidates(video_path, mediainfo, meta):
+            for season_text in (f"S{int(season):02d}", f"Season {int(season)}", f"第{int(season)}季"):
+                query = re.sub(r"\s+", " ", f"{title} {season_text}").strip()
+                if query and query not in queries:
+                    queries.append(query)
+        return queries
+
+    def _season_episode_numbers(self, video_path: Path, mediainfo: Any, meta: Any) -> Tuple[Optional[int], Optional[int]]:
+        match = re.search(r"S(\d{1,2})E(\d{1,3})", video_path.stem, re.IGNORECASE)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        season = self._season(mediainfo, meta)
+        episode = self._episode(meta)
+        return int(season) if season else None, int(episode) if episode else None
+
+    def _assrt_season_cache_key(self, video_path: Path, mediainfo: Any, meta: Any, season: int) -> str:
+        title = next(iter(self._title_candidates(video_path, mediainfo, meta)), "")
+        return f"{video_path.parent.resolve()}|{title.lower()}|S{int(season):02d}"
+
+    def _assrt_season_package_matches(self, urls: List[str], season: int) -> bool:
+        if not urls:
+            return False
+        season_pattern = re.compile(rf"\bS0?{int(season)}E\d{{1,3}}\b", re.IGNORECASE)
+        episode_count = sum(1 for url in urls if season_pattern.search(self._url_file_name(url)))
+        return episode_count >= 2
+
+    def _assrt_episode_urls(self, urls: List[str], season: int, episode: int) -> List[str]:
+        exact_pattern = re.compile(rf"\bS0?{int(season)}E0?{int(episode)}(?:\b|E)", re.IGNORECASE)
+        season_pattern = re.compile(rf"\bS0?{int(season)}\b", re.IGNORECASE)
+        exact_urls = [url for url in urls if exact_pattern.search(self._url_file_name(url))]
+        fallback_urls = [
+            url for url in urls
+            if url not in exact_urls and season_pattern.search(self._url_file_name(url))
+        ]
+        return exact_urls + fallback_urls
+
+    @staticmethod
+    def _url_file_name(url: str) -> str:
+        return Path(urlparse(url or "").path).name
+
     def _assrt_candidate_score(self, target_title: str, target_year: str, target_resolution: str,
                                query: str, match_text: str) -> Optional[float]:
         title_score = max(
@@ -899,6 +1026,8 @@ class ChineseSubtitle(_PluginBase):
         return text.strip(" -._")
 
     def _title_candidates(self, video_path: Path, mediainfo: Any, meta: Any) -> List[str]:
+        if self._is_tv(mediainfo, meta):
+            return self._tv_title_candidates(video_path, mediainfo, meta)
         titles = []
         for value in (
                 getattr(mediainfo, "en_title", None),
@@ -913,6 +1042,57 @@ class ChineseSubtitle(_PluginBase):
             if value and value not in titles:
                 titles.append(value)
         return titles
+
+    def _tv_title_candidates(self, video_path: Path, mediainfo: Any, meta: Any) -> List[str]:
+        titles = []
+        path_title = self._series_title_from_path(video_path)
+        file_title = self._series_title_from_filename(video_path)
+        metadata_values = (
+            getattr(meta, "en_name", None),
+            getattr(meta, "cn_name", None),
+        )
+        if not path_title and not file_title:
+            metadata_values = (
+                getattr(mediainfo, "en_title", None),
+                getattr(mediainfo, "original_title", None),
+                getattr(meta, "en_name", None),
+                getattr(mediainfo, "title", None),
+                getattr(meta, "cn_name", None),
+            )
+        for value in (path_title, *metadata_values, file_title):
+            title = self._clean_query_title(value or "")
+            if not title or self._is_generic_tv_title(title):
+                continue
+            if title not in titles:
+                titles.append(title)
+        return titles
+
+    def _series_title_from_path(self, video_path: Path) -> str:
+        parent_name = video_path.parent.name
+        if self._is_generic_tv_title(parent_name) and video_path.parent.parent != video_path.parent:
+            grandparent_title = self._clean_query_title(video_path.parent.parent.name)
+            if self._is_generic_tv_title(grandparent_title):
+                return ""
+            return grandparent_title
+        return self._clean_query_title(parent_name)
+
+    def _series_title_from_filename(self, video_path: Path) -> str:
+        title = re.split(r"\s+-\s+S\d{1,2}E\d{1,3}\b", video_path.stem, maxsplit=1, flags=re.IGNORECASE)[0]
+        if title == video_path.stem:
+            title = re.split(r"\bS\d{1,2}E\d{1,3}\b", video_path.stem, maxsplit=1, flags=re.IGNORECASE)[0]
+        return self._clean_query_title(title)
+
+    @staticmethod
+    def _is_generic_tv_title(title: str) -> bool:
+        title = re.sub(r"\s+", " ", (title or "").strip(" -._")).lower()
+        if not title:
+            return True
+        return bool(re.fullmatch(
+            r"(tv|shows?|series|电视剧|剧集|国产剧|欧美剧|日韩剧|动漫|动画|"
+            r"(season|series)\s*\d+|s\d{1,2}|第\s*\d+\s*[季部]|第\s*[一二三四五六七八九十百]+\s*[季部]|特别篇|specials?)",
+            title,
+            re.IGNORECASE,
+        ))
 
     def _target_title(self, video_path: Path, mediainfo: Any, meta: Any) -> str:
         return self._first_value(*self._title_candidates(video_path, mediainfo, meta), video_path.stem)
