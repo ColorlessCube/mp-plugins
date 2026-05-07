@@ -39,7 +39,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.7"
+    plugin_version = "1.2.8"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -64,6 +64,7 @@ class ChineseSubtitle(_PluginBase):
     _opensubtitles_username: str = ""
     _opensubtitles_password: str = ""
     _opensubtitles_languages: str = "zh-cn,zh-tw,ze"
+    _opensubtitles_daily_limit: int = 5
     _subdl_api_key: str = ""
     _subdl_languages: str = "ZH,ZH_CN,ZH_TW"
 
@@ -94,8 +95,19 @@ class ChineseSubtitle(_PluginBase):
         self._opensubtitles_username = (config.get("opensubtitles_username") or "").strip()
         self._opensubtitles_password = (config.get("opensubtitles_password") or "").strip()
         self._opensubtitles_languages = (config.get("opensubtitles_languages") or "zh-cn,zh-tw,ze").strip()
+        self._opensubtitles_daily_limit = self._config_int(config.get("opensubtitles_daily_limit"), 5, minimum=0)
         self._subdl_api_key = (config.get("subdl_api_key") or "").strip()
         self._subdl_languages = (config.get("subdl_languages") or "ZH,ZH_CN,ZH_TW").strip()
+
+    @staticmethod
+    def _config_int(value: Any, default: int, minimum: Optional[int] = None) -> int:
+        try:
+            result = int(value) if value not in (None, "") else default
+        except (TypeError, ValueError):
+            result = default
+        if minimum is not None:
+            result = max(minimum, result)
+        return result
 
     def get_state(self) -> bool:
         return self._enable
@@ -471,16 +483,37 @@ class ChineseSubtitle(_PluginBase):
                 params["season_number"] = season
             if episode:
                 params["episode_number"] = episode
+
+        search_params_list = [params]
         movie_hash = self._opensubtitles_hash(video_path)
         if movie_hash:
-            params["moviehash"] = movie_hash
+            hash_params = params.copy()
+            hash_params["moviehash"] = movie_hash
+            search_params_list.insert(0, hash_params)
 
-        res = RequestUtils(headers=headers, timeout=self._timeout).get_res(
-            "https://api.opensubtitles.com/api/v1/subtitles", params=params
-        )
-        if not res or res.status_code != 200:
-            return []
-        data = res.json()
+        for search_params in search_params_list:
+            res = RequestUtils(headers=headers, timeout=self._timeout).get_res(
+                "https://api.opensubtitles.com/api/v1/subtitles", params=search_params
+            )
+            if not res:
+                logger.warn(f"OpenSubtitles 搜索无响应：{video_path.name} 参数={self._opensubtitles_log_params(search_params)}")
+                continue
+            if res.status_code != 200:
+                logger.warn(
+                    f"OpenSubtitles 搜索失败，状态码：{res.status_code} "
+                    f"参数={self._opensubtitles_log_params(search_params)} "
+                    f"返回={self._response_summary(res)}"
+                )
+                continue
+
+            candidates = self._opensubtitles_candidates(res.json(), video_path)
+            if candidates:
+                return candidates
+            if "moviehash" in search_params and len(search_params_list) > 1:
+                logger.info(f"OpenSubtitles moviehash 未命中，改用媒体ID/标题重试：{video_path.name}")
+        return []
+
+    def _opensubtitles_candidates(self, data: dict, video_path: Path) -> List[SubtitleCandidate]:
         candidates = []
         for item in data.get("data") or []:
             attrs = item.get("attributes") or {}
@@ -611,9 +644,12 @@ class ChineseSubtitle(_PluginBase):
     def _download_opensubtitles(self, candidate: SubtitleCandidate, video_path: Path) -> Optional[Path]:
         if not candidate.file_id:
             return None
+        if not self._consume_opensubtitles_download_quota():
+            return None
         token = self._get_opensubtitles_token()
         if not token:
             logger.warn("OpenSubtitles 未配置用户名/密码或登录失败，无法下载字幕")
+            self._rollback_opensubtitles_download_quota()
             return None
         headers = self._opensubtitles_headers(token=token)
         res = RequestUtils(headers=headers, timeout=self._timeout).post_res(
@@ -621,11 +657,55 @@ class ChineseSubtitle(_PluginBase):
             json={"file_id": candidate.file_id},
         )
         if not res or res.status_code != 200:
+            logger.warn(
+                f"OpenSubtitles 下载链接获取失败，状态码：{getattr(res, 'status_code', '无响应')} "
+                f"file_id={candidate.file_id} 返回={self._response_summary(res) if res else ''}"
+            )
+            self._rollback_opensubtitles_download_quota()
             return None
         link = (res.json() or {}).get("link")
         if not link:
+            logger.warn(f"OpenSubtitles 下载链接为空，file_id={candidate.file_id}")
+            self._rollback_opensubtitles_download_quota()
             return None
         return self._download_url(link, video_path)
+
+    def _consume_opensubtitles_download_quota(self) -> bool:
+        if self._opensubtitles_daily_limit <= 0:
+            return True
+        quota = self._opensubtitles_download_quota()
+        if quota["count"] >= self._opensubtitles_daily_limit:
+            logger.warn(
+                f"OpenSubtitles 今日下载额度已用完：{quota['count']}/{self._opensubtitles_daily_limit}，跳过下载"
+            )
+            return False
+        quota["count"] += 1
+        self.save_data("opensubtitles_download_quota", quota)
+        logger.info(f"OpenSubtitles 今日下载额度：{quota['count']}/{self._opensubtitles_daily_limit}")
+        return True
+
+    def _rollback_opensubtitles_download_quota(self):
+        if self._opensubtitles_daily_limit <= 0:
+            return
+        quota = self._opensubtitles_download_quota()
+        if quota["count"] > 0:
+            quota["count"] -= 1
+            self.save_data("opensubtitles_download_quota", quota)
+
+    def _opensubtitles_download_quota(self) -> dict:
+        today = self._today_key()
+        quota = self.get_data("opensubtitles_download_quota") or {}
+        if quota.get("date") != today:
+            return {"date": today, "count": 0}
+        try:
+            count = int(quota.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        return {"date": today, "count": max(0, count)}
+
+    @staticmethod
+    def _today_key() -> str:
+        return time.strftime("%Y-%m-%d", time.localtime())
 
     def _assrt_get_res(self, url: str, params: dict):
         cls = type(self)
@@ -857,6 +937,24 @@ class ChineseSubtitle(_PluginBase):
         return SequenceMatcher(None, query, text).ratio() * 100
 
     @staticmethod
+    def _opensubtitles_log_params(params: dict) -> dict:
+        return {key: value for key, value in params.items() if key in {
+            "languages", "imdb_id", "tmdb_id", "query", "season_number", "episode_number", "moviehash"
+        }}
+
+    @staticmethod
+    def _response_summary(res) -> str:
+        try:
+            data = res.json() or {}
+            message = data.get("message") or data.get("error") or data.get("errors") or data
+            return str(message)[:300]
+        except Exception:
+            try:
+                return (res.text or "")[:300]
+            except Exception:
+                return ""
+
+    @staticmethod
     def _guess_subtitle_suffix(url: str, content: bytes) -> str:
         suffix = Path(url.split("?", 1)[0]).suffix.lower()
         if suffix in settings.RMT_SUBEXT:
@@ -1018,8 +1116,11 @@ class ChineseSubtitle(_PluginBase):
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                                 {"component": "VTextField", "props": {"model": "opensubtitles_password", "label": "OpenSubtitles 密码", "type": "password"}}
                             ]},
-                            {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
                                 {"component": "VTextField", "props": {"model": "opensubtitles_languages", "label": "OpenSubtitles 语言", "placeholder": "zh-cn,zh-tw,ze"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                                {"component": "VTextField", "props": {"model": "opensubtitles_daily_limit", "label": "OpenSubtitles 每日下载上限", "type": "number"}}
                             ]},
                         ],
                     },
@@ -1055,6 +1156,7 @@ class ChineseSubtitle(_PluginBase):
             "opensubtitles_username": "",
             "opensubtitles_password": "",
             "opensubtitles_languages": "zh-cn,zh-tw,ze",
+            "opensubtitles_daily_limit": 5,
             "subdl_api_key": "",
             "subdl_languages": "ZH,ZH_CN,ZH_TW",
         }
