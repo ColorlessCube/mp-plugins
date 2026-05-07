@@ -39,7 +39,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.8"
+    plugin_version = "1.2.9"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -75,22 +75,29 @@ class ChineseSubtitle(_PluginBase):
     _assrt_request_lock = threading.Lock()
     _subtitle_task_lock = threading.RLock()
 
+    _sources = {
+        "assrt": "_assrt_token",
+        "opensubtitles": "_opensubtitles_api_key",
+        "subdl": "_subdl_api_key",
+    }
+    _opensubtitles_quota_key = "opensubtitles_download_quota"
+
     def init_plugin(self, config: dict = None):
         config = config or {}
         self._enable = config.get("enable", False)
         self._overwrite = config.get("overwrite", False)
         self._notify = config.get("notify", False)
         self._language_suffix = (config.get("language_suffix") or ".zh-CN").strip()
-        self._timeout = int(config.get("timeout") or 20)
+        self._timeout = self._config_int(config.get("timeout"), 20, minimum=1)
         self._source_order = (config.get("source_order") or "assrt,opensubtitles,subdl").strip()
-        self._max_candidates = int(config.get("max_candidates") or 5)
+        self._max_candidates = self._config_int(config.get("max_candidates"), 5, minimum=1)
         self._scan_enable = config.get("scan_enable", False)
         self._scan_system_library_dirs = config.get("scan_system_library_dirs", True)
         self._scan_cron = (config.get("scan_cron") or "0 4 * * *").strip()
         self._scan_dirs = (config.get("scan_dirs") or "").strip()
-        self._scan_limit = int(config.get("scan_limit") or 50)
+        self._scan_limit = self._config_int(config.get("scan_limit"), 50, minimum=1)
         self._assrt_token = (config.get("assrt_token") or "").strip()
-        self._assrt_interval = max(0, int(config.get("assrt_interval") or 3))
+        self._assrt_interval = self._config_int(config.get("assrt_interval"), 3, minimum=0)
         self._opensubtitles_api_key = (config.get("opensubtitles_api_key") or "").strip()
         self._opensubtitles_username = (config.get("opensubtitles_username") or "").strip()
         self._opensubtitles_password = (config.get("opensubtitles_password") or "").strip()
@@ -98,6 +105,13 @@ class ChineseSubtitle(_PluginBase):
         self._opensubtitles_daily_limit = self._config_int(config.get("opensubtitles_daily_limit"), 5, minimum=0)
         self._subdl_api_key = (config.get("subdl_api_key") or "").strip()
         self._subdl_languages = (config.get("subdl_languages") or "ZH,ZH_CN,ZH_TW").strip()
+
+    @staticmethod
+    def _first_value(*values: Any) -> Optional[Any]:
+        for value in values:
+            if value not in (None, ""):
+                return value
+        return None
 
     @staticmethod
     def _config_int(value: Any, default: int, minimum: Optional[int] = None) -> int:
@@ -263,101 +277,111 @@ class ChineseSubtitle(_PluginBase):
                 yield item
 
     def _mediainfo_from_local_nfo(self, video_path: Path) -> Optional[MediaInfo]:
-        fallback_mediainfo = None
+        fallback = None
         for nfo_path in self._nfo_candidates(video_path):
             try:
                 mediainfo = self._parse_nfo_mediainfo(nfo_path)
             except Exception as err:
                 logger.warn(f"中文字幕扫描解析 NFO 失败：{nfo_path} - {err}")
                 continue
-            if mediainfo and mediainfo.imdb_id:
-                logger.info(
-                    f"中文字幕扫描从 NFO 读取媒体ID：{video_path.name} "
-                    f"imdb={mediainfo.imdb_id or '-'} tmdb={mediainfo.tmdb_id or '-'}"
-                )
+            if not mediainfo:
+                continue
+            if mediainfo.imdb_id:
+                self._log_nfo_mediainfo(video_path, mediainfo)
                 return mediainfo
-            if mediainfo and mediainfo.tmdb_id and not fallback_mediainfo:
-                fallback_mediainfo = mediainfo
-        if fallback_mediainfo:
-            logger.info(
-                f"中文字幕扫描从 NFO 读取媒体ID：{video_path.name} "
-                f"imdb=- tmdb={fallback_mediainfo.tmdb_id}"
-            )
-        return fallback_mediainfo
+            if mediainfo.tmdb_id and not fallback:
+                fallback = mediainfo
+        if fallback:
+            self._log_nfo_mediainfo(video_path, fallback)
+        return fallback
 
     @staticmethod
     def _nfo_candidates(video_path: Path) -> List[Path]:
-        candidates = []
-        same_stem = video_path.with_suffix(".nfo")
-        if same_stem.exists():
-            candidates.append(same_stem)
-
-        preferred_names = ("movie.nfo", "tvshow.nfo")
-        for name in preferred_names:
-            path = video_path.parent / name
-            if path.exists() and path not in candidates:
-                candidates.append(path)
-
-        for path in sorted(video_path.parent.glob("*.nfo")):
-            if path not in candidates:
-                candidates.append(path)
+        preferred = [video_path.with_suffix(".nfo"), video_path.parent / "movie.nfo", video_path.parent / "tvshow.nfo"]
+        candidates = [path for path in preferred if path.exists()]
+        candidates.extend(path for path in sorted(video_path.parent.glob("*.nfo")) if path not in candidates)
         return candidates
 
     def _parse_nfo_mediainfo(self, nfo_path: Path) -> Optional[MediaInfo]:
         root = ET.parse(nfo_path).getroot()
         root_tag = self._strip_xml_namespace(root.tag).lower()
-        imdb_id = self._nfo_first_text(root, "imdbid") or self._nfo_uniqueid(root, "imdb")
-        tmdb_id = self._nfo_first_text(root, "tmdbid") or self._nfo_uniqueid(root, "tmdb")
-        tvdb_id = self._nfo_first_text(root, "tvdbid") or self._nfo_uniqueid(root, "tvdb")
-
-        if not imdb_id:
-            for element in root.findall(".//"):
-                if self._strip_xml_namespace(element.tag).lower() == "uniqueid" and element.text:
-                    value = element.text.strip()
-                    if re.fullmatch(r"tt\d+", value, re.IGNORECASE):
-                        imdb_id = value
-                        break
-
-        tmdb_id_int = self._safe_int(tmdb_id)
-        tvdb_id_int = self._safe_int(tvdb_id)
-        mtype = None
-        if root_tag == "movie":
-            mtype = MediaType.MOVIE
-        elif root_tag in {"tvshow", "episodedetails"}:
-            mtype = MediaType.TV
-
-        title = (
-            self._nfo_first_text(root, "title")
-            or self._nfo_first_text(root, "originaltitle")
-            or self._nfo_first_text(root, "showtitle")
+        media_type = self._nfo_media_type(root_tag)
+        imdb_id = self._nfo_id(root, "imdb")
+        tmdb_id = self._safe_int(self._nfo_id(root, "tmdb"))
+        tvdb_id = self._safe_int(self._nfo_id(root, "tvdb"))
+        title = self._first_value(
+            self._nfo_first_text(root, "title"),
+            self._nfo_first_text(root, "originaltitle"),
+            self._nfo_first_text(root, "showtitle"),
         )
-        year = self._nfo_first_text(root, "year")
-        if not year:
-            premiered = self._nfo_first_text(root, "premiered") or self._nfo_first_text(root, "aired")
-            if premiered:
-                match = re.search(r"\b(19\d{2}|20\d{2})\b", premiered)
-                year = match.group(1) if match else None
-
-        season = self._safe_int(self._nfo_first_text(root, "season"))
+        original_title = self._nfo_first_text(root, "originaltitle")
+        year = self._nfo_year(root)
         return MediaInfo(
             source="nfo",
-            type=mtype,
+            type=media_type,
             title=title,
+            en_title=self._nfo_english_title(root),
+            original_title=original_title,
             year=year,
-            season=season,
-            tmdb_id=tmdb_id_int,
+            season=self._safe_int(self._nfo_first_text(root, "season")),
+            tmdb_id=tmdb_id,
             imdb_id=imdb_id.strip() if imdb_id else None,
-            tvdb_id=tvdb_id_int,
+            tvdb_id=tvdb_id,
         )
+
+    @staticmethod
+    def _nfo_media_type(root_tag: str) -> Optional[MediaType]:
+        if root_tag == "movie":
+            return MediaType.MOVIE
+        if root_tag in {"tvshow", "episodedetails"}:
+            return MediaType.TV
+        return None
+
+    def _nfo_year(self, root: ET.Element) -> Optional[str]:
+        year = self._nfo_first_text(root, "year")
+        if year:
+            return year
+        date_text = self._nfo_first_text(root, "premiered") or self._nfo_first_text(root, "aired")
+        match = re.search(r"\b(19\d{2}|20\d{2})\b", date_text or "")
+        return match.group(1) if match else None
+
+    @classmethod
+    def _nfo_id(cls, root: ET.Element, id_type: str) -> Optional[str]:
+        value = cls._nfo_first_text(root, f"{id_type}id") or cls._nfo_uniqueid(root, id_type)
+        if value:
+            return value
+        if id_type == "imdb":
+            for value in cls._nfo_texts(root, "uniqueid"):
+                if re.fullmatch(r"tt\d+", value, re.IGNORECASE):
+                    return value
+        return None
+
+    @classmethod
+    def _nfo_english_title(cls, root: ET.Element) -> Optional[str]:
+        for tag_name in ("originaltitle", "sorttitle", "title", "showtitle"):
+            for value in cls._nfo_texts(root, tag_name):
+                if cls._looks_english_title(value):
+                    return value
+        return None
+
+    @staticmethod
+    def _looks_english_title(value: Optional[str]) -> bool:
+        return bool(value and re.search(r"[A-Za-z]", value) and not re.search(r"[\u4e00-\u9fff]", value))
 
     @classmethod
     def _nfo_first_text(cls, root: ET.Element, tag_name: str) -> Optional[str]:
+        return next(iter(cls._nfo_texts(root, tag_name)), None)
+
+    @classmethod
+    def _nfo_texts(cls, root: ET.Element, tag_name: str) -> List[str]:
+        values = []
         for element in root.findall(".//"):
-            if cls._strip_xml_namespace(element.tag).lower() == tag_name and element.text:
-                value = element.text.strip()
-                if value:
-                    return value
-        return None
+            if cls._strip_xml_namespace(element.tag).lower() != tag_name:
+                continue
+            value = (element.text or "").strip()
+            if value:
+                values.append(value)
+        return values
 
     @classmethod
     def _nfo_uniqueid(cls, root: ET.Element, id_type: str) -> Optional[str]:
@@ -382,16 +406,20 @@ class ChineseSubtitle(_PluginBase):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _log_nfo_mediainfo(video_path: Path, mediainfo: MediaInfo):
+        logger.info(
+            f"中文字幕扫描从 NFO 读取媒体ID：{video_path.name} "
+            f"imdb={mediainfo.imdb_id or '-'} tmdb={mediainfo.tmdb_id or '-'}"
+        )
+
     def _enabled_sources(self) -> List[str]:
         sources = []
         for source in re.split(r"[,，\s]+", self._source_order.lower()):
-            if source in {"assrt", "opensubtitles", "subdl"} and source not in sources:
-                if source == "assrt" and not self._assrt_token:
-                    continue
-                if source == "opensubtitles" and not self._opensubtitles_api_key:
-                    continue
-                if source == "subdl" and not self._subdl_api_key:
-                    continue
+            token_attr = self._sources.get(source)
+            if not token_attr or source in sources:
+                continue
+            if getattr(self, token_attr, None):
                 sources.append(source)
         return sources
 
@@ -405,11 +433,24 @@ class ChineseSubtitle(_PluginBase):
         return []
 
     def _search_assrt(self, video_path: Path, mediainfo: Any, meta: Any) -> List[SubtitleCandidate]:
-        seen_ids = set()
         target_title = self._target_title(video_path, mediainfo, meta)
         target_year = self._target_year(video_path, mediainfo, meta)
         target_resolution = self._target_resolution(video_path)
-        query = self._assrt_query(video_path, mediainfo, meta)
+        for query in self._assrt_queries(video_path, mediainfo, meta):
+            candidates = self._search_assrt_by_query(
+                video_path=video_path,
+                target_title=target_title,
+                target_year=target_year,
+                target_resolution=target_resolution,
+                query=query,
+            )
+            if candidates:
+                return candidates
+        return []
+
+    def _search_assrt_by_query(self, video_path: Path, target_title: str, target_year: str,
+                               target_resolution: str, query: str) -> List[SubtitleCandidate]:
+        seen_ids = set()
         params = {
             "token": self._assrt_token,
             "q": query,
@@ -460,22 +501,21 @@ class ChineseSubtitle(_PluginBase):
             ))
         if candidates:
             logger.info(f"ASSRT 通过片名 `{query}` 找到 {len(candidates)} 条候选：{video_path.name}")
+        else:
+            logger.info(f"ASSRT 通过片名 `{query}` 未找到匹配中文字幕：{video_path.name}")
         return sorted(candidates, key=lambda x: x.score, reverse=True)
 
     def _search_opensubtitles(self, video_path: Path, mediainfo: Any, meta: Any) -> List[SubtitleCandidate]:
+        if self._opensubtitles_download_quota_exhausted():
+            return []
         headers = self._opensubtitles_headers()
         params = {
             "languages": self._opensubtitles_languages,
             "order_by": "download_count",
             "order_direction": "desc",
         }
-        imdb_id = self._imdb_id(mediainfo)
-        if imdb_id:
-            params["imdb_id"] = imdb_id
-        elif getattr(mediainfo, "tmdb_id", None):
-            params["tmdb_id"] = getattr(mediainfo, "tmdb_id")
-        else:
-            params["query"] = self._query_title(video_path, mediainfo, meta)
+        if not self._add_media_ids(params, mediainfo, strip_imdb_tt=True):
+            params["query"] = self._target_title(video_path, mediainfo, meta)
         if self._is_tv(mediainfo, meta):
             season = self._season(mediainfo, meta)
             episode = self._episode(meta)
@@ -547,11 +587,7 @@ class ChineseSubtitle(_PluginBase):
             "releases": 1,
             "comment": 1,
         }
-        imdb_id = getattr(mediainfo, "imdb_id", None)
-        if imdb_id:
-            params["imdb_id"] = str(imdb_id)
-        if getattr(mediainfo, "tmdb_id", None):
-            params["tmdb_id"] = getattr(mediainfo, "tmdb_id")
+        self._add_media_ids(params, mediainfo, strip_imdb_tt=False)
         if self._is_tv(mediainfo, meta):
             params["type"] = "tv"
             season = self._season(mediainfo, meta)
@@ -671,17 +707,25 @@ class ChineseSubtitle(_PluginBase):
         return self._download_url(link, video_path)
 
     def _consume_opensubtitles_download_quota(self) -> bool:
+        if self._opensubtitles_download_quota_exhausted():
+            return False
         if self._opensubtitles_daily_limit <= 0:
             return True
         quota = self._opensubtitles_download_quota()
-        if quota["count"] >= self._opensubtitles_daily_limit:
-            logger.warn(
-                f"OpenSubtitles 今日下载额度已用完：{quota['count']}/{self._opensubtitles_daily_limit}，跳过下载"
-            )
-            return False
         quota["count"] += 1
-        self.save_data("opensubtitles_download_quota", quota)
+        self.save_data(self._opensubtitles_quota_key, quota)
         logger.info(f"OpenSubtitles 今日下载额度：{quota['count']}/{self._opensubtitles_daily_limit}")
+        return True
+
+    def _opensubtitles_download_quota_exhausted(self) -> bool:
+        if self._opensubtitles_daily_limit <= 0:
+            return False
+        quota = self._opensubtitles_download_quota()
+        if quota["count"] < self._opensubtitles_daily_limit:
+            return False
+        logger.warn(
+            f"OpenSubtitles 今日下载额度已用完：{quota['count']}/{self._opensubtitles_daily_limit}，跳过 OpenSubtitles"
+        )
         return True
 
     def _rollback_opensubtitles_download_quota(self):
@@ -690,11 +734,11 @@ class ChineseSubtitle(_PluginBase):
         quota = self._opensubtitles_download_quota()
         if quota["count"] > 0:
             quota["count"] -= 1
-            self.save_data("opensubtitles_download_quota", quota)
+            self.save_data(self._opensubtitles_quota_key, quota)
 
     def _opensubtitles_download_quota(self) -> dict:
         today = self._today_key()
-        quota = self.get_data("opensubtitles_download_quota") or {}
+        quota = self.get_data(self._opensubtitles_quota_key) or {}
         if quota.get("date") != today:
             return {"date": today, "count": 0}
         try:
@@ -803,13 +847,17 @@ class ChineseSubtitle(_PluginBase):
     def _looks_chinese(text: str) -> bool:
         return bool(re.search(r"中|简|繁|双语|字幕组|人人|YYeTs|CHS|CHT|Chinese|zh", text, re.IGNORECASE))
 
-    def _assrt_query(self, video_path: Path, mediainfo: Any, meta: Any) -> str:
-        query = self._target_title(video_path, mediainfo, meta)
+    def _assrt_queries(self, video_path: Path, mediainfo: Any, meta: Any) -> List[str]:
+        queries = []
+        season_episode = ""
         if self._is_tv(mediainfo, meta):
             season_episode = self._season_episode_from_path(video_path) or self._season_episode_from_meta(mediainfo, meta)
-            if season_episode:
-                return f"{query} {season_episode}"
-        return query
+        for title in self._title_candidates(video_path, mediainfo, meta) or [video_path.stem]:
+            query = f"{title} {season_episode}" if season_episode else title
+            query = re.sub(r"\s+", " ", query).strip()
+            if query and query not in queries:
+                queries.append(query)
+        return queries
 
     def _assrt_candidate_score(self, target_title: str, target_year: str, target_resolution: str,
                                query: str, match_text: str) -> Optional[float]:
@@ -850,20 +898,24 @@ class ChineseSubtitle(_PluginBase):
         text = re.sub(r"\s+", " ", text)
         return text.strip(" -._")
 
-    def _target_title(self, video_path: Path, mediainfo: Any, meta: Any) -> str:
+    def _title_candidates(self, video_path: Path, mediainfo: Any, meta: Any) -> List[str]:
+        titles = []
         for value in (
                 getattr(mediainfo, "en_title", None),
                 getattr(mediainfo, "original_title", None),
-                getattr(mediainfo, "title", None),
                 getattr(meta, "en_name", None),
+                getattr(mediainfo, "title", None),
                 getattr(meta, "cn_name", None),
                 self._clean_query_title(video_path.parent.name),
                 self._clean_query_title(video_path.stem),
         ):
             value = (value or "").strip()
-            if value:
-                return value
-        return video_path.stem
+            if value and value not in titles:
+                titles.append(value)
+        return titles
+
+    def _target_title(self, video_path: Path, mediainfo: Any, meta: Any) -> str:
+        return self._first_value(*self._title_candidates(video_path, mediainfo, meta), video_path.stem)
 
     @staticmethod
     def _target_year(video_path: Path, mediainfo: Any, meta: Any) -> str:
@@ -1006,6 +1058,17 @@ class ChineseSubtitle(_PluginBase):
             hash_value += sum(int.from_bytes(chunk[i:i + 8], "little") for i in range(0, len(chunk), 8))
         return f"{hash_value & 0xFFFFFFFFFFFFFFFF:016x}"
 
+    def _add_media_ids(self, params: dict, mediainfo: Any, strip_imdb_tt: bool = False) -> bool:
+        imdb_id = self._imdb_id(mediainfo) if strip_imdb_tt else getattr(mediainfo, "imdb_id", None)
+        if imdb_id:
+            params["imdb_id"] = str(imdb_id)
+            return True
+        tmdb_id = getattr(mediainfo, "tmdb_id", None)
+        if tmdb_id:
+            params["tmdb_id"] = tmdb_id
+            return True
+        return False
+
     @staticmethod
     def _imdb_id(mediainfo: Any) -> Optional[str]:
         imdb_id = getattr(mediainfo, "imdb_id", None)
@@ -1027,117 +1090,71 @@ class ChineseSubtitle(_PluginBase):
     def _episode(meta: Any) -> Optional[int]:
         return getattr(meta, "begin_episode", None)
 
-    @staticmethod
-    def _query_title(video_path: Path, mediainfo: Any, meta: Any) -> str:
-        return (
-                getattr(mediainfo, "en_title", None)
-                or getattr(mediainfo, "title", None)
-                or getattr(meta, "en_name", None)
-                or getattr(meta, "cn_name", None)
-                or video_path.stem
-        )
-
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VSwitch", "props": {"model": "enable", "label": "启用插件"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VSwitch", "props": {"model": "overwrite", "label": "覆盖已有字幕"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VSwitch", "props": {"model": "notify", "label": "下载成功通知"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {"model": "language_suffix", "label": "字幕文件语言后缀"}}
-                            ]},
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {"model": "source_order", "label": "字幕源顺序", "placeholder": "assrt,opensubtitles,subdl"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {"model": "max_candidates", "label": "每源尝试数量", "type": "number"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {"model": "timeout", "label": "请求超时秒数", "type": "number"}}
-                            ]},
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VSwitch", "props": {"model": "scan_enable", "label": "启用目录扫描"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VSwitch", "props": {"model": "scan_system_library_dirs", "label": "扫描系统媒体库目录"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {"model": "scan_cron", "label": "扫描 Cron", "placeholder": "0 4 * * *"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {"model": "scan_limit", "label": "单次最多尝试视频数", "type": "number"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12}, "content": [
-                                {"component": "VTextarea", "props": {"model": "scan_dirs", "label": "追加扫描目录", "placeholder": "每行一个 MoviePilot 可访问的本地目录。开启“扫描系统媒体库目录”时，这里可留空。", "rows": 4}}
-                            ]},
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
-                                {"component": "VTextField", "props": {"model": "assrt_token", "label": "ASSRT Token", "placeholder": "assrt.net 用户面板中的 API Token"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                                {"component": "VTextField", "props": {"model": "assrt_interval", "label": "ASSRT 请求间隔秒数", "type": "number"}}
-                            ]},
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                                {"component": "VTextField", "props": {"model": "opensubtitles_api_key", "label": "OpenSubtitles Api-Key"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                                {"component": "VTextField", "props": {"model": "opensubtitles_username", "label": "OpenSubtitles 用户名"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                                {"component": "VTextField", "props": {"model": "opensubtitles_password", "label": "OpenSubtitles 密码", "type": "password"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
-                                {"component": "VTextField", "props": {"model": "opensubtitles_languages", "label": "OpenSubtitles 语言", "placeholder": "zh-cn,zh-tw,ze"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                                {"component": "VTextField", "props": {"model": "opensubtitles_daily_limit", "label": "OpenSubtitles 每日下载上限", "type": "number"}}
-                            ]},
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {"model": "subdl_api_key", "label": "SubDL API Key"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {"model": "subdl_languages", "label": "SubDL 语言", "placeholder": "ZH,ZH_CN,ZH_TW"}}
-                            ]},
-                        ],
-                    },
-                ],
-            }
-        ], {
+        def field(model: str, label: str, **props) -> dict:
+            return {"component": "VTextField", "props": {"model": model, "label": label, **props}}
+
+        def switch(model: str, label: str) -> dict:
+            return {"component": "VSwitch", "props": {"model": model, "label": label}}
+
+        def textarea(model: str, label: str, **props) -> dict:
+            return {"component": "VTextarea", "props": {"model": model, "label": label, **props}}
+
+        def col(component: dict, cols: int = 12, md: Optional[int] = None) -> dict:
+            props = {"cols": cols}
+            if md:
+                props["md"] = md
+            return {"component": "VCol", "props": props, "content": [component]}
+
+        def row(*cols: dict) -> dict:
+            return {"component": "VRow", "content": list(cols)}
+
+        form = [{
+            "component": "VForm",
+            "content": [
+                row(
+                    col(switch("enable", "启用插件"), md=3),
+                    col(switch("overwrite", "覆盖已有字幕"), md=3),
+                    col(switch("notify", "下载成功通知"), md=3),
+                    col(field("language_suffix", "字幕文件语言后缀"), md=3),
+                ),
+                row(
+                    col(field("source_order", "字幕源顺序", placeholder="assrt,opensubtitles,subdl"), md=6),
+                    col(field("max_candidates", "每源尝试数量", type="number"), md=3),
+                    col(field("timeout", "请求超时秒数", type="number"), md=3),
+                ),
+                row(
+                    col(switch("scan_enable", "启用目录扫描"), md=3),
+                    col(switch("scan_system_library_dirs", "扫描系统媒体库目录"), md=3),
+                    col(field("scan_cron", "扫描 Cron", placeholder="0 4 * * *"), md=3),
+                    col(field("scan_limit", "单次最多尝试视频数", type="number"), md=3),
+                    col(textarea(
+                        "scan_dirs", "追加扫描目录", rows=4,
+                        placeholder="每行一个 MoviePilot 可访问的本地目录。开启“扫描系统媒体库目录”时，这里可留空。",
+                    )),
+                ),
+                row(
+                    col(field("assrt_token", "ASSRT Token", placeholder="assrt.net 用户面板中的 API Token"), md=8),
+                    col(field("assrt_interval", "ASSRT 请求间隔秒数", type="number"), md=4),
+                ),
+                row(
+                    col(field("opensubtitles_api_key", "OpenSubtitles Api-Key"), md=4),
+                    col(field("opensubtitles_username", "OpenSubtitles 用户名"), md=4),
+                    col(field("opensubtitles_password", "OpenSubtitles 密码", type="password"), md=4),
+                    col(field("opensubtitles_languages", "OpenSubtitles 语言", placeholder="zh-cn,zh-tw,ze"), md=8),
+                    col(field("opensubtitles_daily_limit", "OpenSubtitles 每日下载上限", type="number"), md=4),
+                ),
+                row(
+                    col(field("subdl_api_key", "SubDL API Key"), md=6),
+                    col(field("subdl_languages", "SubDL 语言", placeholder="ZH,ZH_CN,ZH_TW"), md=6),
+                ),
+            ],
+        }]
+        return form, self._default_config()
+
+    @staticmethod
+    def _default_config() -> Dict[str, Any]:
+        return {
             "enable": False,
             "overwrite": False,
             "notify": False,
