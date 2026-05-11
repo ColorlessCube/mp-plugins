@@ -58,5 +58,31 @@
       "v1.2.12": "ASSRT 剧集优先尝试整季字幕包并缓存整季 filelist，命中后按集数下载对应字幕，未命中回退逐集搜索",
       "v1.2.13": "增强 ASSRT 中文剧集命中率：逐集搜索增加 E25、EP25、第25集等中文集数查询；整季包利用 filelist 预判包内集数，并支持第25集、第25话、S01E25 等包内文件名匹配"
     }
+  },
+  "LocalMediaArchive": {
+    "name": "本地媒体归档",
+    "description": "将长时间未更新的本地电影或剧集目录归档到指定存储目录，可按本地磁盘占用率触发。",
+    "version": "1.0.0",
+    "icon": "folder.png",
+    "author": "Codex",
+    "level": 1,
+    "v2": true,
+    "labels": "归档,存储,云盘",
+    "history": {
+      "v1.0.0": "首次发布：支持按源目录扫描长时间未更新的本地媒体文件夹，满足磁盘占用阈值时归档到目标存储目录。"
+    }
+  },
+  "QuarkDisk": {
+    "name": "夸克网盘存储",
+    "description": "为存储系统集成夸克网盘支持。",
+    "version": "1.1.0",
+    "icon": "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/quark.ico",
+    "author": "xijin285",
+    "level": 1,
+    "v2": true,
+    "labels": "存储,夸克网盘,云盘",
+    "history": {
+      "v1.1.0": "本地维护版本：接入夸克网盘为 MoviePilot 存储。"
+    }
   }
 }
