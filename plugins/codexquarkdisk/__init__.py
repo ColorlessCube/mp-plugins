@@ -11,21 +11,21 @@ from app.schemas import StorageOperSelectionEventData, FileItem
 
 from .quark_api import QuarkApi
 
-class QuarkDisk(_PluginBase):
+class CodexQuarkDisk(_PluginBase):
     # 插件名称
-    plugin_name = "夸克网盘存储"
+    plugin_name = "夸克网盘存储（本地版）"
     # 插件描述
-    plugin_desc = "为存储系统集成夸克网盘支持"
+    plugin_desc = "本地维护的夸克网盘存储插件，为 MoviePilot 存储系统集成夸克网盘支持"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/quark.ico"
     # 插件版本
     plugin_version = "1.1.0"
     # 插件作者
-    plugin_author = "xijin285"
+    plugin_author = "MoviePilot Local"
     # 作者主页
-    author_url = "https://github.com/xijin285"
+    author_url = ""
     # 插件配置项ID前缀
-    plugin_config_prefix = "quarkdisk_"
+    plugin_config_prefix = "codex_quarkdisk_"
     # 加载顺序
     plugin_order = 99
     # 可使用的用户级别
@@ -59,9 +59,9 @@ class QuarkDisk(_PluginBase):
             return False
 
     def init_plugin(self, config: dict = None):
-        if not QuarkDisk._inited:
+        if not CodexQuarkDisk._inited:
             logger.info("【夸克】开始初始化插件")
-            QuarkDisk._inited = True
+            CodexQuarkDisk._inited = True
         self._disk_name = "夸克网盘"
 
         if config:
@@ -415,7 +415,7 @@ class QuarkDisk(_PluginBase):
                                                 "text": "清理缓存",
                                                 "events": {
                                                     "click": {
-                                                        "api": "plugin/QuarkDisk/clear_cache",
+                                                        "api": "plugin/CodexQuarkDisk/clear_cache",
                                                         "method": "post",
                                                     },
                                                 },

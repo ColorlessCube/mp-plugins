@@ -54,7 +54,7 @@ class IdPathCache:
     路径与 ID 双向缓存
     """
 
-    def __init__(self, region_prefix: str = "quarkdisk", maxsize: int = 512):
+    def __init__(self, region_prefix: str = "codexquarkdisk", maxsize: int = 512):
         self.id_to_dir = TTLCache(
             region=f"{region_prefix}_id_to_dir",
             maxsize=maxsize,
@@ -126,7 +126,7 @@ class QuarkApi:
             self._base_url = "https://pan.quark.cn/1/clouddrive"
             self._drive_url = "https://drive.quark.cn/1/clouddrive"
             self._drive_pc_url = "https://drive-pc.quark.cn/1/clouddrive"
-            self._id_cache = IdPathCache(region_prefix="quarkdisk_path")
+            self._id_cache = IdPathCache(region_prefix="codexquarkdisk_path")
             self._list_rate_limiter = RateLimiter(max_calls=1, time_window=1.5, name="list")
             self._path_rate_limiter = RateLimiter(max_calls=2, time_window=1.0, name="path_to_id")
             self._get_item_fail_records: Dict[str, int] = {}

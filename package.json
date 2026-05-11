@@ -72,15 +72,15 @@
       "v1.0.0": "首次发布：支持按源目录扫描长时间未更新的本地媒体文件夹，满足磁盘占用阈值时归档到目标存储目录。"
     }
   },
-  "QuarkDisk": {
-    "name": "夸克网盘存储",
-    "description": "为存储系统集成夸克网盘支持。",
+  "CodexQuarkDisk": {
+    "name": "夸克网盘存储（本地版）",
+    "description": "本地维护的夸克网盘存储插件，为 MoviePilot 存储系统集成夸克网盘支持。",
     "version": "1.1.0",
     "icon": "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/quark.ico",
-    "author": "xijin285",
+    "author": "MoviePilot Local",
     "level": 1,
     "v2": true,
-    "labels": "存储,夸克网盘,云盘",
+    "labels": "存储,夸克网盘,云盘,本地版",
     "history": {
       "v1.1.0": "本地维护版本：接入夸克网盘为 MoviePilot 存储。"
     }
