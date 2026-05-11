@@ -84,5 +84,18 @@
     "history": {
       "v1.1.0": "本地维护版本：接入夸克网盘为 MoviePilot 存储。"
     }
+  },
+  "CodexLibraryScraper": {
+    "name": "媒体库刮削（本地版）",
+    "description": "本地维护的媒体库刮削插件，支持本地目录和 MoviePilot 存储目录。",
+    "version": "2.2.0",
+    "icon": "scraper.png",
+    "author": "MoviePilot Local",
+    "level": 1,
+    "v2": true,
+    "labels": "刮削,媒体库,云盘,本地版",
+    "history": {
+      "v2.2.0": "本地维护版本：支持使用 存储名:/路径#媒体类型 配置刮削 MoviePilot 存储目录。"
+    }
   }
 }
