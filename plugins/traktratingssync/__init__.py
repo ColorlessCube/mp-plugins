@@ -12,7 +12,7 @@
 """
 import hashlib
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.log import logger
@@ -30,7 +30,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.13.0"
+    plugin_version = "3.14.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -52,6 +52,8 @@ class TraktRatingsSync(_PluginBase):
     _private: bool = True
     _sync_type: str = "all"   # all | movies | shows
     _max_sync_count: int = 0  # 0 = 不限制
+    _trakt_history_limit: int = 20
+    _trakt_history_days: int = 30
     _cron: str = "0 2 * * *"
     _bark_webhook_url: str = ""
     _weread_auth_notify_cooldown: int = 6 * 60 * 60
@@ -84,6 +86,8 @@ class TraktRatingsSync(_PluginBase):
         self._private = config.get("private", True)
         self._sync_type = config.get("sync_type", "all") or "all"
         self._max_sync_count = int(config.get("max_sync_count") or 0)
+        self._trakt_history_limit = int(config.get("trakt_history_limit") or 20)
+        self._trakt_history_days = int(config.get("trakt_history_days") or 30)
         self._cron = config.get("cron", "0 2 * * *") or "0 2 * * *"
         self._bark_webhook_url = (config.get("bark_webhook_url") or "").strip()
 
@@ -229,6 +233,10 @@ class TraktRatingsSync(_PluginBase):
 
     def _sync_progress(self) -> None:
         """从 Trakt 播放进度（未看完列表）同步豆瓣「在看」。"""
+        if self._sync_type == "movies":
+            logger.info("同步类型为仅电影，跳过 Trakt 剧集在看同步")
+            return
+
         access_token = self._trakt_helper.get_access_token()
         if not access_token:
             logger.debug("未获取到 Trakt Access Token，跳过未看完列表同步")
@@ -236,11 +244,7 @@ class TraktRatingsSync(_PluginBase):
 
         # 豆瓣无法将电影设置为在看，仅同步剧集
         episodes = self._trakt_helper.fetch_playback("/sync/playback/episodes", access_token)
-
-        if not episodes:
-            logger.debug("Trakt 播放进度列表为空，无未看完的条目")
-            self.save_data("watching", {})
-            return
+        logger.info("获取到 %d 条 Trakt 剧集播放进度", len(episodes))
 
         watching: Dict[str, Any] = self.get_data("watching") or {}
         success_count = 0
@@ -249,20 +253,81 @@ class TraktRatingsSync(_PluginBase):
             if not e.get("show"):
                 continue
             try:
-                self._trakt_helper.sync_one_progress(
+                if self._trakt_helper.sync_one_progress(
                     {"progress": e.get("progress"), "show": e.get("show")},
                     "show",
                     MediaType.TV,
                     watching,
                     self._douban_helper,
                     self._private,
-                )
-                success_count += 1
+                ):
+                    success_count += 1
             except Exception as ex:
                 logger.error("同步播放进度失败: %s", ex, exc_info=True)
 
+        history_items = self._trakt_helper.fetch_history(
+            media_type="shows",
+            access_token=access_token,
+            limit=self._trakt_history_limit,
+        )
+        recent_shows = self._extract_recent_history_shows(history_items)
+        logger.info(
+            "获取到 %d 条 Trakt 剧集观看历史，提取 %d 个最近在看剧集",
+            len(history_items),
+            len(recent_shows),
+        )
+
+        for history_item in recent_shows:
+            show = history_item.get("show")
+            if not show:
+                continue
+            try:
+                if self._trakt_helper.sync_one_progress(
+                    {"progress": "history", "show": show},
+                    "show",
+                    MediaType.TV,
+                    watching,
+                    self._douban_helper,
+                    self._private,
+                ):
+                    success_count += 1
+            except Exception as ex:
+                logger.error("同步观看历史失败: %s", ex, exc_info=True)
+
+        if not episodes and not recent_shows:
+            logger.info("Trakt 剧集播放进度和最近观看历史均为空，无需同步在看")
+            self.save_data("watching", {})
+            return
+
         self.save_data("watching", watching)
-        logger.info("Trakt 播放进度同步完成: 成功 %d 条", success_count)
+        logger.info("Trakt 剧集在看同步完成: 成功 %d 条", success_count)
+
+    def _extract_recent_history_shows(self, history_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """从 Trakt 剧集观看历史中按剧集去重，并过滤过旧记录。"""
+        result: List[Dict[str, Any]] = []
+        seen = set()
+        now = datetime.now(timezone.utc)
+
+        for item in history_items or []:
+            show = item.get("show") if isinstance(item, dict) else None
+            if not show:
+                continue
+            watched_at = item.get("watched_at")
+            if watched_at and self._trakt_history_days > 0:
+                try:
+                    watched_time = datetime.fromisoformat(watched_at.replace("Z", "+00:00"))
+                    if (now - watched_time.astimezone(timezone.utc)).days > self._trakt_history_days:
+                        continue
+                except Exception as err:
+                    logger.debug("解析 Trakt watched_at 失败: %s %s", watched_at, err)
+
+            ids = show.get("ids") if isinstance(show.get("ids"), dict) else {}
+            show_key = ids.get("trakt") or ids.get("slug") or f"{show.get('title')}_{show.get('year')}"
+            if not show_key or show_key in seen:
+                continue
+            seen.add(show_key)
+            result.append(item)
+        return result
 
     def _sync_weread(self) -> None:
         """同步微信读书最近阅读记录到豆瓣「在读/读过」，并持久化打印日志摘要。
@@ -924,6 +989,45 @@ class TraktRatingsSync(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "trakt_history_limit",
+                                            "label": "Trakt 剧集观看历史数量",
+                                            "placeholder": "20",
+                                            "type": "number",
+                                            "hint": "用于将最近看过单集的剧集同步为豆瓣在看",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "trakt_history_days",
+                                            "label": "Trakt 剧集观看历史天数",
+                                            "placeholder": "30",
+                                            "type": "number",
+                                            "hint": "只处理最近 N 天观看过单集的剧集，0 表示不限制",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
@@ -1182,6 +1286,8 @@ class TraktRatingsSync(_PluginBase):
             "private": True,
             "sync_type": "all",
             "max_sync_count": 0,
+            "trakt_history_limit": 20,
+            "trakt_history_days": 30,
             "cron": "0 2 * * *",
             "bark_webhook_url": "",
         }

@@ -170,13 +170,57 @@ class TraktHelper:
             if resp.status_code == 204:
                 return []
             if resp.status_code != 200:
-                logger.debug("Trakt 播放进度返回异常 %s: %s %s",
-                             path, resp.status_code, (resp.text or "")[:200])
+                if resp.status_code == 401:
+                    logger.warning("Trakt Access Token 无效或已过期，无法拉取播放进度: %s", path)
+                else:
+                    logger.warning("Trakt 播放进度返回异常 %s: %s %s",
+                                   path, resp.status_code, (resp.text or "")[:200])
                 return []
             data = resp.json()
             return data if isinstance(data, list) else []
         except Exception as e:
             logger.error("拉取 Trakt 播放进度失败 %s: %s", path, e, exc_info=True)
+            return []
+
+    def fetch_history(self, media_type: str, access_token: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """拉取 Trakt 最近观看历史。
+
+        Args:
+            media_type: Trakt 历史类型，例如 ``"shows"``。
+            access_token: 有效的 Trakt Access Token。
+            limit: 返回条数上限。
+
+        Returns:
+            最近观看历史列表，失败时返回空列表。
+        """
+        headers = self._build_headers({"Authorization": f"Bearer {access_token}"})
+        url = f"{self._API_BASE}/sync/history/{media_type}"
+        try:
+            self._sleep_before_request(f"fetch_history/{media_type}")
+            resp = RequestUtils(timeout=20, headers=headers).get_res(
+                url=url,
+                params={"limit": max(1, int(limit or 20))},
+            )
+            if not resp:
+                logger.debug("Trakt 观看历史请求失败: %s", media_type)
+                return []
+            if resp.status_code == 204:
+                return []
+            if resp.status_code != 200:
+                if resp.status_code == 401:
+                    logger.warning("Trakt Access Token 无效或已过期，无法拉取观看历史: %s", media_type)
+                else:
+                    logger.warning(
+                        "Trakt 观看历史返回异常 %s: %s %s",
+                        media_type,
+                        resp.status_code,
+                        (resp.text or "")[:200],
+                    )
+                return []
+            data = resp.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.error("拉取 Trakt 观看历史失败 %s: %s", media_type, e, exc_info=True)
             return []
 
     # ------------------------------------------------------------------
@@ -357,7 +401,7 @@ class TraktHelper:
         watching: Dict[str, Any],
         douban_helper: Any,
         private: bool,
-    ) -> None:
+    ) -> bool:
         """同步单条播放进度到豆瓣「在看」。
 
         Args:
@@ -372,9 +416,9 @@ class TraktHelper:
         if isinstance(progress, (int, float)) and progress < 10:
             title_temp = (item.get(media_key) or {}).get("title", "未知")
             logger.debug("进度低于 10%%，跳过: %s progress=%s", title_temp, progress)
-            return
+            return False
         if isinstance(progress, (int, float)) and progress >= 100:
-            return
+            return False
 
         media = item.get(media_key) or {}
         ids = media.get("ids") or {}
@@ -387,7 +431,7 @@ class TraktHelper:
 
         if not tmdb_id and not imdb_id:
             logger.debug("Trakt 播放进度条目无 tmdb/imdb，跳过: %s (%s)", title, year)
-            return
+            return False
 
         key = f"{media_type.value}_{str(trakt_id) if trakt_id else slug or f'{title}_{year}'}"
 
@@ -396,12 +440,12 @@ class TraktHelper:
         )
         if not douban_info:
             logger.debug("匹配豆瓣未看完条目失败 %s (%s)", title, year)
-            return
+            return False
 
         subject_id = douban_info.get("id")
         if not subject_id:
             logger.debug("未找到豆瓣未看完条目: %s (%s)", title, year)
-            return
+            return False
 
         display_title = (
             douban_info.get("title")
@@ -427,8 +471,10 @@ class TraktHelper:
                 "sync_time": int(time.time()),
             }
             logger.info("同步未看完到豆瓣在看: %s (%s) -> 在看(progress=%s)", display_title, year, progress)
+            return True
         else:
             logger.warning("同步未看完到豆瓣在看失败: %s (%s) subject_id=%s", title, year, subject_id)
+            return False
 
     # ------------------------------------------------------------------
     # OAuth 授权相关
