@@ -133,11 +133,18 @@ class DoubanHelper:
     def _build_rexxar_headers(self, referer: str) -> dict:
         """构造豆瓣移动端 rexxar 搜索请求头。"""
         headers = self._build_search_headers(referer)
+        headers.pop("Cookie", None)
         headers.update({
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Host": "m.douban.com",
             "Origin": "https://www.douban.com",
         })
+        return headers
+
+    def _build_public_search_headers(self, referer: str) -> dict:
+        """构造不携带登录 Cookie 的公开搜索请求头。"""
+        headers = self._build_search_headers(referer)
+        headers.pop("Cookie", None)
         return headers
 
     def _sleep_before_request(self, action: str) -> None:
@@ -346,7 +353,7 @@ class DoubanHelper:
 
         # 豆瓣播客顶部搜索表单当前指向 subject_search；保留 HTML 解析兜底。
         response = RequestUtils(
-            headers=self._build_search_headers(referer=self._URL_SUBJECT_SEARCH),
+            headers=self._build_public_search_headers(referer=self._URL_SUBJECT_SEARCH),
             timeout=10,
         ).get_res(
             url=self._URL_SUBJECT_SEARCH,
