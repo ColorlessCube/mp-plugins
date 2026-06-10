@@ -2,7 +2,7 @@
   "TraktRatingsSync": {
     "name": "豆瓣书影音同步",
     "description": "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度/观看历史 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑。",
-    "version": "3.14.7",
+    "version": "3.14.8",
     "icon": "trakt.svg",
     "author": "ColorlessCube",
     "level": 1,
@@ -36,7 +36,8 @@
       "v3.14.4": "小宇宙播客搜索改为不携带豆瓣登录 Cookie 的公开 rexxar 请求，降低 m.douban.com 搜索 403 风控概率",
       "v3.14.5": "小宇宙认证支持完整 Cookie/cURL 模式，保留 x-jike-refresh-token 并按网页端方式携带 x-jike-allow-app-token-in-cookie，避免配置退化为短 access token",
       "v3.14.6": "豆瓣播客公开搜索请求显式剥离 Cookie 请求头，避免登录 Cookie 触发移动端 rexxar/HTML 搜索 403 风控",
-      "v3.14.7": "修正豆瓣播客 rexxar 搜索鉴权策略：移动端搜索保留豆瓣登录 Cookie，HTML 兜底请求仍剥离 Cookie，避免 rexxar 返回 need_login"
+      "v3.14.7": "修正豆瓣播客 rexxar 搜索鉴权策略：移动端搜索保留豆瓣登录 Cookie，HTML 兜底请求仍剥离 Cookie，避免 rexxar 返回 need_login",
+      "v3.14.8": "修复豆瓣播客状态提交接口：播客改用 /j/ilmen/thing/{id}/interest，并修正响应判空以保留真实 HTTP 错误码"
     }
   },
   "ChineseSubtitle" : {

@@ -33,7 +33,7 @@ class DoubanHelper:
     _URL_MOVIE_INTEREST = "https://movie.douban.com/j/subject/{subject_id}/interest"
     _URL_BOOK_INTEREST = "https://book.douban.com/j/subject/{subject_id}/interest"
     _URL_MUSIC_INTEREST = "https://music.douban.com/j/subject/{subject_id}/interest"
-    _URL_PODCAST_INTEREST = "https://www.douban.com/j/subject/{subject_id}/interest"
+    _URL_PODCAST_INTEREST = "https://www.douban.com/j/ilmen/thing/{subject_id}/interest"
     _URL_SEARCH = "https://www.douban.com/search"
     _URL_PODCAST_SEARCH = "https://www.douban.com/podcast/"
     _URL_SUBJECT_SEARCH = "https://www.douban.com/subject_search"
@@ -254,7 +254,7 @@ class DoubanHelper:
         except Exception as e:
             logger.error("请求豆瓣失败: %s", e)
             return False
-        if not response:
+        if response is None:
             logger.error("豆瓣未返回内容")
             return False
         if response.status_code == 403:
@@ -618,7 +618,7 @@ class DoubanHelper:
             data["private"] = "on"
         return self._post_interest(
             url,
-            referer=f"https://www.douban.com/subject/{subject_id}/",
+            referer=f"https://www.douban.com/podcast/{subject_id}/",
             host="www.douban.com",
             data=data,
         )
