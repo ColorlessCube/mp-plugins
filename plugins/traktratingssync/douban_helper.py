@@ -245,6 +245,15 @@ class DoubanHelper:
             return
         self._search_forbidden_count = 0
 
+    @staticmethod
+    def _is_need_login_response(response) -> bool:
+        """判断豆瓣 JSON 响应是否为 need_login。"""
+        try:
+            data = response.json()
+        except Exception:
+            return False
+        return data.get("code") == 103 or data.get("msg") == "need_login"
+
     def _post_interest(self, url: str, referer: str, host: str, data: dict) -> bool:
         """向豆瓣提交 interest 请求，统一处理响应和 Cookie 失效检测"""
         headers = self._build_headers(referer, host)
@@ -330,7 +339,11 @@ class DoubanHelper:
                 "sort": "relevance",
             },
         )
-        self._mark_search_response(getattr(response, "status_code", None), keyword)
+        status_code = getattr(response, "status_code", None)
+        if status_code == 403 and self._is_need_login_response(response):
+            logger.warning("豆瓣播客搜索 [%s] 返回 need_login，跳过该候选词", keyword)
+            return None, None
+        self._mark_search_response(status_code, keyword)
         if response and response.status_code == 200:
             try:
                 data = response.json()
@@ -358,7 +371,11 @@ class DoubanHelper:
             url=self._URL_SUBJECT_SEARCH,
             params={"search_text": keyword},
         )
-        self._mark_search_response(getattr(response, "status_code", None), keyword)
+        status_code = getattr(response, "status_code", None)
+        if status_code == 403 and self._is_need_login_response(response):
+            logger.warning("豆瓣播客 HTML 搜索 [%s] 返回 need_login，跳过该候选词", keyword)
+            return None, None
+        self._mark_search_response(status_code, keyword)
         if not response or response.status_code != 200:
             logger.error(
                 "搜索播客 [%s] 失败: HTTP %s%s",
