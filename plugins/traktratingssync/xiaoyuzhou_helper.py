@@ -39,6 +39,7 @@ class XiaoyuzhouHelper:
     _URL_EPISODE_DETAIL = f"{_BASE_URL}/v1/episode/get"
     _URL_PODCAST_DETAIL = f"{_BASE_URL}/v1/podcast/get"
     _URL_PLAYBACK_PROGRESS = f"{_BASE_URL}/v1/playback-progress/list"
+    _URL_REFRESH_TOKENS = "https://web-api.xiaoyuzhoufm.com/app_auth_tokens.refresh"
     _REQUEST_JITTER_RANGE = (0.8, 2.0)
 
     # 已听完判定阈值（已播放秒数 / 总时长 >= 此值则视为听完）
@@ -76,6 +77,7 @@ class XiaoyuzhouHelper:
         self._access_token = auth.get("access_token", "")
         self._refresh_token = auth.get("refresh_token", "")
         self._cookie_string = auth.get("cookie_string", "")
+        self._auth_refreshed = False
 
         if not self._access_token:
             logger.warning("未提供小宇宙 access_token，个人数据接口将无法使用")
@@ -97,6 +99,10 @@ class XiaoyuzhouHelper:
             )
         elif self._access_token:
             self.session.headers["x-jike-access-token"] = self._access_token
+
+    def get_updated_cookie_string(self) -> str:
+        """返回刷新后的 Cookie 字符串。"""
+        return self._cookie_string if self._auth_refreshed and self._cookie_string else ""
 
     # ------------------------------------------------------------------
     # 内部请求封装
@@ -130,6 +136,11 @@ class XiaoyuzhouHelper:
                 key, _, value = part.partition("=")
                 cookies[key.strip()] = value.strip()
         return cookies
+
+    @staticmethod
+    def _cookie_dict_to_string(cookies: Dict[str, str]) -> str:
+        """将 Cookie 字典转为配置可保存的字符串。"""
+        return "; ".join(f"{key}={value}" for key, value in cookies.items() if key and value)
 
     @classmethod
     def _parse_auth_input(cls, raw_value: Optional[str]) -> Dict[str, str]:
@@ -205,7 +216,80 @@ class XiaoyuzhouHelper:
         logger.error("小宇宙 %s 请求失败: %s (HTTP 401)；%s；%s", method, url, msg, detail)
         self._notify("小宇宙 Token 已失效", f"{msg}\n{detail}")
 
-    def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    def _refresh_auth_tokens(self) -> bool:
+        """使用网页端 refresh 接口刷新小宇宙 access/refresh token。"""
+        if not (self._cookie_string and self._refresh_token):
+            return False
+        try:
+            headers = {
+                "Host": "web-api.xiaoyuzhoufm.com",
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://podcaster.xiaoyuzhoufm.com",
+                "Referer": "https://podcaster.xiaoyuzhoufm.com/",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+                ),
+                "x-jike-allow-app-token-in-cookie": "true",
+            }
+            response = self.session.get(self._URL_REFRESH_TOKENS, headers=headers, timeout=10)
+        except Exception as e:
+            logger.warning("小宇宙 Token 自动刷新请求异常: %s", e)
+            return False
+
+        if response.status_code != 200:
+            logger.warning("小宇宙 Token 自动刷新失败: HTTP %s", response.status_code)
+            return False
+
+        try:
+            data = response.json()
+        except Exception as e:
+            logger.warning("解析小宇宙 Token 自动刷新响应失败: %s", e)
+            return False
+
+        payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+        access_token = (
+            data.get("x-jike-access-token")
+            or data.get("accessToken")
+            or payload.get("x-jike-access-token")
+            or payload.get("accessToken")
+            or self.session.cookies.get("x-jike-access-token")
+            or ""
+        )
+        refresh_token = (
+            data.get("x-jike-refresh-token")
+            or data.get("refreshToken")
+            or payload.get("x-jike-refresh-token")
+            or payload.get("refreshToken")
+            or self.session.cookies.get("x-jike-refresh-token")
+            or ""
+        )
+        if not access_token:
+            logger.warning("小宇宙 Token 自动刷新响应缺少 access token")
+            return False
+
+        cookies = self._cookie_string_to_dict(self._cookie_string)
+        cookies["x-jike-access-token"] = access_token
+        if refresh_token:
+            cookies["x-jike-refresh-token"] = refresh_token
+        self._access_token = access_token
+        self._refresh_token = refresh_token or self._refresh_token
+        self._cookie_string = self._cookie_dict_to_string(cookies)
+        self.session.cookies = cookiejar_from_dict(cookies, cookiejar=None, overwrite=True)
+        self.session.headers["x-jike-allow-app-token-in-cookie"] = "true"
+        self._auth_refreshed = True
+        logger.info(
+            "小宇宙 Token 自动刷新成功: has_refresh_token=%s",
+            bool(self._refresh_token),
+        )
+        return True
+
+    def _get(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        retry_on_auth: bool = True,
+    ) -> Optional[Dict[str, Any]]:
         """GET 请求封装。"""
         try:
             self._sleep_before_request("GET")
@@ -214,6 +298,8 @@ class XiaoyuzhouHelper:
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 401:
+                if retry_on_auth and self._refresh_auth_tokens():
+                    return self._get(url, params=params, retry_on_auth=False)
                 self._handle_auth_error("GET", url)
                 return None
             logger.error("小宇宙 GET 请求失败: %s (HTTP %d)", url, resp.status_code)
@@ -222,7 +308,12 @@ class XiaoyuzhouHelper:
             logger.error("小宇宙 GET 请求异常: %s", e)
             return None
 
-    def _post(self, url: str, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    def _post(
+        self,
+        url: str,
+        data: Optional[Dict[str, Any]] = None,
+        retry_on_auth: bool = True,
+    ) -> Optional[Dict[str, Any]]:
         """POST 请求封装。"""
         try:
             self._sleep_before_request("POST")
@@ -231,6 +322,8 @@ class XiaoyuzhouHelper:
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 401:
+                if retry_on_auth and self._refresh_auth_tokens():
+                    return self._post(url, data=data, retry_on_auth=False)
                 self._handle_auth_error("POST", url)
                 return None
             logger.error("小宇宙 POST 请求失败: %s (HTTP %d)", url, resp.status_code)

@@ -31,7 +31,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.9"
+    plugin_version = "3.14.10"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -655,6 +655,7 @@ class TraktRatingsSync(_PluginBase):
         logger.info("开始同步小宇宙播客最近听取记录到豆瓣...")
 
         episodes = self._xiaoyuzhou_helper.get_recent_episodes(limit=self._xiaoyuzhou_limit)
+        self._persist_xiaoyuzhou_cookie_if_updated()
         if not episodes:
             logger.info("小宇宙未获取到最近听取记录（Cookie 可能已失效或暂无听取记录）")
             return
@@ -837,6 +838,17 @@ class TraktRatingsSync(_PluginBase):
         }
         current.update(patch)
         self.update_config(current)
+
+    def _persist_xiaoyuzhou_cookie_if_updated(self) -> None:
+        """持久化小宇宙自动刷新后的 Cookie。"""
+        if not self._xiaoyuzhou_helper:
+            return
+        refreshed_cookie = self._xiaoyuzhou_helper.get_updated_cookie_string()
+        if not refreshed_cookie or refreshed_cookie == self._xiaoyuzhou_cookie:
+            return
+        self._xiaoyuzhou_cookie = refreshed_cookie
+        self._merge_update_config({"xiaoyuzhou_cookie": refreshed_cookie})
+        logger.info("小宇宙 Token 自动刷新结果已写回插件配置")
 
     def _send_bark_notification(self, title: str, content: str) -> bool:
         """发送 Bark 推送通知（POST JSON 方式）。
