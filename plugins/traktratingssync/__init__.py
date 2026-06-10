@@ -14,6 +14,7 @@ import hashlib
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse
 
 from app.log import logger
 from app.plugins import _PluginBase
@@ -30,7 +31,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.0"
+    plugin_version = "3.14.1"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -835,13 +836,25 @@ class TraktRatingsSync(_PluginBase):
             logger.debug("未配置 Bark Webhook URL，跳过通知发送")
             return False
         try:
-            url = self._bark_webhook_url.rstrip("/")
+            title = (title or "").strip()
+            content = (content or "").strip()
+            if not title and not content:
+                logger.warning("Bark 通知标题和正文均为空，跳过发送")
+                return False
+            if not title:
+                title = self.plugin_name
+            if not content:
+                content = title
+
+            url, device_key = self._build_bark_push_endpoint(self._bark_webhook_url)
             payload = {
                 "title": title,
                 "body": content,
                 "group": "豆瓣书影音同步",
                 "sound": "bell",
             }
+            if device_key:
+                payload["device_key"] = device_key
             logger.debug("发送 Bark 通知: %s", title)
             resp = RequestUtils(
                 timeout=10, headers={"Content-Type": "application/json"}
@@ -854,6 +867,22 @@ class TraktRatingsSync(_PluginBase):
         except Exception as e:
             logger.error("❌ Bark 通知发送异常: %s", e)
             return False
+
+    @staticmethod
+    def _build_bark_push_endpoint(webhook_url: str) -> Tuple[str, Optional[str]]:
+        """将 Bark URL 规范化为 /push 接口和 device_key。"""
+        url = webhook_url.strip().rstrip("/")
+        parsed = urlparse(url)
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        if segments and segments[-1] != "push":
+            device_key = segments[-1]
+            push_segments = segments[:-1] + ["push"]
+            push_path = "/" + "/".join(push_segments)
+            push_url = urlunparse(
+                parsed._replace(path=push_path, params="", query="", fragment="")
+            )
+            return push_url, device_key
+        return url, None
 
     def _send_weread_auth_notification(self, title: str, content: str) -> bool:
         """发送微信读书鉴权失败通知，并按 cURL 指纹做持久化冷却。"""
