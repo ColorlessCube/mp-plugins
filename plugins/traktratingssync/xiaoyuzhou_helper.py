@@ -14,6 +14,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import requests
+from requests.utils import cookiejar_from_dict
 
 from app.log import logger
 
@@ -29,7 +30,7 @@ class XiaoyuzhouHelper:
     - list-history 不返回 playedAt（听取时间），该字段不可用
 
     Args:
-        access_token: 小宇宙 API 认证令牌（x-jike-access-token），从浏览器 Cookie 中复制
+        access_token: 小宇宙 API 认证信息，支持 x-jike-access-token、Cookie 字符串或完整 cURL
         notify_fn: Token 失效等异常时的通知回调，签名 ``(title: str, body: str) -> None``
     """
 
@@ -71,7 +72,10 @@ class XiaoyuzhouHelper:
         notify_fn: Optional[Callable[[str, str], None]] = None,
     ):
         self._notify = notify_fn or (lambda title, body: None)
-        self._access_token = self._extract_access_token(access_token)
+        auth = self._parse_auth_input(access_token)
+        self._access_token = auth.get("access_token", "")
+        self._refresh_token = auth.get("refresh_token", "")
+        self._cookie_string = auth.get("cookie_string", "")
 
         if not self._access_token:
             logger.warning("未提供小宇宙 access_token，个人数据接口将无法使用")
@@ -80,7 +84,19 @@ class XiaoyuzhouHelper:
 
         self.session = requests.Session()
         self.session.headers.update(self._BASE_HEADERS)
-        self.session.headers["x-jike-access-token"] = self._access_token
+        if self._cookie_string:
+            self.session.cookies = cookiejar_from_dict(
+                self._cookie_string_to_dict(self._cookie_string),
+                cookiejar=None,
+                overwrite=True,
+            )
+            self.session.headers["x-jike-allow-app-token-in-cookie"] = "true"
+            logger.debug(
+                "小宇宙使用 Cookie 模式认证，has_refresh_token=%s",
+                bool(self._refresh_token),
+            )
+        elif self._access_token:
+            self.session.headers["x-jike-access-token"] = self._access_token
 
     # ------------------------------------------------------------------
     # 内部请求封装
@@ -104,41 +120,75 @@ class XiaoyuzhouHelper:
         match = re.search(rf"(?:^|;\s*){re.escape(key)}=([^;]+)", cookie_string)
         return match.group(1).strip() if match else ""
 
+    @staticmethod
+    def _cookie_string_to_dict(cookie_string: str) -> Dict[str, str]:
+        """将浏览器复制的 Cookie 字符串转为字典。"""
+        cookies: Dict[str, str] = {}
+        for part in (cookie_string or "").split(";"):
+            part = part.strip()
+            if "=" in part:
+                key, _, value = part.partition("=")
+                cookies[key.strip()] = value.strip()
+        return cookies
+
     @classmethod
-    def _extract_access_token(cls, raw_value: Optional[str]) -> str:
-        """兼容纯 token 或完整 curl，提取 x-jike-access-token。"""
+    def _parse_auth_input(cls, raw_value: Optional[str]) -> Dict[str, str]:
+        """兼容纯 token、Cookie 字符串或完整 cURL，提取小宇宙认证信息。"""
         text = (raw_value or "").strip()
         if not text:
-            return ""
+            return {"access_token": "", "refresh_token": "", "cookie_string": ""}
 
-        if not text.lower().startswith("curl "):
-            if text.startswith("x-jike-access-token="):
-                return text.split("=", 1)[1].strip()
-            return text
+        cookie_string = ""
+        if text.lower().startswith("curl "):
+            normalized = re.sub(r"\\\n\s*", " ", text).strip()
+            try:
+                parts = shlex.split(normalized)
+            except Exception:
+                logger.warning("解析小宇宙 cURL 失败，回退为原始文本")
+                parts = []
 
-        normalized = re.sub(r"\\\n\s*", " ", text).strip()
-        try:
-            parts = shlex.split(normalized)
-        except Exception:
-            logger.warning("解析小宇宙 cURL 失败，回退为原始文本")
-            return text
+            for i, part in enumerate(parts):
+                if part in ("-b", "--cookie") and i + 1 < len(parts):
+                    cookie_string = parts[i + 1].strip()
+                    break
+                if part in ("-H", "--header") and i + 1 < len(parts):
+                    header = parts[i + 1]
+                    if header.lower().startswith("cookie:"):
+                        cookie_string = header.split(":", 1)[1].strip()
+                        break
+        elif "x-jike-access-token=" in text or "x-jike-refresh-token=" in text:
+            cookie_string = text
 
-        for i, part in enumerate(parts):
-            if part in ("-b", "--cookie") and i + 1 < len(parts):
-                cookie_string = parts[i + 1].strip()
-                token = cls._extract_cookie_value(cookie_string, "x-jike-access-token")
-                if token:
-                    logger.debug("已从小宇宙 cURL Cookie 中提取 x-jike-access-token")
-                    return token
+        if cookie_string:
+            access_token = cls._extract_cookie_value(cookie_string, "x-jike-access-token")
+            refresh_token = cls._extract_cookie_value(cookie_string, "x-jike-refresh-token")
+            if access_token:
+                logger.debug("已从小宇宙 Cookie 中提取 x-jike-access-token")
+            if not access_token:
                 jt = cls._extract_cookie_value(cookie_string, "_jt")
                 if jt:
                     match = re.search(r'"accessToken":"([^"]+)"', jt)
                     if match:
-                        logger.debug("已从小宇宙 cURL 的 _jt 字段中提取 accessToken")
-                        return match.group(1).strip()
+                        logger.debug("已从小宇宙 Cookie 的 _jt 字段中提取 accessToken")
+                        access_token = match.group(1).strip()
+            return {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "cookie_string": cookie_string,
+            }
 
-        logger.warning("未能从小宇宙 cURL 中提取 x-jike-access-token")
-        return ""
+        if text.startswith("x-jike-access-token="):
+            return {
+                "access_token": text.split("=", 1)[1].split(";", 1)[0].strip(),
+                "refresh_token": "",
+                "cookie_string": "",
+            }
+        return {"access_token": text, "refresh_token": "", "cookie_string": ""}
+
+    @classmethod
+    def _extract_access_token(cls, raw_value: Optional[str]) -> str:
+        """兼容纯 token 或完整 curl，提取 x-jike-access-token。"""
+        return cls._parse_auth_input(raw_value).get("access_token", "")
 
     def _handle_auth_error(self, method: str, url: str) -> None:
         """统一处理 401，明确提示 Token 问题并通知用户。"""
@@ -148,7 +198,9 @@ class XiaoyuzhouHelper:
         )
         detail = (
             f"method={method}, url={url}, "
-            f"has_token={bool(self._access_token)}, token_length={len(self._access_token)}"
+            f"auth_mode={'cookie' if self._cookie_string else 'header'}, "
+            f"has_token={bool(self._access_token)}, token_length={len(self._access_token)}, "
+            f"has_refresh_token={bool(self._refresh_token)}"
         )
         logger.error("小宇宙 %s 请求失败: %s (HTTP 401)；%s；%s", method, url, msg, detail)
         self._notify("小宇宙 Token 已失效", f"{msg}\n{detail}")
