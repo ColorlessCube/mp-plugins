@@ -133,7 +133,6 @@ class DoubanHelper:
     def _build_rexxar_headers(self, referer: str) -> dict:
         """构造豆瓣移动端 rexxar 搜索请求头。"""
         headers = self._build_search_headers(referer)
-        headers.pop("Cookie", None)
         headers.update({
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Host": "m.douban.com",
