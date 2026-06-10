@@ -8,7 +8,7 @@ import random
 import re
 import shlex
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
 import requests
@@ -36,6 +36,8 @@ class DoubanHelper:
     _URL_PODCAST_INTEREST = "https://www.douban.com/j/subject/{subject_id}/interest"
     _URL_SEARCH = "https://www.douban.com/search"
     _URL_PODCAST_SEARCH = "https://www.douban.com/podcast/"
+    _URL_SUBJECT_SEARCH = "https://www.douban.com/subject_search"
+    _URL_REXXAR_SEARCH = "https://m.douban.com/rexxar/api/v2/search"
     _SEARCH_MIN_INTERVAL = 2.5
     _SEARCH_FORBIDDEN_COOLDOWN = 600
     _REQUEST_JITTER_RANGE = (1.0, 3.0)
@@ -127,6 +129,16 @@ class DoubanHelper:
             "Referer": referer,
             "Host": "www.douban.com",
         }
+
+    def _build_rexxar_headers(self, referer: str) -> dict:
+        """构造豆瓣移动端 rexxar 搜索请求头。"""
+        headers = self._build_search_headers(referer)
+        headers.update({
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Host": "m.douban.com",
+            "Origin": "https://www.douban.com",
+        })
+        return headers
 
     def _sleep_before_request(self, action: str) -> None:
         """所有豆瓣请求前加随机等待，降低周期任务的突发特征。"""
@@ -298,13 +310,49 @@ class DoubanHelper:
             return None, None
         self._sleep_before_request("播客搜索")
         self._throttle_search()
+
         response = RequestUtils(
-            headers=self._build_search_headers(referer=self._URL_PODCAST_SEARCH),
+            headers=self._build_rexxar_headers(referer=self._URL_SUBJECT_SEARCH),
             cookies=self.cookies,
             timeout=10,
         ).get_res(
-            url=self._URL_PODCAST_SEARCH,
-            params={"q": keyword},
+            url=self._URL_REXXAR_SEARCH,
+            params={
+                "q": keyword,
+                "type": "podcast",
+                "start": 0,
+                "count": 5,
+                "sort": "relevance",
+            },
+        )
+        self._mark_search_response(getattr(response, "status_code", None), keyword)
+        if response and response.status_code == 200:
+            try:
+                data = response.json()
+            except Exception as e:
+                logger.warning("解析豆瓣播客搜索 JSON 失败 [%s]: %s", keyword, e)
+                data = {}
+            douban_title, subject_id = self._parse_podcast_rexxar_result(keyword, data)
+            if subject_id:
+                return douban_title, subject_id
+            logger.debug("豆瓣 rexxar 播客搜索未命中: %s", keyword)
+        elif not response or response.status_code != 200:
+            logger.error(
+                "搜索播客 [%s] 失败: HTTP %s%s",
+                keyword,
+                getattr(response, "status_code", None),
+                "（可能是频率过高或搜索页风控）" if getattr(response, "status_code", None) == 403 else "",
+            )
+            return None, None
+
+        # 豆瓣播客顶部搜索表单当前指向 subject_search；保留 HTML 解析兜底。
+        response = RequestUtils(
+            headers=self._build_search_headers(referer=self._URL_SUBJECT_SEARCH),
+            cookies=self.cookies,
+            timeout=10,
+        ).get_res(
+            url=self._URL_SUBJECT_SEARCH,
+            params={"search_text": keyword},
         )
         self._mark_search_response(getattr(response, "status_code", None), keyword)
         if not response or response.status_code != 200:
@@ -319,19 +367,57 @@ class DoubanHelper:
         soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
         for a in soup.find_all("a", href=True):
             link = unquote(a.get("href", ""))
-            match = re.search(r"/podcast/(\d+)/", link)
+            match = re.search(r"/(?:podcast|subject)/(\d+)(?:/|$|\?)", link)
             if not match:
                 continue
             title = a.get_text(strip=True) or keyword
             return title, match.group(1)
 
-        match = re.search(r"/podcast/(\d+)/", response.text)
+        match = re.search(r"/(?:podcast|subject)/(\d+)(?:/|$|\?)", response.text)
         if match:
             logger.debug("豆瓣播客搜索命中，但未解析到标题，回退为原始关键词: %s", keyword)
             return keyword, match.group(1)
 
         logger.debug("豆瓣未找到播客条目: %s", keyword)
         return None, None
+
+    @staticmethod
+    def _parse_podcast_rexxar_result(
+        keyword: str,
+        data: Dict[str, Any],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """从豆瓣 rexxar 搜索结果中提取播客 subject。"""
+        subjects = data.get("subjects") if isinstance(data, dict) else {}
+        items = subjects.get("items") if isinstance(subjects, dict) else []
+        if not isinstance(items, list):
+            return None, None
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            target = item.get("target") if isinstance(item.get("target"), dict) else {}
+            layout = item.get("layout") or item.get("target_type")
+            uri = str(target.get("uri") or target.get("url") or "")
+            if layout != "podcast" and "/podcast/" not in uri and "podcast/" not in uri:
+                continue
+            subject_id = str(target.get("id") or "")
+            if not subject_id:
+                match = re.search(r"podcast/(\d+)", uri)
+                subject_id = match.group(1) if match else ""
+            if subject_id:
+                return (target.get("title") or keyword), subject_id
+        return None, None
+
+    @staticmethod
+    def _podcast_search_candidates(title: str) -> List[str]:
+        """生成播客搜索候选词，兼容小宇宙标题中的副标题和官方后缀。"""
+        candidates = [title]
+        for sep in ("｜", "|", " - ", "—", "–"):
+            if sep in title:
+                candidates.append(title.split(sep, 1)[0].strip())
+        if title.endswith("official"):
+            candidates.append(title[:-8].strip())
+        return [item for idx, item in enumerate(candidates) if item and item not in candidates[:idx]]
 
     # ------------------------------------------------------------------
     # 搜索接口
@@ -498,9 +584,12 @@ class DoubanHelper:
         if not title:
             return None, None
 
-        douban_title, subject_id = self._search_podcast_subject(title)
-        if subject_id:
-            return douban_title, subject_id
+        for keyword in self._podcast_search_candidates(title):
+            douban_title, subject_id = self._search_podcast_subject(keyword)
+            if subject_id:
+                if keyword != title:
+                    logger.debug("豆瓣播客候选词命中 [%s → %s]", title, keyword)
+                return douban_title, subject_id
 
         logger.debug("豆瓣播客搜索未找到: %s", title)
         return None, None

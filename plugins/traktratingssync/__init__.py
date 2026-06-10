@@ -31,7 +31,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.2"
+    plugin_version = "3.14.3"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -693,6 +693,11 @@ class TraktRatingsSync(_PluginBase):
                 if ep.get("is_finished") or ep.get("listen_pct", 0) > existing.get("listen_pct", 0):
                     seen_podcasts[podcast_id] = ep
 
+        logger.info(
+            "小宇宙拉取到 %d 条单集，去重后 %d 个播客，开始匹配豆瓣播客条目",
+            len(episodes), len(seen_podcasts),
+        )
+
         for podcast_id, ep_info in seen_podcasts.items():
             podcast_name = ep_info.get("podcast_name", "")
             if not podcast_name:
@@ -733,7 +738,13 @@ class TraktRatingsSync(_PluginBase):
                     continue
 
                 if not subject_id:
-                    logger.debug("豆瓣未找到播客条目: %s", podcast_name)
+                    logger.warning(
+                        "豆瓣未找到播客条目: %s；代表单集=%s；目标状态=%s；播放进度=%.0f%%",
+                        podcast_name,
+                        ep_info.get("title", ""),
+                        "听过" if target_status == "collect" else "在听",
+                        listen_pct * 100,
+                    )
                     fail_count += 1
                     continue
 

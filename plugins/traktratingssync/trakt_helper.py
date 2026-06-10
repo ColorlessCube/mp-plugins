@@ -339,6 +339,10 @@ class TraktHelper:
             int(tmdb_id) if tmdb_id else None, imdb_id, title, year, media_type
         )
         if not douban_info:
+            logger.warning(
+                "Trakt 条目未匹配到豆瓣信息: %s (%s), tmdb=%s, imdb=%s, trakt=%s, rating=%s",
+                title, year, tmdb_id, imdb_id, trakt_id or slug, trakt_rating,
+            )
             if key not in wait_retry:
                 wait_retry[key] = {
                     "title": title, "year": year,
