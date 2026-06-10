@@ -313,7 +313,6 @@ class DoubanHelper:
 
         response = RequestUtils(
             headers=self._build_rexxar_headers(referer=self._URL_SUBJECT_SEARCH),
-            cookies=self.cookies,
             timeout=10,
         ).get_res(
             url=self._URL_REXXAR_SEARCH,
@@ -348,7 +347,6 @@ class DoubanHelper:
         # 豆瓣播客顶部搜索表单当前指向 subject_search；保留 HTML 解析兜底。
         response = RequestUtils(
             headers=self._build_search_headers(referer=self._URL_SUBJECT_SEARCH),
-            cookies=self.cookies,
             timeout=10,
         ).get_res(
             url=self._URL_SUBJECT_SEARCH,
