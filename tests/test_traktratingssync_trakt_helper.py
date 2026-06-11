@@ -39,6 +39,10 @@ class _Response:
         """返回 JSON 数据。"""
         return self._data
 
+    def __bool__(self):
+        """模拟 requests.Response 在 4xx/5xx 时为 False。"""
+        return self.status_code < 400
+
 
 def _load_trakt_helper_module(monkeypatch):
     """加载 TraktHelper 并替换 MoviePilot 边界依赖。"""

@@ -139,7 +139,7 @@ class TraktHelper:
         try:
             self._sleep_before_request(f"fetch_ratings/{media_type}")
             resp = RequestUtils(timeout=30, headers=self._headers).get_res(url=url)
-            if not resp:
+            if resp is None:
                 logger.warning("Trakt API 请求失败（网络或超时）")
                 return []
             if resp.status_code == 200:
@@ -180,7 +180,7 @@ class TraktHelper:
         try:
             self._sleep_before_request(f"fetch_playback/{path}")
             resp = RequestUtils(timeout=20, headers=headers).get_res(url=url)
-            if not resp:
+            if resp is None:
                 logger.debug("Trakt 播放进度请求失败: %s", path)
                 return []
             if resp.status_code == 204:
@@ -218,7 +218,7 @@ class TraktHelper:
                 url=url,
                 params={"limit": max(1, int(limit or 20))},
             )
-            if not resp:
+            if resp is None:
                 logger.debug("Trakt 观看历史请求失败: %s", media_type)
                 return []
             if resp.status_code == 204:
@@ -594,7 +594,7 @@ class TraktHelper:
                     "grant_type": "refresh_token",
                 },
             )
-            if not resp or resp.status_code != 200:
+            if resp is None or resp.status_code != 200:
                 logger.warning(
                     "Trakt Refresh Token 续期失败: %s %s",
                     getattr(resp, "status_code", None),
@@ -639,7 +639,7 @@ class TraktHelper:
                 url=url,
                 json={"client_id": self._client_id},
             )
-            if not resp or resp.status_code != 200:
+            if resp is None or resp.status_code != 200:
                 logger.warning(
                     "获取 Trakt 设备码失败: %s %s",
                     getattr(resp, "status_code", None),
@@ -718,7 +718,7 @@ class TraktHelper:
                     "client_secret": self._client_secret,
                 },
             )
-            if not resp:
+            if resp is None:
                 return None
 
             if resp.status_code == 200:
