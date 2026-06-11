@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import types
@@ -113,6 +114,105 @@ def test_manual_mapping_is_used_before_douban_resolution(monkeypatch):
 
     assert calls[0]["subject_id"] == "27099082"
     assert calls[0]["status"] == "collect"
+
+
+def test_tmdb_mapping_uses_moviepilot_result_without_title_fallback(monkeypatch):
+    """有 TMDB ID 时应直接使用 MoviePilot 映射结果，不额外标题兜底。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, _saved, _updated = _build_helper(module)
+    calls = []
+
+    class MediaChainStub:
+        """MoviePilot 媒体链测试桩。"""
+
+        async def async_get_doubaninfo_by_tmdbid(self, **kwargs):
+            """返回 TMDB 映射结果。"""
+            calls.append(("tmdb", kwargs))
+            return {"id": "27099082", "title": "出租车司机"}
+
+        async def async_match_doubaninfo(self, **kwargs):
+            """记录不应发生的标题兜底调用。"""
+            calls.append(("match", kwargs))
+            return {"id": "00000000", "title": "错误匹配"}
+
+    monkeypatch.setattr(module, "MediaChain", MediaChainStub)
+
+    result = asyncio.run(helper._get_douban_info_by_tmdb(
+        tmdb_id=437068,
+        imdb_id="tt6878038",
+        title="A Taxi Driver",
+        year=2017,
+        mtype=module.MediaType.MOVIE,
+    ))
+
+    assert result["id"] == "27099082"
+    assert [name for name, _kwargs in calls] == ["tmdb"]
+
+
+def test_tmdb_mapping_failure_does_not_fallback_to_trakt_title(monkeypatch):
+    """TMDB 映射失败时不应使用 Trakt 标题自行二次匹配。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, _saved, _updated = _build_helper(module)
+    calls = []
+
+    class MediaChainStub:
+        """MoviePilot 媒体链测试桩。"""
+
+        async def async_get_doubaninfo_by_tmdbid(self, **kwargs):
+            """返回未匹配。"""
+            calls.append(("tmdb", kwargs))
+            return {}
+
+        async def async_match_doubaninfo(self, **kwargs):
+            """记录不应发生的标题兜底调用。"""
+            calls.append(("match", kwargs))
+            return {"id": "00000000", "title": "错误匹配"}
+
+    monkeypatch.setattr(module, "MediaChain", MediaChainStub)
+
+    result = asyncio.run(helper._get_douban_info_by_tmdb(
+        tmdb_id=437068,
+        imdb_id="tt6878038",
+        title="A Taxi Driver",
+        year=2017,
+        mtype=module.MediaType.MOVIE,
+    ))
+
+    assert result == {}
+    assert [name for name, _kwargs in calls] == ["tmdb"]
+
+
+def test_imdb_title_fallback_is_kept_when_tmdb_missing(monkeypatch):
+    """缺少 TMDB ID 时仍可交由 MoviePilot 使用 IMDb/标题兜底。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, _saved, _updated = _build_helper(module)
+    calls = []
+
+    class MediaChainStub:
+        """MoviePilot 媒体链测试桩。"""
+
+        async def async_get_doubaninfo_by_tmdbid(self, **kwargs):
+            """记录不应发生的 TMDB 映射调用。"""
+            calls.append(("tmdb", kwargs))
+            return {}
+
+        async def async_match_doubaninfo(self, **kwargs):
+            """返回 IMDb/标题兜底映射结果。"""
+            calls.append(("match", kwargs))
+            return {"id": "27099082", "title": "出租车司机"}
+
+    monkeypatch.setattr(module, "MediaChain", MediaChainStub)
+
+    result = asyncio.run(helper._get_douban_info_by_tmdb(
+        tmdb_id=None,
+        imdb_id="tt6878038",
+        title="A Taxi Driver",
+        year=2017,
+        mtype=module.MediaType.MOVIE,
+    ))
+
+    assert result["id"] == "27099082"
+    assert [name for name, _kwargs in calls] == ["match"]
 
 
 def test_fetch_history_marks_oauth_unauthorized(monkeypatch):

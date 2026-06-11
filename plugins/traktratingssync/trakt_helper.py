@@ -242,7 +242,7 @@ class TraktHelper:
             return []
 
     # ------------------------------------------------------------------
-    # 豆瓣信息匹配（异步→同步桥接）
+    # 豆瓣信息匹配（MoviePilot 映射桥接）
     # ------------------------------------------------------------------
 
     async def _get_douban_info_by_tmdb(
@@ -253,31 +253,34 @@ class TraktHelper:
         year: Optional[int] = None,
         mtype: MediaType = MediaType.MOVIE,
     ) -> Dict[str, Any]:
-        """根据 TMDB ID（及可选 IMDB/标题/年份）获取豆瓣 subject_id 和中文标题。"""
+        """通过 MoviePilot 媒体链获取豆瓣 subject_id 和中文标题。"""
         douban_info = None
+        media_chain = MediaChain()
         if tmdb_id:
             try:
-                douban_info = await MediaChain().async_get_doubaninfo_by_tmdbid(
+                douban_info = await media_chain.async_get_doubaninfo_by_tmdbid(
                     tmdbid=int(tmdb_id), mtype=mtype
                 )
                 if douban_info and douban_info.get("id"):
-                    logger.debug("豆瓣信息 (TMDB %s): %s", tmdb_id, douban_info)
+                    logger.debug("MoviePilot 映射豆瓣信息 (TMDB %s): %s", tmdb_id, douban_info)
                     return douban_info
             except Exception as e:
-                logger.debug("TMDB %s 匹配豆瓣失败: %s", tmdb_id, e)
+                logger.debug("MoviePilot TMDB %s 映射豆瓣失败: %s", tmdb_id, e)
+            return {}
+
         if title or imdb_id:
             try:
-                douban_info = await MediaChain().async_match_doubaninfo(
+                douban_info = await media_chain.async_match_doubaninfo(
                     name=title or "Unknown",
                     year=str(year) if year else None,
                     mtype=mtype,
                     imdbid=imdb_id,
                 )
                 if douban_info and douban_info.get("id"):
-                    logger.debug("豆瓣信息 (标题匹配 %s): %s", title, douban_info)
+                    logger.debug("MoviePilot 兜底映射豆瓣信息 (%s): %s", imdb_id or title, douban_info)
                     return douban_info
             except Exception as e:
-                logger.debug("标题/IMDB 匹配豆瓣失败 %s: %s", title, e)
+                logger.debug("MoviePilot IMDb/标题兜底映射豆瓣失败 %s: %s", title, e)
         return douban_info or {}
 
     def _resolve_douban_info(
