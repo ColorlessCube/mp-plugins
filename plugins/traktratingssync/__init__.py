@@ -6,7 +6,7 @@
 所有业务逻辑分别由对应 helper 实现：
   - TraktHelper      → Trakt API 封装（评分拉取、播放进度、OAuth 授权）
   - DoubanHelper     → 豆瓣 Cookie 操作（标记看过/在看、写入评分）
-  - WereadHelper     → 微信读书 Web API（notebook、getProgress）
+  - WereadHelper     → 微信读书 Skill API / Web API（书架、阅读进度）
   - NeteaseHelper    → 网易云音乐 Web API（最近播放记录，按专辑聚合）
   - XiaoyuzhouHelper → 小宇宙 FM API（播客听取历史）
 """
@@ -31,7 +31,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.10"
+    plugin_version = "3.14.11"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -44,6 +44,7 @@ class TraktRatingsSync(_PluginBase):
     _trakt_client_secret: str = ""
     _trakt_access_token: str = ""
     _douban_cookie: str = ""
+    _weread_api_key: str = ""
     _weread_curl: str = ""
     _weread_limit: int = 20
     _netease_cookie: str = ""
@@ -78,7 +79,10 @@ class TraktRatingsSync(_PluginBase):
         self._trakt_client_secret = (config.get("trakt_client_secret") or "").strip()
         self._trakt_access_token = (config.get("trakt_access_token") or "").strip()
         self._douban_cookie = (config.get("douban_cookie") or "").strip()
+        self._weread_api_key = (config.get("weread_api_key") or "").strip()
         self._weread_curl = (config.get("weread_curl") or "").strip()
+        if not self._weread_api_key and self._weread_curl.startswith("wrk-"):
+            self._weread_api_key = self._weread_curl
         self._weread_limit = int(config.get("weread_limit") or 20)
         self._netease_cookie = (config.get("netease_cookie") or "").strip()
         self._netease_limit = int(config.get("netease_limit") or 20)
@@ -123,7 +127,7 @@ class TraktRatingsSync(_PluginBase):
                 logger.error("同步 Trakt 评分失败: %s", e, exc_info=True)
 
         # 同步微信读书最近阅读记录
-        if self._weread_curl:
+        if self._weread_api_key or self._weread_curl:
             try:
                 self._sync_weread()
             except Exception as e:
@@ -344,13 +348,14 @@ class TraktRatingsSync(_PluginBase):
         4. 「读完」→ 豆瓣「读过」(collect)；「在读」→ 豆瓣「在读」(do)；其余跳过
         5. 已同步过（相同 subject_id + 状态未变）则跳过，避免重复提交
         """
-        if not self._weread_curl:
-            logger.debug("未配置微信读书阅读页 cURL，跳过同步")
+        if not (self._weread_api_key or self._weread_curl):
+            logger.debug("未配置微信读书 Skill API Key 或阅读页 cURL，跳过同步")
             return
 
         if not self._weread_helper:
             self._weread_helper = WereadHelper(
                 curl_string=self._weread_curl,
+                api_key=self._weread_api_key,
                 notify_fn=self._send_weread_auth_notification,
             )
 
@@ -361,7 +366,7 @@ class TraktRatingsSync(_PluginBase):
         )
 
         if not books:
-            logger.info("微信读书未获取到最近阅读记录（cURL 可能已失效或 notebook 为空）")
+            logger.info("微信读书未获取到最近阅读记录（API Key/cURL 可能已失效或书架为空）")
             return
 
         # 持久化书单（供详情页展示）
@@ -824,6 +829,7 @@ class TraktRatingsSync(_PluginBase):
             "trakt_client_secret": self._trakt_client_secret,
             "trakt_access_token": self._trakt_access_token,
             "douban_cookie": self._douban_cookie,
+            "weread_api_key": self._weread_api_key,
             "weread_curl": self._weread_curl,
             "weread_limit": self._weread_limit,
             "netease_cookie": self._netease_cookie,
@@ -918,8 +924,9 @@ class TraktRatingsSync(_PluginBase):
         }
 
     def _send_weread_auth_notification(self, title: str, content: str) -> bool:
-        """发送微信读书鉴权失败通知，并按 cURL 指纹做持久化冷却。"""
-        fingerprint = hashlib.sha256(self._weread_curl.encode("utf-8")).hexdigest()[:16]
+        """发送微信读书鉴权失败通知，并按凭据指纹做持久化冷却。"""
+        auth_value = self._weread_api_key or self._weread_curl
+        fingerprint = hashlib.sha256(auth_value.encode("utf-8")).hexdigest()[:16]
         state = self.get_data("weread_auth_notify_state") or {}
         now = int(time.time())
         try:
@@ -1215,11 +1222,25 @@ class TraktRatingsSync(_PluginBase):
                                 "props": {"cols": 12, "md": 10},
                                 "content": [
                                     {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "weread_api_key",
+                                            "label": "微信读书 Skill API Key（优先）",
+                                            "placeholder": "wrk-...",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 10},
+                                "content": [
+                                    {
                                         "component": "VTextarea",
                                         "props": {
                                             "model": "weread_curl",
-                                            "label": "微信读书阅读页 cURL（可选）",
-                                            "placeholder": "在微信读书阅读页打开 DevTools → Network，筛选 read，翻页后复制 web/book/read 的 Copy as cURL (bash) 完整内容粘贴到此处",
+                                            "label": "微信读书阅读页 cURL（兼容兜底）",
+                                            "placeholder": "API Key 不可用时，可粘贴 web/book/read 的完整 cURL；也兼容直接填 wrk-... API Key",
                                             "rows": 6,
                                             "auto-grow": True,
                                         },
@@ -1319,7 +1340,7 @@ class TraktRatingsSync(_PluginBase):
                                                 "2. 填写 Client Secret 启用自动授权（首次同步时会通过 Bark 发送授权链接，系统阻塞等待10分钟）\n"
                                                 "3. 授权成功后，Access Token 会自动回填到配置中\n"
                                                 "4. 豆瓣支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；失效时会通过 Bark 推送通知提醒更新\n"
-                                                "5. 微信读书请填写阅读页中 web/book/read 请求的完整 cURL，而不是只填 Cookie\n"
+                                                "5. 微信读书优先填写 Skill API Key（wrk-...），旧版阅读页完整 cURL 仍可作为兜底\n"
                                                 "6. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
                                                 "7. 网易云支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；会将最近一周听歌记录按专辑聚合，同步到豆瓣音乐「听过」\n"
                                                 "8. 小宇宙支持两种填写方式：直接填 x-jike-access-token，或粘贴包含该字段的完整 cURL"
@@ -1339,6 +1360,7 @@ class TraktRatingsSync(_PluginBase):
             "trakt_client_secret": "",
             "trakt_access_token": "",
             "douban_cookie": "",
+            "weread_api_key": "",
             "weread_curl": "",
             "weread_limit": 20,
             "netease_cookie": "",

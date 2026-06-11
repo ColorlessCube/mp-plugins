@@ -2,7 +2,8 @@
 """
 微信读书 API Helper
 用于查询用户最近阅读的书籍及阅读进度。
-通过阅读页 cURL 复用真实浏览器请求上下文，避免仅凭 Cookie 无法访问进度接口。
+优先通过微信读书 Skill API Key 调用 Agent API Gateway；未配置 API Key 时，
+兼容阅读页 cURL 复用真实浏览器请求上下文，避免仅凭 Cookie 无法访问进度接口。
 
 直接运行本文件可快速测试：
     python weread_helper.py
@@ -18,6 +19,7 @@ import requests
 from requests.utils import cookiejar_from_dict
 
 from app.log import logger
+from app.utils.http import RequestUtils
 
 
 class WereadHelper:
@@ -25,6 +27,7 @@ class WereadHelper:
 
     Args:
         curl_string: 从浏览器复制的 ``web/book/read`` 完整 cURL 字符串
+        api_key: 微信读书 Skill API Key，格式为 ``wrk-...``
         notify_fn: 登录态失效等异常时的通知回调，签名 ``(title: str, body: str) -> None``
     """
 
@@ -37,29 +40,43 @@ class WereadHelper:
     }
     _REQUEST_JITTER_RANGE = (0.8, 2.0)
     _AUTH_FAILURE_NOTIFY_COOLDOWN = 6 * 60 * 60
+    _SKILL_VERSION = "1.0.3"
 
     def __init__(
         self,
         curl_string: Optional[str] = None,
+        api_key: Optional[str] = None,
         notify_fn: Optional[Callable[[str, str], None]] = None,
     ):
         self._notify = notify_fn or (lambda title, body: None)
         self._auth_failed = False
         self._last_auth_failure_notify_at = 0.0
+        self._api_key = (api_key or "").strip()
+        if not self._api_key and (curl_string or "").strip().startswith("wrk-"):
+            self._api_key = (curl_string or "").strip()
+            curl_string = ""
 
         # 实例级 URL 常量（便于测试替换）
         self._base_url = "https://weread.qq.com"
+        self._url_gateway = "https://i.weread.qq.com/api/agent/gateway"
         self._url_notebooks = f"{self._base_url}/api/user/notebook"
         self._url_book_progress = f"{self._base_url}/web/book/getProgress"
         self._url_book_info = f"{self._base_url}/web/book/info"
 
         self.session = requests.Session()
-        if curl_string:
+        if self._api_key:
+            self.session.headers.update({
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            })
+            logger.debug("微信读书使用 Skill API Key 模式认证，key_length=%d", len(self._api_key))
+        elif curl_string:
             parsed = self._parse_curl_string(curl_string)
             self.session.cookies = self._parse_cookie_string(parsed.get("cookie", ""))
             self.session.headers.update(parsed.get("headers", {}))
         else:
-            logger.warning("未提供微信读书阅读页 cURL，个人数据接口将无法使用")
+            logger.warning("未提供微信读书 Skill API Key 或阅读页 cURL，个人数据接口将无法使用")
 
         self.session.headers.update({
             "User-Agent": self.session.headers.get(
@@ -141,6 +158,8 @@ class WereadHelper:
 
     def _refresh_session(self) -> None:
         """访问首页以刷新 Session，防止登录态过期"""
+        if self._api_key:
+            return
         if self._auth_failed:
             logger.debug("微信读书登录态已标记失效，跳过刷新 Session")
             return
@@ -152,8 +171,11 @@ class WereadHelper:
 
     def _auth_context(self) -> str:
         """返回当前微信读书鉴权上下文摘要。"""
+        if self._api_key:
+            return f"auth_mode=api_key, key_length={len(self._api_key)}"
         cookie_keys = sorted(self.session.cookies.keys())
         return (
+            "auth_mode=curl, "
             f"cookie_count={len(cookie_keys)}, "
             f"has_wr_skey={'wr_skey' in self.session.cookies}, "
             f"has_wr_vid={'wr_vid' in self.session.cookies}, "
@@ -183,6 +205,91 @@ class WereadHelper:
         delay = random.uniform(*self._REQUEST_JITTER_RANGE)
         logger.debug("微信读书%s前随机等待 %.2f 秒", action, delay)
         time.sleep(delay)
+
+    def _gateway_call(
+        self,
+        api_name: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """调用微信读书 Skill Agent API Gateway。"""
+        if self._auth_failed:
+            logger.warning("微信读书登录态已标记失效，跳过 Skill 请求: api_name=%s", api_name)
+            return None
+        if not self._api_key:
+            return None
+
+        body = {
+            "api_name": api_name,
+            "skill_version": self._SKILL_VERSION,
+        }
+        if payload:
+            body.update(payload)
+
+        try:
+            self._sleep_before_request("Skill API")
+            resp = RequestUtils(
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=20,
+            ).post_res(self._url_gateway, json=body)
+            if resp is None:
+                logger.error("微信读书 Skill 请求失败: api_name=%s", api_name)
+                return None
+            if resp.status_code in (401, 403):
+                msg = (
+                    f"微信读书 API Key 已失效或无权限（HTTP {resp.status_code}），"
+                    "请重新获取 API Key 并更新配置。"
+                )
+                detail = f"api_name={api_name}, status={resp.status_code}, {self._auth_context()}"
+                self._notify_auth_failure("微信读书 API Key 已失效", msg, detail)
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.HTTPError as e:
+            logger.error("微信读书 Skill HTTP 错误: %s", e)
+            return None
+        except requests.RequestException as e:
+            logger.error("微信读书 Skill 请求异常: %s", e)
+            return None
+        except Exception as e:
+            logger.error("微信读书 Skill 处理异常: %s", e, exc_info=True)
+            return None
+
+        if not isinstance(data, dict):
+            logger.warning("微信读书 Skill 返回非对象响应: api_name=%s", api_name)
+            return None
+
+        upgrade_info = data.get("upgrade_info")
+        if upgrade_info:
+            logger.error("微信读书 Skill 需要升级: %s", upgrade_info.get("message") or upgrade_info)
+            return None
+
+        errcode = data.get("errcode")
+        errmsg = data.get("errmsg", "")
+        if errcode is None and "errCode" in data:
+            errcode = data.get("errCode")
+            errmsg = data.get("errMsg", "")
+        if errcode is not None and errcode != 0:
+            if errcode in (-2012, -2010, -1012, 401, 403):
+                msg = "微信读书 API Key 已失效或无权限，请重新获取 API Key 并更新配置。"
+                detail = (
+                    f"api_name={api_name}, errcode={errcode}, "
+                    f"errmsg={errmsg}, {self._auth_context()}"
+                )
+                self._notify_auth_failure("微信读书 API Key 已失效", msg, detail)
+            else:
+                logger.warning(
+                    "微信读书 Skill API 返回错误: api_name=%s, errcode=%s, errmsg=%s",
+                    api_name, errcode, errmsg,
+                )
+            return None
+
+        if isinstance(data.get("data"), dict):
+            return data.get("data")
+        return data
 
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """GET 请求封装，自动检测登录态失效并通知，失败返回 None"""
@@ -284,6 +391,17 @@ class WereadHelper:
 
     def get_notebook_list(self) -> List[Dict[str, Any]]:
         """获取书架上有划线/笔记的书籍列表（/api/user/notebook），按最近交互时间排序"""
+        if self._api_key:
+            data = self._gateway_call("/shelf/sync")
+            if not data:
+                return []
+            books = data.get("books", [])
+            books.sort(
+                key=lambda x: x.get("readUpdateTime") or x.get("updateTime") or 0,
+                reverse=True,
+            )
+            return [{"book": book} for book in books]
+
         self._refresh_session()
         data = self._get(self._url_notebooks)
         if data:
@@ -294,10 +412,14 @@ class WereadHelper:
 
     def get_book_progress(self, book_id: str) -> Optional[Dict[str, Any]]:
         """获取单本书当前阅读进度（百分比、阅读时长、最后阅读位置）。"""
+        if self._api_key:
+            return self._gateway_call("/book/getprogress", {"bookId": book_id})
         return self._get(self._url_book_progress, params={"bookId": book_id})
 
     def get_book_info(self, book_id: str) -> Optional[Dict[str, Any]]:
         """获取书籍详细信息（封面、ISBN、评分等）"""
+        if self._api_key:
+            return self._gateway_call("/book/info", {"bookId": book_id})
         return self._get(self._url_book_info, params={"bookId": book_id})
 
     # ------------------------------------------------------------------
@@ -311,8 +433,9 @@ class WereadHelper:
     ) -> List[Dict[str, Any]]:
         """获取最近阅读的书籍列表，可选附带每本书的阅读进度。
 
-        当前实现固定使用 ``/api/user/notebook`` 获取最近交互书单，
-        再逐本调用 ``/web/book/getProgress`` 获取进度。
+        API Key 模式使用 ``/shelf/sync`` 获取书架并按最近阅读时间排序，
+        再逐本调用 ``/book/getprogress`` 获取进度；cURL 模式保留旧的
+        ``/api/user/notebook`` + ``/web/book/getProgress`` 流程。
 
         Args:
             limit: 最多返回几本（默认 20）
@@ -364,16 +487,18 @@ class WereadHelper:
 
     def _build_entry_from_notebook(self, book_id: str, book: Dict[str, Any]) -> Dict[str, Any]:
         """从 notebook 条目构造统一数据结构"""
+        read_update_time = self._safe_int(book.get("readUpdateTime") or book.get("updateTime"))
+        finished = book.get("finishReading") == 1
         return {
             "book_id": book_id,
             "title": book.get("title", ""),
             "author": book.get("author", ""),
             "cover": self._normalize_cover(book.get("cover", "")),
             "category": book.get("category", ""),
-            "read_update_time": 0,
+            "read_update_time": read_update_time,
             "reading_time": 0,
             "reading_progress": 0,
-            "status": "在读",
+            "status": "读完" if finished else "在读",
             "finished_date": None,
             "weread_url": self._build_weread_url(book_id),
         }
@@ -391,7 +516,13 @@ class WereadHelper:
             entry["reading_progress"] = reading_progress
             if reading_progress >= 100:
                 entry["status"] = "读完"
-                if not entry.get("finished_date"):
+                finish_time = self._extract_finish_time(book)
+                if finish_time > 0:
+                    entry["finished_date"] = time.strftime(
+                        "%Y-%m-%d",
+                        time.localtime(finish_time),
+                    )
+                elif not entry.get("finished_date"):
                     entry["finished_date"] = None
             elif reading_progress > 0 and entry.get("status") != "读完":
                 entry["status"] = "在读"
@@ -423,6 +554,7 @@ class WereadHelper:
     def _extract_reading_time(payload: Dict[str, Any]) -> Optional[int]:
         for value in (
             payload.get("readingTime"),
+            payload.get("recordReadingTime"),
             (payload.get("readingDetail") or {}).get("readingTime") if isinstance(payload.get("readingDetail"), dict) else None,
         ):
             if value is None:
@@ -432,6 +564,11 @@ class WereadHelper:
             except (TypeError, ValueError):
                 continue
         return None
+
+    @staticmethod
+    def _extract_finish_time(payload: Dict[str, Any]) -> int:
+        """提取读完时间戳。"""
+        return WereadHelper._safe_int(payload.get("finishTime"))
 
     @staticmethod
     def _extract_read_update_time(payload: Dict[str, Any]) -> int:
@@ -450,6 +587,16 @@ class WereadHelper:
             except (TypeError, ValueError):
                 continue
         return 0
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        """将输入转换为整数，失败时返回 0。"""
+        if value is None or value == "":
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _normalize_progress_value(value: Any) -> Optional[int]:
