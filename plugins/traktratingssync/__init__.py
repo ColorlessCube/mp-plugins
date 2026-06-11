@@ -22,6 +22,7 @@ from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
 from .douban_helper import DoubanHelper
 from .netease_helper import NeteaseHelper
+from .netease_openapi_helper import NeteaseOpenApiHelper
 from .trakt_helper import TraktHelper
 from .weread_helper import WereadHelper
 from .xiaoyuzhou_helper import XiaoyuzhouHelper
@@ -31,7 +32,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.12"
+    plugin_version = "3.14.13"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -47,6 +48,15 @@ class TraktRatingsSync(_PluginBase):
     _weread_api_key: str = ""
     _weread_limit: int = 20
     _netease_cookie: str = ""
+    _netease_app_id: str = ""
+    _netease_private_key: str = ""
+    _netease_access_token: str = ""
+    _netease_refresh_token: str = ""
+    _netease_token_expires_at: int = 0
+    _netease_anonymous_access_token: str = ""
+    _netease_device_id: str = ""
+    _netease_qr_key: str = ""
+    _netease_qr_url: str = ""
     _netease_limit: int = 20
     _xiaoyuzhou_cookie: str = ""
     _xiaoyuzhou_limit: int = 20
@@ -64,6 +74,7 @@ class TraktRatingsSync(_PluginBase):
     _trakt_helper: Optional[TraktHelper] = None
     _weread_helper: Optional[WereadHelper] = None
     _netease_helper: Optional[NeteaseHelper] = None
+    _netease_openapi_helper: Optional[NeteaseOpenApiHelper] = None
     _xiaoyuzhou_helper: Optional[XiaoyuzhouHelper] = None
 
     # ------------------------------------------------------------------
@@ -81,6 +92,18 @@ class TraktRatingsSync(_PluginBase):
         self._weread_api_key = (config.get("weread_api_key") or "").strip()
         self._weread_limit = int(config.get("weread_limit") or 20)
         self._netease_cookie = (config.get("netease_cookie") or "").strip()
+        self._netease_app_id = (config.get("netease_app_id") or "").strip()
+        self._netease_private_key = (config.get("netease_private_key") or "").strip()
+        self._netease_access_token = (config.get("netease_access_token") or "").strip()
+        self._netease_refresh_token = (config.get("netease_refresh_token") or "").strip()
+        self._netease_token_expires_at = int(config.get("netease_token_expires_at") or 0)
+        self._netease_anonymous_access_token = (config.get("netease_anonymous_access_token") or "").strip()
+        self._netease_device_id = NeteaseOpenApiHelper.normalize_device_id(
+            config.get("netease_device_id") or "",
+            self._netease_app_id,
+        )
+        self._netease_qr_key = (config.get("netease_qr_key") or "").strip()
+        self._netease_qr_url = (config.get("netease_qr_url") or "").strip()
         self._netease_limit = int(config.get("netease_limit") or 20)
         self._xiaoyuzhou_cookie = (config.get("xiaoyuzhou_cookie") or "").strip()
         self._xiaoyuzhou_limit = int(config.get("xiaoyuzhou_limit") or 20)
@@ -97,6 +120,7 @@ class TraktRatingsSync(_PluginBase):
         self._trakt_helper = None
         self._weread_helper = None
         self._netease_helper = None
+        self._netease_openapi_helper = None
         self._xiaoyuzhou_helper = None
 
     def run(self):
@@ -130,7 +154,7 @@ class TraktRatingsSync(_PluginBase):
                 logger.error("同步微信读书记录失败: %s", e, exc_info=True)
 
         # 同步网易云音乐最近听歌专辑到豆瓣「听过」
-        if self._netease_cookie:
+        if self._has_netease_source():
             try:
                 self._sync_netease()
             except Exception as e:
@@ -508,22 +532,36 @@ class TraktRatingsSync(_PluginBase):
         3. 调用 set_music_status("collect") 标记为「听过」
         4. 结果持久化到插件数据 "netease_albums"
         """
-        if not self._netease_cookie:
-            logger.debug("未配置网易云音乐 Cookie，跳过同步")
+        if not self._has_netease_source():
+            logger.debug("未配置网易云音乐官方授权或 Cookie，跳过同步")
             return
 
-        if not self._netease_helper:
-            self._netease_helper = NeteaseHelper(
-                cookies=self._netease_cookie,
-                notify_fn=self._send_bark_notification,
-            )
+        if self._netease_access_token and self._netease_app_id and self._netease_private_key:
+            netease_helper = self._get_netease_openapi_helper()
+            logger.info("开始同步网易云音乐最近听歌记录到豆瓣（官方开放平台）...")
+        elif self._netease_cookie:
+            if not self._netease_helper:
+                self._netease_helper = NeteaseHelper(
+                    cookies=self._netease_cookie,
+                    notify_fn=self._send_bark_notification,
+                )
+            netease_helper = self._netease_helper
+            logger.info("开始同步网易云音乐最近听歌记录到豆瓣（Cookie 回退）...")
+        else:
+            logger.info("网易云音乐已配置官方 AppID/PrivateKey，但尚未完成扫码登录，跳过同步")
+            return
 
-        logger.info("开始同步网易云音乐最近听歌记录到豆瓣...")
+        if not netease_helper:
+            logger.warning("网易云音乐 Helper 初始化失败，跳过同步")
+            return
 
-        albums = self._netease_helper.get_recent_albums(limit=self._netease_limit)
+        albums = netease_helper.get_recent_albums(limit=self._netease_limit)
         if not albums:
-            logger.info("网易云音乐未获取到最近专辑记录（Cookie 可能已失效或暂无听歌记录）")
+            logger.info("网易云音乐未获取到最近专辑记录（凭据可能失效或暂无听歌记录）")
             return
+
+        if isinstance(netease_helper, NeteaseOpenApiHelper):
+            self._persist_netease_openapi_state(netease_helper)
 
         # 已同步缓存（key = 豆瓣 subject_id，避免重复提交）
         synced: Dict[str, Any] = self.get_data("netease_albums") or {}
@@ -815,6 +853,45 @@ class TraktRatingsSync(_PluginBase):
 # 辅助工具
 # ------------------------------------------------------------------
 
+    def _has_netease_source(self) -> bool:
+        """判断网易云音乐是否存在可用数据源配置。"""
+        return bool(
+            self._netease_cookie
+            or (self._netease_app_id and self._netease_private_key)
+        )
+
+    def _get_netease_openapi_helper(self) -> Optional[NeteaseOpenApiHelper]:
+        """创建或复用网易云开放平台 Helper。"""
+        if not (self._netease_app_id and self._netease_private_key):
+            return None
+        if not self._netease_openapi_helper:
+            self._netease_openapi_helper = NeteaseOpenApiHelper(
+                app_id=self._netease_app_id,
+                private_key=self._netease_private_key,
+                access_token=self._netease_access_token,
+                refresh_token=self._netease_refresh_token,
+                token_expires_at=self._netease_token_expires_at,
+                anonymous_access_token=self._netease_anonymous_access_token,
+                device_id=self._netease_device_id,
+                notify_fn=self._send_bark_notification,
+            )
+        return self._netease_openapi_helper
+
+    def _persist_netease_openapi_state(self, helper: NeteaseOpenApiHelper) -> None:
+        """持久化网易云开放平台 Helper 的非空状态。"""
+        state = helper.get_token_values()
+        patch: Dict[str, Any] = {
+            "netease_device_id": state.get("device_id") or self._netease_device_id,
+            "netease_token_expires_at": state.get("token_expires_at") or self._netease_token_expires_at,
+        }
+        if state.get("anonymous_access_token"):
+            patch["netease_anonymous_access_token"] = state["anonymous_access_token"]
+        if state.get("access_token"):
+            patch["netease_access_token"] = state["access_token"]
+        if state.get("refresh_token"):
+            patch["netease_refresh_token"] = state["refresh_token"]
+        self._merge_update_config(patch)
+
     def _merge_update_config(self, patch: Dict[str, Any]) -> None:
         """将 patch 合并到当前配置后调用 update_config（避免覆盖其他字段）。"""
         current = {
@@ -827,16 +904,34 @@ class TraktRatingsSync(_PluginBase):
             "weread_api_key": self._weread_api_key,
             "weread_limit": self._weread_limit,
             "netease_cookie": self._netease_cookie,
+            "netease_app_id": self._netease_app_id,
+            "netease_private_key": self._netease_private_key,
+            "netease_access_token": self._netease_access_token,
+            "netease_refresh_token": self._netease_refresh_token,
+            "netease_token_expires_at": self._netease_token_expires_at,
+            "netease_anonymous_access_token": self._netease_anonymous_access_token,
+            "netease_device_id": self._netease_device_id,
+            "netease_qr_key": self._netease_qr_key,
+            "netease_qr_url": self._netease_qr_url,
             "netease_limit": self._netease_limit,
             "xiaoyuzhou_cookie": self._xiaoyuzhou_cookie,
             "xiaoyuzhou_limit": self._xiaoyuzhou_limit,
             "private": self._private,
             "sync_type": self._sync_type,
             "max_sync_count": self._max_sync_count,
+            "trakt_history_limit": self._trakt_history_limit,
+            "trakt_history_days": self._trakt_history_days,
             "cron": self._cron,
             "bark_webhook_url": self._bark_webhook_url,
         }
         current.update(patch)
+        self._netease_access_token = current.get("netease_access_token") or ""
+        self._netease_refresh_token = current.get("netease_refresh_token") or ""
+        self._netease_token_expires_at = int(current.get("netease_token_expires_at") or 0)
+        self._netease_anonymous_access_token = current.get("netease_anonymous_access_token") or ""
+        self._netease_device_id = current.get("netease_device_id") or self._netease_device_id
+        self._netease_qr_key = current.get("netease_qr_key") or ""
+        self._netease_qr_url = current.get("netease_qr_url") or ""
         self.update_config(current)
 
     def _persist_xiaoyuzhou_cookie_if_updated(self) -> None:
@@ -967,6 +1062,27 @@ class TraktRatingsSync(_PluginBase):
                 "methods": ["GET", "POST"],
                 "summary": "手动执行同步",
                 "description": "立即执行一次 Trakt 评分同步到豆瓣",
+            },
+            {
+                "path": "/traktratingssync/netease/qrcode",
+                "endpoint": self._api_netease_qrcode,
+                "methods": ["GET", "POST"],
+                "summary": "生成网易云官方登录二维码",
+                "description": "通过网易云开放平台生成 App 扫码登录二维码",
+            },
+            {
+                "path": "/traktratingssync/netease/qrcode/status",
+                "endpoint": self._api_netease_qrcode_status,
+                "methods": ["GET", "POST"],
+                "summary": "轮询网易云官方登录二维码",
+                "description": "轮询上一次生成的网易云登录二维码状态，成功后写回 Token",
+            },
+            {
+                "path": "/traktratingssync/netease/test",
+                "endpoint": self._api_netease_test,
+                "methods": ["GET", "POST"],
+                "summary": "测试网易云官方最近播放专辑",
+                "description": "拉取网易云开放平台最近播放专辑，用于验证官方授权是否可用",
             }
         ]
 
@@ -978,6 +1094,66 @@ class TraktRatingsSync(_PluginBase):
         except Exception as e:
             logger.error("手动同步失败: %s", e, exc_info=True)
             return {"success": False, "message": str(e)}
+
+    def _api_netease_qrcode(self) -> Dict[str, Any]:
+        """生成网易云官方二维码登录链接。"""
+        helper = self._get_netease_openapi_helper()
+        if not helper:
+            return {"success": False, "message": "请先配置网易云开放平台 AppID 和 PrivateKey"}
+
+        qrcode = helper.get_login_qrcode()
+        self._persist_netease_openapi_state(helper)
+        if not qrcode:
+            return {"success": False, "message": "生成网易云登录二维码失败，请检查 AppID/PrivateKey 和开放平台权限"}
+
+        patch = {
+            "netease_qr_key": qrcode.get("uniKey") or "",
+            "netease_qr_url": qrcode.get("qrCodeUrl") or "",
+        }
+        self._merge_update_config(patch)
+        return {
+            "success": True,
+            "message": "请在 5 分钟内使用网易云音乐 App 扫码授权",
+            "qrCodeUrl": qrcode.get("qrCodeUrl"),
+            "uniKey": qrcode.get("uniKey"),
+        }
+
+    def _api_netease_qrcode_status(self) -> Dict[str, Any]:
+        """轮询网易云官方二维码登录状态。"""
+        helper = self._get_netease_openapi_helper()
+        if not helper:
+            return {"success": False, "message": "请先配置网易云开放平台 AppID 和 PrivateKey"}
+        if not self._netease_qr_key:
+            return {"success": False, "message": "请先生成网易云登录二维码"}
+
+        status_data = helper.poll_login_qrcode(self._netease_qr_key)
+        self._persist_netease_openapi_state(helper)
+        if not status_data:
+            return {"success": False, "message": "轮询网易云登录二维码失败"}
+
+        status_code = status_data.get("status")
+        status_message = status_data.get("msg") or ""
+        if status_code == 803:
+            self._merge_update_config({"netease_qr_key": "", "netease_qr_url": ""})
+            return {"success": True, "status": status_code, "message": "网易云扫码授权成功"}
+        if status_code == 800:
+            self._merge_update_config({"netease_qr_key": "", "netease_qr_url": ""})
+            return {"success": False, "status": status_code, "message": status_message or "二维码已过期，请重新生成"}
+        return {"success": False, "status": status_code, "message": status_message or "等待扫码"}
+
+    def _api_netease_test(self) -> Dict[str, Any]:
+        """测试网易云开放平台最近播放专辑接口。"""
+        helper = self._get_netease_openapi_helper()
+        if not helper:
+            return {"success": False, "message": "请先配置网易云开放平台 AppID 和 PrivateKey"}
+        albums = helper.get_recent_albums(limit=min(self._netease_limit, 10))
+        self._persist_netease_openapi_state(helper)
+        return {
+            "success": bool(albums),
+            "message": f"获取到 {len(albums)} 张最近播放专辑" if albums else "未获取到最近播放专辑",
+            "albums": albums[:10],
+            "token_state": helper.get_token_state(),
+        }
 
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enable:
@@ -1242,14 +1418,115 @@ class TraktRatingsSync(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "netease_app_id",
+                                            "label": "网易云开放平台 AppID",
+                                            "placeholder": "b3010d...",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "netease_private_key",
+                                            "label": "网易云开放平台 PrivateKey",
+                                            "placeholder": "粘贴开放平台 RSA PrivateKey，不需要依赖 CLI",
+                                            "rows": 2,
+                                            "auto-grow": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "netease_qr_url",
+                                            "label": "网易云登录二维码 URL（自动生成）",
+                                            "readonly": True,
+                                            "placeholder": "调用 /api/v1/plugin/traktratingssync/netease/qrcode 生成",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "netease_device_id",
+                                            "label": "网易云开放平台 Device ID",
+                                            "placeholder": "留空自动生成，仅允许字母数字",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "netease_access_token",
+                                            "label": "网易云 Access Token（自动填充）",
+                                            "type": "password",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "netease_refresh_token",
+                                            "label": "网易云 Refresh Token（自动填充）",
+                                            "type": "password",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "netease_token_expires_at",
+                                            "label": "网易云 Token 过期时间戳",
+                                            "readonly": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 10},
                                 "content": [
                                     {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "netease_cookie",
-                                            "label": "网易云音乐 Cookie（可选）",
-                                            "placeholder": "可直接填网易云 Cookie，或粘贴包含 Cookie 的完整网易云 cURL",
+                                            "label": "网易云音乐 Cookie（回退方式，可选）",
+                                            "placeholder": "官方授权不可用时可临时填 Cookie 或完整网易云 cURL",
                                         },
                                     }
                                 ],
@@ -1320,8 +1597,9 @@ class TraktRatingsSync(_PluginBase):
                                                 "4. 豆瓣支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；失效时会通过 Bark 推送通知提醒更新\n"
                                                 "5. 微信读书填写 Skill API Key（wrk-...），不再支持旧版阅读页 cURL\n"
                                                 "6. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
-                                                "7. 网易云支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；会将最近一周听歌记录按专辑聚合，同步到豆瓣音乐「听过」\n"
-                                                "8. 小宇宙支持两种填写方式：直接填 x-jike-access-token，或粘贴包含该字段的完整 cURL"
+                                                "7. 网易云优先使用开放平台 AppID/PrivateKey + 官方扫码授权；生成二维码后用网易云 App 扫码，再轮询状态写回 Token\n"
+                                                "8. 网易云 Cookie 仅作为回退方式；会将最近播放专辑同步到豆瓣音乐「听过」\n"
+                                                "9. 小宇宙支持两种填写方式：直接填 x-jike-access-token，或粘贴包含该字段的完整小宇宙 cURL"
                                             ),
                                         },
                                     }
@@ -1341,6 +1619,15 @@ class TraktRatingsSync(_PluginBase):
             "weread_api_key": "",
             "weread_limit": 20,
             "netease_cookie": "",
+            "netease_app_id": "",
+            "netease_private_key": "",
+            "netease_access_token": "",
+            "netease_refresh_token": "",
+            "netease_token_expires_at": 0,
+            "netease_anonymous_access_token": "",
+            "netease_device_id": "",
+            "netease_qr_key": "",
+            "netease_qr_url": "",
             "netease_limit": 20,
             "xiaoyuzhou_cookie": "",
             "xiaoyuzhou_limit": 20,
