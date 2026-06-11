@@ -24,6 +24,7 @@ from Crypto.Util.Padding import pad
 import base64
 
 from app.log import logger
+from app.utils.http import RequestUtils
 
 
 class NeteaseHelper:
@@ -270,23 +271,26 @@ class NeteaseHelper:
 
         try:
             self._sleep_before_request(endpoint)
+            request = RequestUtils(
+                headers=self._headers,
+                cookies=self.cookies,
+                timeout=15,
+            )
             if method.upper() == "POST":
                 encrypted = self._encrypt_params(request_params)
-                response = requests.post(
+                response = request.post_res(
                     url=url,
                     data=encrypted,
-                    headers=self._headers,
-                    cookies=self.cookies,
-                    timeout=15,
                 )
             else:
-                response = requests.get(
+                response = request.get_res(
                     url=url,
                     params=request_params,
-                    headers=self._headers,
-                    cookies=self.cookies,
-                    timeout=15,
                 )
+
+            if response is None:
+                logger.error("网易云音乐 API 请求失败: endpoint=%s, %s", endpoint, self._auth_context())
+                return None
 
             response.raise_for_status()
             data = response.json()
