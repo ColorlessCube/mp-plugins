@@ -450,6 +450,28 @@ def test_expired_token_refresh_failure_triggers_auth_required_callback(monkeypat
     assert notifications[0][0] == "网易云开放平台 Token 已过期"
 
 
+def test_missing_access_token_triggers_auth_required_callback(monkeypatch):
+    """缺少 AT 且无法用 RT 恢复时，应触发重新认证回调。"""
+    helper_module = _load_helper_module()
+    callbacks = []
+    notifications = []
+    helper = helper_module.NeteaseOpenApiHelper(
+        app_id="app-id",
+        app_secret="app-secret",
+        private_key="test",
+        access_token="",
+        refresh_token="",
+        notify_fn=lambda title, body: notifications.append((title, body)),
+        auth_required_fn=lambda: callbacks.append("auth-required"),
+    )
+
+    monkeypatch.setattr(helper, "refresh_access_token", lambda: False)
+
+    assert helper.get_recent_albums(limit=10) == []
+    assert callbacks == ["auth-required"]
+    assert notifications[0][0] == "网易云开放平台未登录"
+
+
 def test_auth_response_1406_refresh_failure_triggers_auth_required_callback(monkeypatch):
     """实名接口返回 1406 且刷新失败时，应触发重新认证回调。"""
     helper_module = _load_helper_module()

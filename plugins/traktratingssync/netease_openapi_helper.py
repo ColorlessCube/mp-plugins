@@ -331,6 +331,7 @@ class NeteaseOpenApiHelper:
                 "网易云开放平台未登录",
                 "请先通过插件的网易云官方二维码登录接口完成扫码授权。",
             )
+            self._auth_required()
             return False
 
         now_ts = int(time.time())
