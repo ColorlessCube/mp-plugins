@@ -212,3 +212,34 @@ def test_post_interest_uses_requestutils(monkeypatch):
     )
     assert calls[0]["init"]["cookies"] == helper.cookies
     assert calls[0]["request"]["data"] == {"ck": "mIHe"}
+
+
+def test_post_interest_retries_transient_status(monkeypatch):
+    """豆瓣状态提交遇到临时 5xx 时应重试一次。"""
+    module = _load_douban_helper_module(monkeypatch)
+    helper = _build_helper(module, monkeypatch)
+    calls = []
+
+    class RequestUtilsStub:
+        """按调用顺序返回 503 与成功响应。"""
+
+        def __init__(self, **kwargs):
+            """记录初始化参数。"""
+            self.kwargs = kwargs
+
+        def post_res(self, **kwargs):
+            """返回测试响应。"""
+            calls.append({"init": self.kwargs, "request": kwargs})
+            if len(calls) == 1:
+                return _Response(503, text="upstream connect error")
+            return _Response(200, {"r": 0})
+
+    monkeypatch.setattr(module, "RequestUtils", RequestUtilsStub)
+
+    assert helper._post_interest(
+        url="https://movie.douban.com/j/subject/123/interest",
+        referer="https://movie.douban.com/subject/123/",
+        host="movie.douban.com",
+        data={"ck": "mIHe"},
+    )
+    assert len(calls) == 2

@@ -40,6 +40,7 @@ class DoubanHelper:
     _SEARCH_MIN_INTERVAL = 2.5
     _SEARCH_FORBIDDEN_COOLDOWN = 600
     _REQUEST_JITTER_RANGE = (1.0, 3.0)
+    _TRANSIENT_STATUS_CODES = {502, 503, 504}
 
     def __init__(
         self,
@@ -278,18 +279,30 @@ class DoubanHelper:
     def _post_interest(self, url: str, referer: str, host: str, data: dict) -> bool:
         """向豆瓣提交 interest 请求，统一处理响应和 Cookie 失效检测"""
         headers = self._build_headers(referer, host)
-        try:
-            self._sleep_before_request("提交状态")
-            response = RequestUtils(headers=headers, cookies=self.cookies, timeout=10).post_res(
-                url=url,
-                data=data,
-            )
-        except Exception as e:
-            logger.error("请求豆瓣失败: %s", e)
-            return False
-        if response is None:
-            logger.error("豆瓣未返回内容")
-            return False
+        response = None
+        for attempt in range(2):
+            try:
+                self._sleep_before_request("提交状态")
+                response = RequestUtils(headers=headers, cookies=self.cookies, timeout=10).post_res(
+                    url=url,
+                    data=data,
+                )
+            except Exception as e:
+                logger.error("请求豆瓣失败: %s", e)
+                return False
+            if response is None:
+                logger.warning("豆瓣未返回内容，attempt=%d", attempt + 1)
+                if attempt == 0:
+                    continue
+                return False
+            if response.status_code in self._TRANSIENT_STATUS_CODES and attempt == 0:
+                logger.warning(
+                    "豆瓣返回临时异常 %s，准备重试一次: %s",
+                    response.status_code,
+                    (response.text or "")[:200],
+                )
+                continue
+            break
         if response.status_code == 403:
             msg = "豆瓣返回 403，Cookie 可能已失效、填写错误，或当前请求被风控。请重新复制 Cookie 或完整 cURL 后重试。"
             detail = (
