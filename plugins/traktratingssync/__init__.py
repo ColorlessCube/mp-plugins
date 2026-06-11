@@ -32,7 +32,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.13"
+    plugin_version = "3.14.16"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -69,6 +69,7 @@ class TraktRatingsSync(_PluginBase):
     _cron: str = "0 2 * * *"
     _bark_webhook_url: str = ""
     _weread_auth_notify_cooldown: int = 6 * 60 * 60
+    _netease_auth_notify_cooldown: int = 10 * 60
 
     # helper 实例（延迟初始化）
     _douban_helper: Optional[DoubanHelper] = None
@@ -538,7 +539,7 @@ class TraktRatingsSync(_PluginBase):
             logger.debug("未配置网易云音乐官方授权或 Cookie，跳过同步")
             return
 
-        if self._netease_access_token and self._netease_app_id and self._netease_private_key:
+        if self._netease_app_id and self._netease_private_key:
             netease_helper = self._get_netease_openapi_helper()
             logger.info("开始同步网易云音乐最近听歌记录到豆瓣（官方开放平台）...")
         elif self._netease_cookie:
@@ -877,6 +878,7 @@ class TraktRatingsSync(_PluginBase):
                 anonymous_access_token=self._netease_anonymous_access_token,
                 device_id=self._netease_device_id,
                 notify_fn=self._send_bark_notification,
+                auth_required_fn=self._send_netease_auth_notification,
             )
         return self._netease_openapi_helper
 
@@ -950,7 +952,7 @@ class TraktRatingsSync(_PluginBase):
         self._merge_update_config({"xiaoyuzhou_cookie": refreshed_cookie})
         logger.info("小宇宙 Token 自动刷新结果已写回插件配置")
 
-    def _send_bark_notification(self, title: str, content: str) -> bool:
+    def _send_bark_notification(self, title: str, content: str, link_url: str = "") -> bool:
         """发送 Bark 推送通知（POST JSON 方式）。
 
         参考: https://github.com/Finb/Bark
@@ -969,7 +971,7 @@ class TraktRatingsSync(_PluginBase):
             if not content:
                 content = title
 
-            url, payload = self._build_bark_request(self._bark_webhook_url, title, content)
+            url, payload = self._build_bark_request(self._bark_webhook_url, title, content, link_url)
             logger.debug("发送 Bark 通知: %s", title)
             resp = RequestUtils(
                 timeout=10, headers={"Content-Type": "application/json"}
@@ -988,14 +990,23 @@ class TraktRatingsSync(_PluginBase):
             return False
 
     @staticmethod
-    def _build_bark_request(webhook_url: str, title: str, content: str) -> Tuple[str, Dict[str, Any]]:
+    def _build_bark_request(
+            webhook_url: str,
+            title: str,
+            content: str,
+            link_url: str = "",
+    ) -> Tuple[str, Dict[str, Any]]:
         """构造 Bark 请求 URL 和 JSON 参数。"""
         url = webhook_url.strip().rstrip("/")
+        link_url = (link_url or "").strip()
         parsed = urlparse(url)
         segments = [segment for segment in parsed.path.split("/") if segment]
         if segments and segments[-1] != "push":
             device_key = segments[-1]
             body = content if len(content) <= 1800 else f"{content[:1800]}..."
+            query_params = {"group": "豆瓣书影音同步", "sound": "bell"}
+            if link_url:
+                query_params["url"] = link_url
             path_segments = segments[:-1] + [
                 quote(device_key, safe=""),
                 quote(title, safe=""),
@@ -1005,17 +1016,75 @@ class TraktRatingsSync(_PluginBase):
                 parsed._replace(
                     path="/" + "/".join(path_segments),
                     params="",
-                    query=urlencode({"group": "豆瓣书影音同步", "sound": "bell"}),
+                    query=urlencode(query_params),
                     fragment="",
                 )
             )
             return path_url, {}
-        return url, {
+        payload = {
             "title": title,
             "body": content,
             "group": "豆瓣书影音同步",
             "sound": "bell",
         }
+        if link_url:
+            payload["url"] = link_url
+        return url, payload
+
+    def _send_netease_auth_notification(self) -> bool:
+        """发送网易云重新扫码认证通知，并把短期二维码链接写回配置。"""
+        helper = self._netease_openapi_helper or self._get_netease_openapi_helper()
+        if not helper:
+            return False
+
+        fingerprint_source = f"{self._netease_app_id}:{self._netease_device_id}:{self._netease_refresh_token[:16]}"
+        fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:16]
+        state = self.get_data("netease_auth_notify_state") or {}
+        now = int(time.time())
+        try:
+            last_notified_at = int(state.get("last_notified_at") or 0)
+        except (TypeError, ValueError):
+            last_notified_at = 0
+        if (
+            state.get("fingerprint") == fingerprint
+            and now - last_notified_at < self._netease_auth_notify_cooldown
+        ):
+            logger.warning(
+                "网易云鉴权失败通知仍在冷却期内，跳过 Bark 推送: cooldown=%ss",
+                self._netease_auth_notify_cooldown,
+            )
+            return False
+
+        qrcode = helper.get_login_qrcode()
+        self._persist_netease_openapi_state(helper)
+        if not qrcode:
+            self.save_data("netease_auth_notify_state", {
+                "fingerprint": fingerprint,
+                "last_notified_at": now,
+                "title": "网易云音乐授权已失效",
+            })
+            return self._send_bark_notification(
+                "网易云音乐授权已失效",
+                "自动生成认证链接失败，请打开豆瓣书影音同步插件页面重新生成网易云二维码。",
+            )
+
+        patch = {
+            "netease_qr_key": qrcode.get("uniKey") or "",
+            "netease_qr_url": qrcode.get("qrCodeUrl") or "",
+        }
+        self._merge_update_config(patch)
+        auth_url = patch["netease_qr_url"]
+        self.save_data("netease_auth_notify_state", {
+            "fingerprint": fingerprint,
+            "last_notified_at": now,
+            "title": "网易云音乐授权已失效",
+            "qr_key": patch["netease_qr_key"],
+        })
+        content = (
+            "网易云开放平台 Token 已失效，点击通知打开认证链接并在 5 分钟内完成授权。"
+            "授权后请在插件页面轮询二维码状态，或稍后手动执行网易云测试接口。"
+        )
+        return self._send_bark_notification("网易云音乐需要重新授权", content, auth_url)
 
     def _send_weread_auth_notification(self, title: str, content: str) -> bool:
         """发送微信读书鉴权失败通知，并按凭据指纹做持久化冷却。"""
@@ -1618,7 +1687,7 @@ class TraktRatingsSync(_PluginBase):
                                                 "4. 豆瓣支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；失效时会通过 Bark 推送通知提醒更新\n"
                                                 "5. 微信读书填写 Skill API Key（wrk-...），不再支持旧版阅读页 cURL\n"
                                                 "6. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
-                                                "7. 网易云优先使用开放平台 AppID/PrivateKey + 官方扫码授权；生成二维码后用网易云 App 扫码，再轮询状态写回 Token\n"
+                                                "7. 网易云优先使用开放平台 AppID/PrivateKey + 官方扫码授权；Token 失效时会通过 Bark 推送短期认证链接\n"
                                                 "8. 网易云 Cookie 仅作为回退方式；会将最近播放专辑同步到豆瓣音乐「听过」\n"
                                                 "9. 小宇宙支持两种填写方式：直接填 x-jike-access-token，或粘贴包含该字段的完整小宇宙 cURL"
                                             ),

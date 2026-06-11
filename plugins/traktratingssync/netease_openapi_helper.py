@@ -33,10 +33,13 @@ class NeteaseOpenApiHelper:
         anonymous_access_token: 匿名登录 Access Token，用于二维码轮询。
         device_id: 开放平台设备 ID，需稳定且仅含字母数字。
         notify_fn: 鉴权异常时的通知回调。
+        auth_required_fn: 需要用户重新扫码认证时的回调。
     """
 
     _BASE_URL = "https://openapi.music.163.com"
+    _CLI_VERSION = "0.1.5"
     _REQUEST_JITTER_RANGE = (0.8, 2.0)
+    _TOKEN_REFRESH_MARGIN_SECONDS = 3600
 
     def __init__(
             self,
@@ -49,6 +52,7 @@ class NeteaseOpenApiHelper:
             anonymous_access_token: str = "",
             device_id: str = "",
             notify_fn: Optional[Callable[[str, str], None]] = None,
+            auth_required_fn: Optional[Callable[[], None]] = None,
     ):
         self._app_id = (app_id or "").strip()
         self._app_secret = (app_secret or "").strip()
@@ -59,11 +63,13 @@ class NeteaseOpenApiHelper:
         self._anonymous_access_token = (anonymous_access_token or "").strip()
         self._device_id = self.normalize_device_id(device_id, self._app_id)
         self._notify = notify_fn or (lambda title, body: None)
+        self._auth_required = auth_required_fn or (lambda: None)
         self._headers = {
-            "User-Agent": "MoviePilot TraktRatingsSync/3.14",
+            "User-Agent": f"ncm-cli/{self._CLI_VERSION} MoviePilot TraktRatingsSync/3.14",
             "Accept": "application/json",
         }
         self._last_error = ""
+        self._manifest: Dict[str, Any] = {}
 
     @staticmethod
     def normalize_device_id(device_id: str, app_id: str = "") -> str:
@@ -123,17 +129,28 @@ class NeteaseOpenApiHelper:
             return "网易云开放平台 PrivateKey 格式无效，请从开放平台重新复制完整私钥或粘贴带 BEGIN/END 的 PEM 内容"
         return "网易云开放平台 PrivateKey 无法导入，请确认复制的是 RSA 私钥而不是 PubKey 或 AppSecret"
 
+    @staticmethod
+    def _resolve_token_expires_at(expires_value: Any) -> int:
+        """将网易云返回的秒数或时间戳统一转换为本地过期时间戳。"""
+        expires_seconds = int(expires_value or 0)
+        if not expires_seconds:
+            return 0
+        now_ts = int(time.time())
+        if expires_seconds > now_ts:
+            return expires_seconds
+        return now_ts + expires_seconds
+
     def _device_json(self) -> str:
         device = {
-            "clientIp": "192.168.0.1",
-            "deviceType": "andrcar",
-            "os": "andrcar",
-            "appVer": "1.0.0",
-            "channel": "moviepilot",
-            "model": "MoviePilot",
+            "clientIp": "127.0.0.1",
+            "deviceType": "openapi",
+            "os": "ncmcli",
+            "appVer": self._CLI_VERSION,
+            "channel": "ncmcli",
+            "model": "MoviePilot_cli",
             "deviceId": self._device_id,
-            "brand": "MoviePilot",
-            "osVer": "1.0.0",
+            "brand": "ncmcli",
+            "osVer": "15.3",
         }
         return json.dumps(device, ensure_ascii=False, separators=(",", ":"))
 
@@ -159,20 +176,30 @@ class NeteaseOpenApiHelper:
         params["sign"] = sign
         return params
 
-    def _request(self, endpoint: str, biz_content: Dict[str, Any], access_token: str = "") -> Optional[Dict[str, Any]]:
+    def _request(
+            self,
+            endpoint: str,
+            biz_content: Dict[str, Any],
+            access_token: str = "",
+            method: str = "GET",
+    ) -> Optional[Dict[str, Any]]:
         params = self._build_params(biz_content=biz_content, access_token=access_token)
         if not params:
             return None
 
         time.sleep(self._random_delay(endpoint))
         url = f"{self._BASE_URL}{endpoint}"
-        response = RequestUtils(headers=self._headers, timeout=15).get_json(url=url, params=params)
+        request_utils = RequestUtils(headers=self._headers, timeout=15)
+        if method.upper() == "POST":
+            response = request_utils.post_json(url=url, data={}, params=params)
+        else:
+            response = request_utils.get_json(url=url, params=params)
         if not response:
             self._last_error = f"网易云开放平台请求失败: {endpoint}"
             logger.error(self._last_error)
             return None
 
-        if response.get("code") == 200:
+        if response.get("code") == 200 or (endpoint == "/openapi/v1/ncm/cli/manifest" and response.get("manifests")):
             self._last_error = ""
             return response
 
@@ -195,6 +222,7 @@ class NeteaseOpenApiHelper:
         response = self._request(
             endpoint="/openapi/music/basic/oauth2/login/anonymous",
             biz_content={"clientId": self._app_id},
+            method="POST",
         )
         data = (response or {}).get("data") or {}
         token = (data.get("accessToken") or "").strip()
@@ -217,6 +245,7 @@ class NeteaseOpenApiHelper:
             endpoint="/openapi/music/basic/user/oauth2/qrcodekey/get/v2",
             biz_content={"type": 2, "expiredKey": "300"},
             access_token=anonymous_token,
+            method="GET",
         )
         data = (response or {}).get("data") or {}
         if not data.get("qrCodeUrl") or not data.get("uniKey"):
@@ -241,39 +270,168 @@ class NeteaseOpenApiHelper:
             endpoint="/openapi/music/basic/oauth2/device/login/qrcode/get",
             biz_content={"key": uni_key, "clientId": self._app_id},
             access_token=anonymous_token,
+            method="GET",
         )
         data = (response or {}).get("data") or {}
         token_data = data.get("accessToken") or {}
         if data.get("status") == 803 and token_data.get("accessToken") not in ("", "null", None):
             self._access_token = token_data.get("accessToken") or ""
             self._refresh_token = token_data.get("refreshToken") or ""
-            expires_in = int(token_data.get("expireTime") or 0)
-            self._token_expires_at = int(time.time()) + expires_in if expires_in else 0
+            self._token_expires_at = self._resolve_token_expires_at(token_data.get("expireTime"))
         return data
 
-    def get_recent_albums(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """获取最近播放专辑列表，并转换为插件统一专辑结构。"""
+    def refresh_access_token(self) -> bool:
+        """使用 Refresh Token 刷新网易云开放平台 Access Token。"""
+        if not self._refresh_token:
+            self._last_error = "网易云开放平台缺少 Refresh Token，请重新扫码登录"
+            logger.warning(self._last_error)
+            return False
+        if not self._app_secret:
+            self._last_error = "网易云开放平台缺少 AppSecret，无法刷新 Access Token"
+            logger.warning(self._last_error)
+            return False
+
+        response = self._request(
+            endpoint="/openapi/music/basic/user/oauth2/token/refresh/v2",
+            biz_content={
+                "clientId": self._app_id,
+                "clientSecret": self._app_secret,
+                "refreshToken": self._refresh_token,
+            },
+            access_token=self._access_token,
+            method="POST",
+        )
+        data = (response or {}).get("data") or {}
+        access_token = (data.get("accessToken") or "").strip()
+        refresh_token = (data.get("refreshToken") or "").strip()
+        if (response or {}).get("code") != 200 or not access_token:
+            code = (response or {}).get("code")
+            if code in (1407, 1408):
+                self._last_error = "网易云开放平台授权已失效，请重新扫码登录"
+            else:
+                self._last_error = (response or {}).get("message") or "网易云开放平台刷新 Access Token 失败"
+            logger.warning("网易云开放平台刷新 Access Token 失败: code=%s, message=%s", code, self._last_error)
+            return False
+
+        self._access_token = access_token
+        self._refresh_token = refresh_token or self._refresh_token
+        self._token_expires_at = self._resolve_token_expires_at(
+            data.get("expiresTime") or data.get("expireIn") or data.get("expireTime")
+        )
+        self._last_error = ""
+        logger.info("网易云开放平台 Access Token 刷新成功，expires_at=%s", self._token_expires_at)
+        return True
+
+    def _ensure_access_token(self) -> bool:
+        """在调用实名接口前确保 Access Token 存在且未临近过期。"""
         if not self._access_token:
+            if self.refresh_access_token():
+                return True
             self._notify(
                 "网易云开放平台未登录",
                 "请先通过插件的网易云官方二维码登录接口完成扫码授权。",
             )
-            return []
-        if self._token_expires_at and self._token_expires_at <= int(time.time()):
+            return False
+
+        now_ts = int(time.time())
+        if self._token_expires_at and self._token_expires_at <= now_ts + self._TOKEN_REFRESH_MARGIN_SECONDS:
+            if self.refresh_access_token():
+                return True
+            if self._token_expires_at > now_ts:
+                logger.warning("网易云开放平台 Access Token 预刷新失败，将继续使用尚未过期的现有 Token")
+                return True
             self._notify(
                 "网易云开放平台 Token 已过期",
-                "当前版本尚未配置 refresh 所需的 clientSecret，请重新生成二维码扫码登录。",
+                "Refresh Token 无法续期，请重新生成二维码扫码登录。",
             )
-            return []
+            self._auth_required()
+            return False
+
+        return True
+
+    def _request_with_access_token(
+            self,
+            endpoint: str,
+            biz_content: Dict[str, Any],
+            method: str = "GET",
+    ) -> Optional[Dict[str, Any]]:
+        """调用实名接口，遇到 Token 过期码时刷新后重试一次。"""
+        if not self._ensure_access_token():
+            return None
 
         response = self._request(
+            endpoint=endpoint,
+            biz_content=biz_content,
+            access_token=self._access_token,
+            method=method,
+        )
+        if (response or {}).get("code") != 1406:
+            return response
+
+        logger.warning("网易云开放平台接口提示 Access Token 过期，尝试使用 Refresh Token 续期")
+        if not self.refresh_access_token():
+            self._notify(
+                "网易云开放平台 Token 已过期",
+                "Refresh Token 无法续期，请重新生成二维码扫码登录。",
+            )
+            self._auth_required()
+            return response
+
+        return self._request(
+            endpoint=endpoint,
+            biz_content=biz_content,
+            access_token=self._access_token,
+            method=method,
+        )
+
+    def get_recent_albums(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取最近播放专辑列表，并转换为插件统一专辑结构。"""
+        response = self._request_with_access_token(
             endpoint="/openapi/music/basic/album/play/record/list",
             biz_content={"limit": limit},
-            access_token=self._access_token,
+            method="GET",
         )
         data = (response or {}).get("data") or {}
         records = data.get("records") or []
         return self._format_album_records(records=records, limit=limit)
+
+    def get_favorite_songs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取红心歌单歌曲列表，并转换为插件可展示的歌曲结构。"""
+        playlist = self._request_with_access_token(
+            endpoint="/openapi/music/basic/playlist/star/get/v2",
+            biz_content={"trialScene": "cli"},
+            method="POST",
+        )
+        playlist_id = (((playlist or {}).get("data") or {}).get("id") or "").strip()
+        if not playlist_id:
+            self._last_error = (playlist or {}).get("message") or "网易云红心歌单接口未返回 playlistId"
+            logger.warning(self._last_error)
+            return []
+
+        response = self._request_with_access_token(
+            endpoint="/openapi/music/basic/playlist/song/list/get/v3",
+            biz_content={
+                "playlistId": playlist_id,
+                "limit": min(max(int(limit or 100), 1), 500),
+                "offset": 0,
+                "qualityFlag": False,
+                "trialScene": "cli",
+            },
+            method="GET",
+        )
+        data = (response or {}).get("data") or []
+        songs = data if isinstance(data, list) else data.get("list") or data.get("songs") or []
+        return self._format_song_records(records=songs, limit=limit)
+
+    def load_manifest(self) -> Dict[str, Any]:
+        """按官方 CLI 协议加载动态命令清单，用于诊断开放平台能力。"""
+        response = self._request_with_access_token(
+            endpoint="/openapi/v1/ncm/cli/manifest",
+            biz_content={"cliVersion": self._CLI_VERSION, "cachedVersion": "{}"},
+            method="POST",
+        )
+        self._manifest = (response or {}).get("manifests") or {}
+        return self._manifest
 
     def get_token_state(self) -> Dict[str, Any]:
         """返回当前网易云开放平台 Token 状态摘要，不包含敏感值。"""
@@ -284,6 +442,7 @@ class NeteaseOpenApiHelper:
             "has_app_secret": bool(self._app_secret),
             "token_expires_at": self._token_expires_at,
             "device_id": self._device_id,
+            "manifest_count": len(self._manifest),
         }
 
     def get_last_error(self) -> str:
@@ -331,3 +490,26 @@ class NeteaseOpenApiHelper:
 
         albums = sorted(album_map.values(), key=lambda x: x.get("play_time", 0), reverse=True)
         return albums[:limit]
+
+    @staticmethod
+    def _format_song_records(records: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        songs: List[Dict[str, Any]] = []
+        for item in records[:limit]:
+            artists = item.get("artists") or item.get("fullArtists") or []
+            album = item.get("album") or {}
+            ext_map = item.get("extMap") or {}
+            songs.append({
+                "song": item.get("name") or "",
+                "artists": [artist.get("name", "") for artist in artists if artist.get("name")],
+                "album": album.get("name") or "",
+                "netease_song_id": item.get("id") or "",
+                "netease_original_song_id": item.get("originalId") or "",
+                "netease_album_id": album.get("id") or "",
+                "netease_original_album_id": album.get("originalId") or "",
+                "duration": item.get("duration") or 0,
+                "liked": bool(item.get("liked")),
+                "visible": bool(item.get("visible")),
+                "cover_img_url": item.get("coverImgUrl") or "",
+                "add_time": int(ext_map.get("addTime") or 0),
+            })
+        return songs
