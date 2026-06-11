@@ -32,7 +32,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.17"
+    plugin_version = "3.14.18"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -70,6 +70,8 @@ class TraktRatingsSync(_PluginBase):
     _bark_webhook_url: str = ""
     _weread_auth_notify_cooldown: int = 6 * 60 * 60
     _netease_auth_notify_cooldown: int = 10 * 60
+    _netease_auth_wait_seconds: int = 5 * 60
+    _netease_auth_poll_interval: int = 5
 
     # helper 实例（延迟初始化）
     _douban_helper: Optional[DoubanHelper] = None
@@ -1082,9 +1084,37 @@ class TraktRatingsSync(_PluginBase):
         })
         content = (
             "网易云开放平台 Token 已失效，点击通知打开认证链接并在 5 分钟内完成授权。"
-            "授权后请在插件页面轮询二维码状态，或稍后手动执行网易云测试接口。"
+            "插件会在本次任务中自动轮询授权结果。"
         )
-        return self._send_bark_notification("网易云音乐需要重新授权", content, auth_url)
+        sent = self._send_bark_notification("网易云音乐需要重新授权", content, auth_url)
+        if not sent:
+            return False
+        return self._wait_netease_auth_completion(helper, patch["netease_qr_key"]) or sent
+
+    def _wait_netease_auth_completion(self, helper: NeteaseOpenApiHelper, qr_key: str) -> bool:
+        """等待网易云扫码授权完成，并把新 Token 写回插件配置。"""
+        if not qr_key:
+            return False
+        deadline = time.time() + self._netease_auth_wait_seconds
+        while time.time() < deadline:
+            time.sleep(self._netease_auth_poll_interval)
+            status_data = helper.poll_login_qrcode(qr_key)
+            self._persist_netease_openapi_state(helper)
+            if not status_data:
+                continue
+            status_code = status_data.get("status")
+            status_message = status_data.get("msg") or ""
+            if status_code == 803:
+                self._merge_update_config({"netease_qr_key": "", "netease_qr_url": ""})
+                self._send_bark_notification("网易云音乐授权成功", "网易云开放平台授权已完成，Token 已写回插件配置。")
+                logger.info("网易云音乐扫码授权成功，新 Token 已写回插件配置")
+                return True
+            if status_code == 800:
+                self._merge_update_config({"netease_qr_key": "", "netease_qr_url": ""})
+                logger.warning("网易云音乐认证二维码已过期: %s", status_message or "二维码不存在或过期")
+                return False
+        logger.warning("网易云音乐扫码授权等待超时，请稍后重新触发同步生成新的认证链接")
+        return False
 
     def _send_weread_auth_notification(self, title: str, content: str) -> bool:
         """发送微信读书鉴权失败通知，并按凭据指纹做持久化冷却。"""
