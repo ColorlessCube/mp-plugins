@@ -7,7 +7,7 @@
   - TraktHelper      → Trakt API 封装（评分拉取、播放进度、OAuth 授权）
   - DoubanHelper     → 豆瓣 Cookie 操作（标记看过/在看、写入评分）
   - WereadHelper     → 微信读书 Skill API（书架、阅读进度）
-  - NeteaseHelper    → 网易云音乐 Web API（最近播放记录，按专辑聚合）
+  - NeteaseOpenApiHelper → 网易云音乐开放平台 API（最近播放记录，按专辑聚合）
   - XiaoyuzhouHelper → 小宇宙 FM API（播客听取历史）
 """
 import hashlib
@@ -21,7 +21,6 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
 from .douban_helper import DoubanHelper
-from .netease_helper import NeteaseHelper
 from .netease_openapi_helper import NeteaseOpenApiHelper
 from .trakt_helper import TraktHelper
 from .weread_helper import WereadHelper
@@ -32,7 +31,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.18"
+    plugin_version = "3.14.20"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -44,10 +43,10 @@ class TraktRatingsSync(_PluginBase):
     _trakt_client_id: str = ""
     _trakt_client_secret: str = ""
     _trakt_access_token: str = ""
+    _trakt_manual_mappings: str = ""
     _douban_cookie: str = ""
     _weread_api_key: str = ""
     _weread_limit: int = 20
-    _netease_cookie: str = ""
     _netease_app_id: str = ""
     _netease_app_secret: str = ""
     _netease_private_key: str = ""
@@ -77,7 +76,6 @@ class TraktRatingsSync(_PluginBase):
     _douban_helper: Optional[DoubanHelper] = None
     _trakt_helper: Optional[TraktHelper] = None
     _weread_helper: Optional[WereadHelper] = None
-    _netease_helper: Optional[NeteaseHelper] = None
     _netease_openapi_helper: Optional[NeteaseOpenApiHelper] = None
     _xiaoyuzhou_helper: Optional[XiaoyuzhouHelper] = None
 
@@ -92,10 +90,10 @@ class TraktRatingsSync(_PluginBase):
         self._trakt_client_id = (config.get("trakt_client_id") or "").strip()
         self._trakt_client_secret = (config.get("trakt_client_secret") or "").strip()
         self._trakt_access_token = (config.get("trakt_access_token") or "").strip()
+        self._trakt_manual_mappings = (config.get("trakt_manual_mappings") or "").strip()
         self._douban_cookie = (config.get("douban_cookie") or "").strip()
         self._weread_api_key = (config.get("weread_api_key") or "").strip()
         self._weread_limit = int(config.get("weread_limit") or 20)
-        self._netease_cookie = (config.get("netease_cookie") or "").strip()
         self._netease_app_id = (config.get("netease_app_id") or "").strip()
         self._netease_app_secret = (config.get("netease_app_secret") or "").strip()
         self._netease_private_key = (config.get("netease_private_key") or "").strip()
@@ -124,7 +122,6 @@ class TraktRatingsSync(_PluginBase):
         self._douban_helper = None
         self._trakt_helper = None
         self._weread_helper = None
-        self._netease_helper = None
         self._netease_openapi_helper = None
         self._xiaoyuzhou_helper = None
 
@@ -194,6 +191,7 @@ class TraktRatingsSync(_PluginBase):
             get_data_fn=self.get_data,
             update_config_fn=self._merge_update_config,
             send_notification_fn=self._send_bark_notification,
+            manual_mappings=self._parse_trakt_manual_mappings(),
         )
 
         # 同步 Trakt 评分 → 豆瓣看过
@@ -272,8 +270,18 @@ class TraktRatingsSync(_PluginBase):
             logger.debug("未获取到 Trakt Access Token，跳过未看完列表同步")
             return
 
+        episodes, recent_shows = self._fetch_trakt_progress_sources(access_token)
+        if self._trakt_helper.has_oauth_unauthorized():
+            logger.warning("Trakt OAuth Token 已失效，尝试刷新或重新授权后重试剧集同步")
+            access_token = self._trakt_helper.get_access_token(force_reauthorize=True)
+            if not access_token:
+                logger.warning("Trakt 重新授权未完成，跳过本次剧集同步")
+                return
+            self._trakt_access_token = access_token
+            self._trakt_helper.reset_oauth_unauthorized()
+            episodes, recent_shows = self._fetch_trakt_progress_sources(access_token)
+
         # 豆瓣无法将电影设置为在看，仅同步剧集
-        episodes = self._trakt_helper.fetch_playback("/sync/playback/episodes", access_token)
         logger.info("获取到 %d 条 Trakt 剧集播放进度", len(episodes))
 
         watching: Dict[str, Any] = self.get_data("watching") or {}
@@ -295,17 +303,7 @@ class TraktRatingsSync(_PluginBase):
             except Exception as ex:
                 logger.error("同步播放进度失败: %s", ex, exc_info=True)
 
-        history_items = self._trakt_helper.fetch_history(
-            media_type="shows",
-            access_token=access_token,
-            limit=self._trakt_history_limit,
-        )
-        recent_shows = self._extract_recent_history_shows(history_items)
-        logger.info(
-            "获取到 %d 条 Trakt 剧集观看历史，提取 %d 个最近在看剧集",
-            len(history_items),
-            len(recent_shows),
-        )
+        logger.info("获取到 %d 个最近在看剧集", len(recent_shows))
 
         for history_item in recent_shows:
             show = history_item.get("show")
@@ -331,6 +329,26 @@ class TraktRatingsSync(_PluginBase):
 
         self.save_data("watching", watching)
         logger.info("Trakt 剧集在看同步完成: 成功 %d 条", success_count)
+
+    def _fetch_trakt_progress_sources(
+        self,
+        access_token: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """拉取 Trakt 剧集播放进度和观看历史来源。"""
+        self._trakt_helper.reset_oauth_unauthorized()
+        episodes = self._trakt_helper.fetch_playback("/sync/playback/episodes", access_token)
+        history_items = self._trakt_helper.fetch_history(
+            media_type="shows",
+            access_token=access_token,
+            limit=self._trakt_history_limit,
+        )
+        recent_shows = self._extract_recent_history_shows(history_items)
+        logger.info(
+            "获取到 %d 条 Trakt 剧集观看历史，提取 %d 个最近在看剧集",
+            len(history_items),
+            len(recent_shows),
+        )
+        return episodes, recent_shows
 
     def _extract_recent_history_shows(self, history_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """从 Trakt 剧集观看历史中按剧集去重，并过滤过旧记录。"""
@@ -358,6 +376,28 @@ class TraktRatingsSync(_PluginBase):
             seen.add(show_key)
             result.append(item)
         return result
+
+    def _parse_trakt_manual_mappings(self) -> Dict[str, str]:
+        """解析 Trakt 条目到豆瓣 subject_id 的手动映射配置。"""
+        mappings: Dict[str, str] = {}
+        for line in (self._trakt_manual_mappings or "").splitlines():
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            if "=" in text:
+                key, value = text.split("=", 1)
+            elif ":" in text:
+                key, value = text.rsplit(":", 1)
+            else:
+                logger.warning("Trakt 手动映射格式无效，已跳过: %s", text)
+                continue
+            key = key.strip().lower()
+            value = value.strip()
+            if key and value.isdigit():
+                mappings[key] = value
+            else:
+                logger.warning("Trakt 手动映射内容无效，已跳过: %s", text)
+        return mappings
 
     def _sync_weread(self) -> None:
         """同步微信读书最近阅读记录到豆瓣「在读/读过」，并持久化打印日志摘要。
@@ -538,23 +578,11 @@ class TraktRatingsSync(_PluginBase):
         4. 结果持久化到插件数据 "netease_albums"
         """
         if not self._has_netease_source():
-            logger.debug("未配置网易云音乐官方授权或 Cookie，跳过同步")
+            logger.debug("未配置网易云音乐开放平台 AppID/PrivateKey，跳过同步")
             return
 
-        if self._netease_app_id and self._netease_private_key:
-            netease_helper = self._get_netease_openapi_helper()
-            logger.info("开始同步网易云音乐最近听歌记录到豆瓣（官方开放平台）...")
-        elif self._netease_cookie:
-            if not self._netease_helper:
-                self._netease_helper = NeteaseHelper(
-                    cookies=self._netease_cookie,
-                    notify_fn=self._send_bark_notification,
-                )
-            netease_helper = self._netease_helper
-            logger.info("开始同步网易云音乐最近听歌记录到豆瓣（Cookie 回退）...")
-        else:
-            logger.info("网易云音乐已配置官方 AppID/PrivateKey，但尚未完成扫码登录，跳过同步")
-            return
+        netease_helper = self._get_netease_openapi_helper()
+        logger.info("开始同步网易云音乐最近听歌记录到豆瓣（官方开放平台）...")
 
         if not netease_helper:
             logger.warning("网易云音乐 Helper 初始化失败，跳过同步")
@@ -565,8 +593,7 @@ class TraktRatingsSync(_PluginBase):
             logger.info("网易云音乐未获取到最近专辑记录（凭据可能失效或暂无听歌记录）")
             return
 
-        if isinstance(netease_helper, NeteaseOpenApiHelper):
-            self._persist_netease_openapi_state(netease_helper)
+        self._persist_netease_openapi_state(netease_helper)
 
         # 已同步缓存（key = 豆瓣 subject_id，避免重复提交）
         synced: Dict[str, Any] = self.get_data("netease_albums") or {}
@@ -860,10 +887,7 @@ class TraktRatingsSync(_PluginBase):
 
     def _has_netease_source(self) -> bool:
         """判断网易云音乐是否存在可用数据源配置。"""
-        return bool(
-            self._netease_cookie
-            or (self._netease_app_id and self._netease_private_key)
-        )
+        return bool(self._netease_app_id and self._netease_private_key)
 
     def _get_netease_openapi_helper(self) -> Optional[NeteaseOpenApiHelper]:
         """创建或复用网易云开放平台 Helper。"""
@@ -907,10 +931,10 @@ class TraktRatingsSync(_PluginBase):
             "trakt_client_id": self._trakt_client_id,
             "trakt_client_secret": self._trakt_client_secret,
             "trakt_access_token": self._trakt_access_token,
+            "trakt_manual_mappings": self._trakt_manual_mappings,
             "douban_cookie": self._douban_cookie,
             "weread_api_key": self._weread_api_key,
             "weread_limit": self._weread_limit,
-            "netease_cookie": self._netease_cookie,
             "netease_app_id": self._netease_app_id,
             "netease_app_secret": self._netease_app_secret,
             "netease_private_key": self._netease_private_key,
@@ -933,6 +957,8 @@ class TraktRatingsSync(_PluginBase):
             "bark_webhook_url": self._bark_webhook_url,
         }
         current.update(patch)
+        self._trakt_access_token = current.get("trakt_access_token") or ""
+        self._trakt_manual_mappings = current.get("trakt_manual_mappings") or ""
         self._netease_access_token = current.get("netease_access_token") or ""
         self._netease_refresh_token = current.get("netease_refresh_token") or ""
         self._netease_token_expires_at = int(current.get("netease_token_expires_at") or 0)
@@ -1326,6 +1352,22 @@ class TraktRatingsSync(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "trakt_manual_mappings",
+                                            "label": "Trakt → 豆瓣手动映射（可选）",
+                                            "placeholder": "每行一条，例如：imdb:tt1234567=12345678 或 movie:294048=12345678",
+                                            "rows": 2,
+                                            "auto-grow": True,
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -1568,22 +1610,7 @@ class TraktRatingsSync(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "netease_qr_url",
-                                            "label": "网易云登录二维码 URL（自动生成）",
-                                            "readonly": True,
-                                            "placeholder": "调用 /api/v1/plugin/traktratingssync/netease/qrcode 生成",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -1639,21 +1666,7 @@ class TraktRatingsSync(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 10},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "netease_cookie",
-                                            "label": "网易云音乐 Cookie（回退方式，可选）",
-                                            "placeholder": "官方授权不可用时可临时填 Cookie 或完整网易云 cURL",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 2},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -1714,12 +1727,13 @@ class TraktRatingsSync(_PluginBase):
                                                 "1. 在 https://trakt.tv/oauth/applications 创建应用获取 Client ID\n"
                                                 "2. 填写 Client Secret 启用自动授权（首次同步时会通过 Bark 发送授权链接，系统阻塞等待10分钟）\n"
                                                 "3. 授权成功后，Access Token 会自动回填到配置中\n"
-                                                "4. 豆瓣支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；失效时会通过 Bark 推送通知提醒更新\n"
-                                                "5. 微信读书填写 Skill API Key（wrk-...），不再支持旧版阅读页 cURL\n"
-                                                "6. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
-                                                "7. 网易云优先使用开放平台 AppID/PrivateKey + 官方扫码授权；Token 失效时会通过 Bark 推送短期认证链接\n"
-                                                "8. 网易云 Cookie 仅作为回退方式；会将最近播放专辑同步到豆瓣音乐「听过」\n"
-                                                "9. 小宇宙支持两种填写方式：直接填 x-jike-access-token，或粘贴包含该字段的完整小宇宙 cURL"
+                                                "4. Trakt 自动匹配失败的条目可在手动映射中填写 imdb/tmdb/trakt 与豆瓣 subject_id\n"
+                                                "5. 豆瓣支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；失效时会通过 Bark 推送通知提醒更新\n"
+                                                "6. 微信读书填写 Skill API Key（wrk-...），不再支持旧版阅读页 cURL\n"
+                                                "7. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
+                                                "8. 网易云优先使用开放平台 AppID/PrivateKey + 官方扫码授权；Token 失效时会通过 Bark 推送短期认证链接\n"
+                                                "9. 网易云会将最近播放专辑同步到豆瓣音乐「听过」\n"
+                                                "10. 小宇宙支持两种填写方式：直接填 x-jike-access-token，或粘贴包含该字段的完整小宇宙 cURL"
                                             ),
                                         },
                                     }
@@ -1735,10 +1749,10 @@ class TraktRatingsSync(_PluginBase):
             "trakt_client_id": "",
             "trakt_client_secret": "",
             "trakt_access_token": "",
+            "trakt_manual_mappings": "",
             "douban_cookie": "",
             "weread_api_key": "",
             "weread_limit": 20,
-            "netease_cookie": "",
             "netease_app_id": "",
             "netease_app_secret": "",
             "netease_private_key": "",

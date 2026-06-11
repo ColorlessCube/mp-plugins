@@ -30,6 +30,7 @@ class TraktHelper:
         get_data_fn: 读取持久化数据回调，签名 ``(key: str) -> Any``
         update_config_fn: 更新插件配置回调，签名 ``(config: dict) -> None``
         send_notification_fn: 发送通知回调（可选），签名 ``(title: str, body: str) -> None``
+        manual_mappings: Trakt 条目到豆瓣 subject_id 的手动映射
     """
 
     # 协议固定常量，保持类级
@@ -47,6 +48,7 @@ class TraktHelper:
         get_data_fn: Callable[[str], Any],
         update_config_fn: Callable[[Dict[str, Any]], None],
         send_notification_fn: Optional[Callable[[str, str], None]] = None,
+        manual_mappings: Optional[Dict[str, str]] = None,
     ):
         self._client_id = client_id
         self._client_secret = client_secret
@@ -56,6 +58,12 @@ class TraktHelper:
         self._get_data = get_data_fn
         self._update_config = update_config_fn
         self._notify = send_notification_fn or (lambda title, body: None)
+        self._manual_mappings = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in (manual_mappings or {}).items()
+            if str(key).strip() and str(value).strip()
+        }
+        self._last_oauth_unauthorized = False
 
         # 实例级基础请求头（含 api-key，避免每处重复构建）
         self._headers = {
@@ -95,6 +103,14 @@ class TraktHelper:
         if trakt_rating <= 0:
             return 1
         return int(math.ceil(trakt_rating / 2))
+
+    def reset_oauth_unauthorized(self) -> None:
+        """重置最近一次 OAuth 请求 401 标记。"""
+        self._last_oauth_unauthorized = False
+
+    def has_oauth_unauthorized(self) -> bool:
+        """判断最近一次 OAuth 接口请求是否返回 401。"""
+        return self._last_oauth_unauthorized
 
     # ------------------------------------------------------------------
     # 公开评分接口（仅需 client_id）
@@ -171,6 +187,7 @@ class TraktHelper:
                 return []
             if resp.status_code != 200:
                 if resp.status_code == 401:
+                    self._last_oauth_unauthorized = True
                     logger.warning("Trakt Access Token 无效或已过期，无法拉取播放进度: %s", path)
                 else:
                     logger.warning("Trakt 播放进度返回异常 %s: %s %s",
@@ -208,6 +225,7 @@ class TraktHelper:
                 return []
             if resp.status_code != 200:
                 if resp.status_code == 401:
+                    self._last_oauth_unauthorized = True
                     logger.warning("Trakt Access Token 无效或已过期，无法拉取观看历史: %s", media_type)
                 else:
                     logger.warning(
@@ -281,6 +299,41 @@ class TraktHelper:
             logger.warning("匹配豆瓣失败 %s (%s): %s", title, year, e)
             return {}
 
+    def _lookup_manual_douban_id(
+        self,
+        media: Dict[str, Any],
+        media_type: MediaType,
+        sync_key: str,
+    ) -> Optional[str]:
+        """根据配置的手动映射查找豆瓣 subject_id。"""
+        if not self._manual_mappings:
+            return None
+        ids = media.get("ids") if isinstance(media.get("ids"), dict) else {}
+        title = media.get("title", "未知")
+        year = media.get("year")
+        trakt_id = ids.get("trakt") or media.get("trakt_id")
+        tmdb_id = ids.get("tmdb")
+        imdb_id = ids.get("imdb")
+        slug = ids.get("slug") or ""
+        media_name = "movie" if media_type == MediaType.MOVIE else "show"
+        candidates = [
+            sync_key,
+            f"{media_name}:{trakt_id}" if trakt_id else "",
+            f"trakt:{trakt_id}" if trakt_id else "",
+            f"tmdb:{tmdb_id}" if tmdb_id else "",
+            f"imdb:{imdb_id}" if imdb_id else "",
+            f"slug:{slug}" if slug else "",
+            f"{title} ({year})" if year else "",
+            f"{title} {year}" if year else "",
+            title,
+        ]
+        for candidate in candidates:
+            subject_id = self._manual_mappings.get(str(candidate).strip().lower())
+            if subject_id:
+                logger.info("命中 Trakt 手动映射: %s -> 豆瓣 %s", candidate, subject_id)
+                return subject_id
+        return None
+
     # ------------------------------------------------------------------
     # 评分同步（单条）
     # ------------------------------------------------------------------
@@ -335,10 +388,14 @@ class TraktHelper:
                 logger.debug("已同步过且评分未变，跳过: %s", title)
                 return True
 
-        douban_info = self._resolve_douban_info(
-            int(tmdb_id) if tmdb_id else None, imdb_id, title, year, media_type
-        )
-        if not douban_info:
+        subject_id = self._lookup_manual_douban_id(media, media_type, key)
+        douban_info: Dict[str, Any] = {}
+        if not subject_id:
+            douban_info = self._resolve_douban_info(
+                int(tmdb_id) if tmdb_id else None, imdb_id, title, year, media_type
+            )
+            subject_id = douban_info.get("id")
+        if not subject_id:
             logger.warning(
                 "Trakt 条目未匹配到豆瓣信息: %s (%s), tmdb=%s, imdb=%s, trakt=%s, rating=%s",
                 title, year, tmdb_id, imdb_id, trakt_id or slug, trakt_rating,
@@ -351,11 +408,6 @@ class TraktHelper:
                     "tmdb_id": tmdb_id, "imdb_id": imdb_id,
                     "media_type": media_type.value,
                 }
-            return False
-
-        subject_id = douban_info.get("id")
-        if not subject_id:
-            logger.warning("未找到豆瓣条目: %s (%s)", title, year)
             return False
 
         display_title = douban_info.get("alt_title", title)
@@ -439,16 +491,15 @@ class TraktHelper:
 
         key = f"{media_type.value}_{str(trakt_id) if trakt_id else slug or f'{title}_{year}'}"
 
-        douban_info = self._resolve_douban_info(
-            int(tmdb_id) if tmdb_id else None, imdb_id, title, year, media_type
-        )
-        if not douban_info:
-            logger.debug("匹配豆瓣未看完条目失败 %s (%s)", title, year)
-            return False
-
-        subject_id = douban_info.get("id")
+        subject_id = self._lookup_manual_douban_id(media, media_type, key)
+        douban_info: Dict[str, Any] = {}
         if not subject_id:
-            logger.debug("未找到豆瓣未看完条目: %s (%s)", title, year)
+            douban_info = self._resolve_douban_info(
+                int(tmdb_id) if tmdb_id else None, imdb_id, title, year, media_type
+            )
+            subject_id = douban_info.get("id")
+        if not subject_id:
+            logger.debug("匹配豆瓣未看完条目失败 %s (%s)", title, year)
             return False
 
         display_title = (
@@ -484,7 +535,7 @@ class TraktHelper:
     # OAuth 授权相关
     # ------------------------------------------------------------------
 
-    def get_access_token(self) -> Optional[str]:
+    def get_access_token(self, force_reauthorize: bool = False) -> Optional[str]:
         """获取有效的 Trakt Access Token。
 
         优先顺序：
@@ -495,11 +546,11 @@ class TraktHelper:
         Returns:
             有效的 access_token 字符串，无法获取时返回 None。
         """
-        if self._access_token:
+        if not force_reauthorize and self._access_token:
             logger.info("使用配置的 Access Token")
             return self._access_token
 
-        cached = self._get_cached_token()
+        cached = None if force_reauthorize else self._get_cached_token()
         if cached:
             logger.info("使用缓存的 Access Token")
             return cached
@@ -507,6 +558,10 @@ class TraktHelper:
         if not self._client_id or not self._client_secret:
             logger.debug("未配置 Trakt Client Secret，无法自动获取 Access Token")
             return None
+
+        if force_reauthorize and self._refresh_access_token():
+            logger.info("Trakt Refresh Token 续期成功")
+            return self._access_token
 
         logger.info("开始 Trakt 设备码授权流程...")
         return self._create_device_code_and_wait()
@@ -520,6 +575,57 @@ class TraktHelper:
         if access_token and expires_at > now_ts:
             return access_token
         return None
+
+    def _refresh_access_token(self) -> bool:
+        """使用已保存的 Refresh Token 续期 Trakt Access Token。"""
+        token_data = self._get_data("trakt_token") or {}
+        refresh_token = token_data.get("refresh_token")
+        if not refresh_token:
+            return False
+        url = f"{self._API_BASE}/oauth/token"
+        try:
+            resp = RequestUtils(timeout=10, headers=self._headers).post_res(
+                url=url,
+                json={
+                    "refresh_token": refresh_token,
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                    "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+                    "grant_type": "refresh_token",
+                },
+            )
+            if not resp or resp.status_code != 200:
+                logger.warning(
+                    "Trakt Refresh Token 续期失败: %s %s",
+                    getattr(resp, "status_code", None),
+                    getattr(resp, "text", "")[:200],
+                )
+                return False
+            data = resp.json()
+            return self._persist_token_response(data)
+        except Exception as e:
+            logger.warning("Trakt Refresh Token 续期异常: %s", e)
+            return False
+
+    def _persist_token_response(self, data: Dict[str, Any]) -> bool:
+        """持久化 Trakt OAuth token 响应。"""
+        access_token = data.get("access_token")
+        refresh_token = data.get("refresh_token")
+        expires_in = int(data.get("expires_in") or 0)
+        if not access_token or expires_in <= 0:
+            return False
+        expires_at = int(time.time()) + expires_in - 60
+        token_data = {
+            "access_token": access_token,
+            "expires_at": expires_at,
+        }
+        if refresh_token:
+            token_data["refresh_token"] = refresh_token
+        self._access_token = access_token
+        self._save_data("trakt_token", token_data)
+        self._update_config({"trakt_access_token": access_token})
+        logger.info("✅ Access Token 已保存（有效期约 %d 小时）", expires_in // 3600)
+        return True
 
     def _create_device_code_and_wait(self) -> Optional[str]:
         """创建 Trakt 设备码并阻塞等待用户授权（最多 10 分钟）。
@@ -622,19 +728,8 @@ class TraktHelper:
                     logger.debug("解析 Trakt Access Token 响应失败: %s", e)
                     return None
 
-                access_token = data.get("access_token")
-                expires_in = int(data.get("expires_in") or 0)
-
-                if access_token and expires_in > 0:
-                    expires_at = int(time.time()) + expires_in - 60
-                    self._save_data("trakt_token", {
-                        "access_token": access_token,
-                        "expires_at": expires_at,
-                    })
-                    # 回写到插件配置，方便用户下次直接使用
-                    self._update_config({"trakt_access_token": access_token})
-                    logger.info("✅ Access Token 已保存（有效期约 %d 小时）", expires_in // 3600)
-                    return access_token
+                if self._persist_token_response(data):
+                    return self._access_token
                 return None
 
             if resp.status_code == 400:
