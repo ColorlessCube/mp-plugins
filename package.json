@@ -2,7 +2,7 @@
   "TraktRatingsSync": {
     "name": "豆瓣书影音同步",
     "description": "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度/观看历史 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑。",
-    "version": "3.14.22",
+    "version": "3.14.23",
     "icon": "trakt.svg",
     "author": "ColorlessCube",
     "level": 1,
@@ -51,7 +51,8 @@
       "v3.14.19": "网易云音乐移除 Cookie 兜底同步配置，仅保留官方开放平台授权；配置页隐藏自动生成的二维码 URL",
       "v3.14.20": "Trakt OAuth 过期时自动尝试刷新或重新授权后重试剧集同步；新增 Trakt 到豆瓣 subject_id 手动映射兜底",
       "v3.14.21": "修复 Trakt OAuth 接口 401 响应被误判为无响应导致不会触发重新授权的问题",
-      "v3.14.22": "Trakt 条目有 TMDB ID 时仅使用 MoviePilot 媒体链映射豆瓣 ID，避免插件侧标题兜底造成误匹配"
+      "v3.14.22": "Trakt 条目有 TMDB ID 时仅使用 MoviePilot 媒体链映射豆瓣 ID，避免插件侧标题兜底造成误匹配",
+      "v3.14.23": "修复小宇宙播客豆瓣 rexxar 搜索 need_login：补齐 ck 参数和 Cookie，并在 need_login 时继续 HTML 兜底搜索"
     }
   },
   "ChineseSubtitle" : {

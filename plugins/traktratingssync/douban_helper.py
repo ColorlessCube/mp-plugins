@@ -140,6 +140,19 @@ class DoubanHelper:
         })
         return headers
 
+    def _build_rexxar_params(self, keyword: str, search_type: str) -> dict:
+        """构造豆瓣 rexxar 搜索参数。"""
+        params = {
+            "q": keyword,
+            "type": search_type,
+            "start": 0,
+            "count": 5,
+            "sort": "relevance",
+        }
+        if self.ck:
+            params["ck"] = self.ck
+        return params
+
     def _build_public_search_headers(self, referer: str) -> dict:
         """构造不携带登录 Cookie 的公开搜索请求头。"""
         headers = self._build_search_headers(referer)
@@ -327,24 +340,20 @@ class DoubanHelper:
         self._throttle_search()
 
         response = RequestUtils(
-            headers=self._build_rexxar_headers(referer=self._URL_SUBJECT_SEARCH),
+            headers=self._build_rexxar_headers(referer=self._URL_DOUBAN),
+            cookies=self.cookies,
             timeout=10,
         ).get_res(
             url=self._URL_REXXAR_SEARCH,
-            params={
-                "q": keyword,
-                "type": "podcast",
-                "start": 0,
-                "count": 5,
-                "sort": "relevance",
-            },
+            params=self._build_rexxar_params(keyword, "podcast"),
         )
         status_code = getattr(response, "status_code", None)
-        if status_code == 403 and self._is_need_login_response(response):
-            logger.warning("豆瓣播客搜索 [%s] 返回 need_login，跳过该候选词", keyword)
-            return None, None
-        self._mark_search_response(status_code, keyword)
-        if response and response.status_code == 200:
+        need_login = bool(response is not None and self._is_need_login_response(response))
+        if need_login:
+            logger.warning("豆瓣播客 rexxar 搜索 [%s] 返回 need_login，降级为 HTML 搜索", keyword)
+        elif status_code is not None:
+            self._mark_search_response(status_code, keyword)
+        if response is not None and response.status_code == 200 and not need_login:
             try:
                 data = response.json()
             except Exception as e:
@@ -354,7 +363,7 @@ class DoubanHelper:
             if subject_id:
                 return douban_title, subject_id
             logger.debug("豆瓣 rexxar 播客搜索未命中: %s", keyword)
-        elif not response or response.status_code != 200:
+        elif not need_login and (not response or response.status_code != 200):
             logger.error(
                 "搜索播客 [%s] 失败: HTTP %s%s",
                 keyword,
