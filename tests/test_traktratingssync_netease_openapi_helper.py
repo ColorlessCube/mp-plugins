@@ -71,3 +71,19 @@ def test_format_album_records_keeps_latest_play_order():
     assert albums[0]["artist"] == "Artist A"
     assert albums[0]["total_play_count"] == 2
     assert albums[0]["play_time"] == 300
+
+
+def test_invalid_private_key_returns_actionable_error_without_request():
+    """私钥格式非法时应在本地失败，并返回不含敏感值的配置提示。"""
+    helper_module = _load_helper_module()
+    helper = helper_module.NeteaseOpenApiHelper(
+        app_id="test-app-id",
+        private_key="abcde",
+        app_secret="test-secret",
+    )
+
+    params = helper._build_params(biz_content={"clientId": "test-app-id"})
+
+    assert params is None
+    assert "PrivateKey" in helper.get_last_error()
+    assert helper.get_token_state()["has_app_secret"] is True

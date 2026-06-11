@@ -49,6 +49,7 @@ class TraktRatingsSync(_PluginBase):
     _weread_limit: int = 20
     _netease_cookie: str = ""
     _netease_app_id: str = ""
+    _netease_app_secret: str = ""
     _netease_private_key: str = ""
     _netease_access_token: str = ""
     _netease_refresh_token: str = ""
@@ -93,6 +94,7 @@ class TraktRatingsSync(_PluginBase):
         self._weread_limit = int(config.get("weread_limit") or 20)
         self._netease_cookie = (config.get("netease_cookie") or "").strip()
         self._netease_app_id = (config.get("netease_app_id") or "").strip()
+        self._netease_app_secret = (config.get("netease_app_secret") or "").strip()
         self._netease_private_key = (config.get("netease_private_key") or "").strip()
         self._netease_access_token = (config.get("netease_access_token") or "").strip()
         self._netease_refresh_token = (config.get("netease_refresh_token") or "").strip()
@@ -868,6 +870,7 @@ class TraktRatingsSync(_PluginBase):
             self._netease_openapi_helper = NeteaseOpenApiHelper(
                 app_id=self._netease_app_id,
                 private_key=self._netease_private_key,
+                app_secret=self._netease_app_secret,
                 access_token=self._netease_access_token,
                 refresh_token=self._netease_refresh_token,
                 token_expires_at=self._netease_token_expires_at,
@@ -905,6 +908,7 @@ class TraktRatingsSync(_PluginBase):
             "weread_limit": self._weread_limit,
             "netease_cookie": self._netease_cookie,
             "netease_app_id": self._netease_app_id,
+            "netease_app_secret": self._netease_app_secret,
             "netease_private_key": self._netease_private_key,
             "netease_access_token": self._netease_access_token,
             "netease_refresh_token": self._netease_refresh_token,
@@ -932,6 +936,7 @@ class TraktRatingsSync(_PluginBase):
         self._netease_device_id = current.get("netease_device_id") or self._netease_device_id
         self._netease_qr_key = current.get("netease_qr_key") or ""
         self._netease_qr_url = current.get("netease_qr_url") or ""
+        self._netease_app_secret = current.get("netease_app_secret") or ""
         self.update_config(current)
 
     def _persist_xiaoyuzhou_cookie_if_updated(self) -> None:
@@ -1104,7 +1109,8 @@ class TraktRatingsSync(_PluginBase):
         qrcode = helper.get_login_qrcode()
         self._persist_netease_openapi_state(helper)
         if not qrcode:
-            return {"success": False, "message": "生成网易云登录二维码失败，请检查 AppID/PrivateKey 和开放平台权限"}
+            message = helper.get_last_error() or "生成网易云登录二维码失败，请检查 AppID/PrivateKey 和开放平台权限"
+            return {"success": False, "message": message}
 
         patch = {
             "netease_qr_key": qrcode.get("uniKey") or "",
@@ -1432,6 +1438,21 @@ class TraktRatingsSync(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "netease_app_secret",
+                                            "label": "网易云开放平台 AppSecret",
+                                            "type": "password",
+                                            "placeholder": "用于后续 Token 刷新",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 8},
                                 "content": [
                                     {
@@ -1620,6 +1641,7 @@ class TraktRatingsSync(_PluginBase):
             "weread_limit": 20,
             "netease_cookie": "",
             "netease_app_id": "",
+            "netease_app_secret": "",
             "netease_private_key": "",
             "netease_access_token": "",
             "netease_refresh_token": "",

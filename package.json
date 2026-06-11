@@ -2,7 +2,7 @@
   "TraktRatingsSync": {
     "name": "豆瓣书影音同步",
     "description": "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度/观看历史 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑。",
-    "version": "3.14.13",
+    "version": "3.14.14",
     "icon": "trakt.svg",
     "author": "ColorlessCube",
     "level": 1,

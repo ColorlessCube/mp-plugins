@@ -25,6 +25,7 @@ class NeteaseOpenApiHelper:
 
     Args:
         app_id: 网易云音乐开放平台 AppID。
+        app_secret: 网易云音乐开放平台 AppSecret，预留给 Token 刷新接口。
         private_key: 网易云音乐开放平台 RSA 私钥。
         access_token: 用户扫码授权后的 Access Token。
         refresh_token: 用户扫码授权后的 Refresh Token。
@@ -41,6 +42,7 @@ class NeteaseOpenApiHelper:
             self,
             app_id: str,
             private_key: str,
+            app_secret: str = "",
             access_token: str = "",
             refresh_token: str = "",
             token_expires_at: int = 0,
@@ -49,6 +51,7 @@ class NeteaseOpenApiHelper:
             notify_fn: Optional[Callable[[str, str], None]] = None,
     ):
         self._app_id = (app_id or "").strip()
+        self._app_secret = (app_secret or "").strip()
         self._private_key = (private_key or "").strip()
         self._access_token = (access_token or "").strip()
         self._refresh_token = (refresh_token or "").strip()
@@ -60,6 +63,7 @@ class NeteaseOpenApiHelper:
             "User-Agent": "MoviePilot TraktRatingsSync/3.14",
             "Accept": "application/json",
         }
+        self._last_error = ""
 
     @staticmethod
     def normalize_device_id(device_id: str, app_id: str = "") -> str:
@@ -96,17 +100,28 @@ class NeteaseOpenApiHelper:
 
     def _sign(self, params: Dict[str, Any]) -> Optional[str]:
         if not self._private_key:
-            logger.error("网易云开放平台未配置 PrivateKey")
+            self._last_error = "网易云开放平台未配置 PrivateKey"
+            logger.error(self._last_error)
             return None
         try:
             content = self._format_parameters(params)
             private_key = RSA.import_key(self._format_private_key(self._private_key))
             digest = SHA256.new(content.encode("utf-8"))
             signature = pkcs1_15.new(private_key).sign(digest)
+            self._last_error = ""
             return base64.b64encode(signature).decode("utf-8")
         except Exception as e:
-            logger.error("网易云开放平台签名失败: %s", e)
+            self._last_error = self._format_private_key_error(e)
+            logger.error("网易云开放平台签名失败: %s", self._last_error)
             return None
+
+    @staticmethod
+    def _format_private_key_error(error: Exception) -> str:
+        """将私钥导入异常转换为不包含敏感值的用户提示。"""
+        error_text = str(error)
+        if "base64" in error_text.lower():
+            return "网易云开放平台 PrivateKey 格式无效，请从开放平台重新复制完整私钥或粘贴带 BEGIN/END 的 PEM 内容"
+        return "网易云开放平台 PrivateKey 无法导入，请确认复制的是 RSA 私钥而不是 PubKey 或 AppSecret"
 
     def _device_json(self) -> str:
         device = {
@@ -124,7 +139,8 @@ class NeteaseOpenApiHelper:
 
     def _build_params(self, biz_content: Dict[str, Any], access_token: str = "") -> Optional[Dict[str, Any]]:
         if not self._app_id:
-            logger.error("网易云开放平台未配置 AppID")
+            self._last_error = "网易云开放平台未配置 AppID"
+            logger.error(self._last_error)
             return None
 
         params: Dict[str, Any] = {
@@ -152,12 +168,15 @@ class NeteaseOpenApiHelper:
         url = f"{self._BASE_URL}{endpoint}"
         response = RequestUtils(headers=self._headers, timeout=15).get_json(url=url, params=params)
         if not response:
-            logger.error("网易云开放平台请求失败: endpoint=%s", endpoint)
+            self._last_error = f"网易云开放平台请求失败: {endpoint}"
+            logger.error(self._last_error)
             return None
 
         if response.get("code") == 200:
+            self._last_error = ""
             return response
 
+        self._last_error = response.get("message", "") or f"网易云开放平台返回异常: {response.get('code')}"
         logger.warning(
             "网易云开放平台返回异常: endpoint=%s, code=%s, message=%s",
             endpoint, response.get("code"), response.get("message", ""),
@@ -262,9 +281,14 @@ class NeteaseOpenApiHelper:
             "has_access_token": bool(self._access_token),
             "has_refresh_token": bool(self._refresh_token),
             "has_anonymous_access_token": bool(self._anonymous_access_token),
+            "has_app_secret": bool(self._app_secret),
             "token_expires_at": self._token_expires_at,
             "device_id": self._device_id,
         }
+
+    def get_last_error(self) -> str:
+        """返回最近一次开放平台失败原因，不包含敏感值。"""
+        return self._last_error
 
     def get_token_values(self) -> Dict[str, Any]:
         """返回需要持久化的网易云开放平台 Token 值。"""
