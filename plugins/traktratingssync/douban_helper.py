@@ -11,7 +11,6 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
-import requests
 from bs4 import BeautifulSoup
 
 from app.core.config import settings
@@ -99,17 +98,26 @@ class DoubanHelper:
         self.headers["Cookie"] = ";".join(f"{k}={v}" for k, v in self.cookies.items())
         try:
             self._sleep_before_request("刷新 ck")
-            response = requests.get(self._URL_DOUBAN, headers=self.headers, timeout=10)
+            response = RequestUtils(headers=self.headers, cookies=self.cookies, timeout=10).get_res(
+                url=self._URL_DOUBAN
+            )
         except Exception as e:
             logger.warning("刷新豆瓣 ck 请求失败: %s；%s", e, self._auth_context())
             self.cookies["ck"] = ""
             return
-        ck_str = response.headers.get("Set-Cookie", "")
-        logger.debug("豆瓣 Set-Cookie: %s", ck_str)
-        if not ck_str:
+        if response is None:
+            logger.warning("刷新豆瓣 ck 未返回响应；%s", self._auth_context())
             self.cookies["ck"] = ""
             return
-        ck = ck_str.split(";")[0].split("=")[1].strip()
+        ck = getattr(response, "cookies", {}).get("ck") if getattr(response, "cookies", None) else ""
+        ck_str = response.headers.get("Set-Cookie", "")
+        logger.debug("豆瓣 Set-Cookie: %s", ck_str)
+        if not ck:
+            match = re.search(r"(?:^|,\s*)ck=([^;]+)", ck_str or "")
+            ck = match.group(1).strip() if match else ""
+        if not ck:
+            self.cookies["ck"] = ""
+            return
         self.cookies["ck"] = "" if ck == '"deleted"' else ck
 
     def _build_headers(self, referer: str, host: str) -> dict:
@@ -272,7 +280,10 @@ class DoubanHelper:
         headers = self._build_headers(referer, host)
         try:
             self._sleep_before_request("提交状态")
-            response = requests.post(url=url, headers=headers, data=data, timeout=10)
+            response = RequestUtils(headers=headers, cookies=self.cookies, timeout=10).post_res(
+                url=url,
+                data=data,
+            )
         except Exception as e:
             logger.error("请求豆瓣失败: %s", e)
             return False

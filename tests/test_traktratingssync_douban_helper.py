@@ -29,11 +29,13 @@ class _Settings:
 class _Response:
     """测试用 HTTP 响应桩。"""
 
-    def __init__(self, status_code, data=None, text=""):
+    def __init__(self, status_code, data=None, text="", headers=None, cookies=None):
         """初始化响应。"""
         self.status_code = status_code
         self._data = data or {}
         self.text = text
+        self.headers = headers or {}
+        self.cookies = cookies or {}
 
     def json(self):
         """返回 JSON 响应。"""
@@ -69,6 +71,7 @@ def _build_helper(module, monkeypatch):
     helper.cookies = {"dbcl2": "user:token", "ck": "mIHe", "bid": "bid-value"}
     helper.ck = "mIHe"
     helper.headers = {"User-Agent": "MoviePilot-Test", "Cookie": "dbcl2=user:token;ck=mIHe"}
+    helper._notify = lambda *_args, **_kwargs: None
     helper._last_search_ts = 0.0
     helper._search_forbidden_until = 0.0
     helper._search_forbidden_count = 0
@@ -149,3 +152,63 @@ def test_podcast_rexxar_need_login_falls_back_to_html(monkeypatch):
 
     assert (title, subject_id) == ("谐星聊天会", "654321")
     assert len(calls) == 2
+
+
+def test_refresh_ck_uses_requestutils_and_extracts_ck(monkeypatch):
+    """刷新 ck 时应使用 RequestUtils，并从多个 Set-Cookie 中定位 ck。"""
+    module = _load_douban_helper_module(monkeypatch)
+    helper = _build_helper(module, monkeypatch)
+    calls = []
+
+    class RequestUtilsStub:
+        """记录请求参数的请求桩。"""
+
+        def __init__(self, **kwargs):
+            """记录初始化参数。"""
+            self.kwargs = kwargs
+
+        def get_res(self, **kwargs):
+            """返回包含 ck 的 Set-Cookie。"""
+            calls.append({"init": self.kwargs, "request": kwargs})
+            return _Response(
+                200,
+                headers={"Set-Cookie": "bid=abc; Path=/, ck=fresh-ck; Path=/; Domain=.douban.com"},
+            )
+
+    monkeypatch.setattr(module, "RequestUtils", RequestUtilsStub)
+
+    helper._refresh_ck()
+
+    assert helper.cookies["ck"] == "fresh-ck"
+    assert calls[0]["init"]["cookies"] == helper.cookies
+    assert calls[0]["request"]["url"] == helper._URL_DOUBAN
+
+
+def test_post_interest_uses_requestutils(monkeypatch):
+    """豆瓣状态提交应通过 RequestUtils 发送。"""
+    module = _load_douban_helper_module(monkeypatch)
+    helper = _build_helper(module, monkeypatch)
+    calls = []
+
+    class RequestUtilsStub:
+        """记录提交参数的请求桩。"""
+
+        def __init__(self, **kwargs):
+            """记录初始化参数。"""
+            self.kwargs = kwargs
+
+        def post_res(self, **kwargs):
+            """返回提交成功响应。"""
+            calls.append({"init": self.kwargs, "request": kwargs})
+            return _Response(200, {"r": 0})
+
+    monkeypatch.setattr(module, "RequestUtils", RequestUtilsStub)
+
+    assert helper._post_interest(
+        url="https://movie.douban.com/j/subject/123/interest",
+        referer="https://movie.douban.com/subject/123/",
+        host="movie.douban.com",
+        data={"ck": "mIHe"},
+    )
+    assert calls[0]["init"]["cookies"] == helper.cookies
+    assert calls[0]["request"]["data"] == {"ck": "mIHe"}

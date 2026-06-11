@@ -28,10 +28,12 @@ from .xiaoyuzhou_helper import XiaoyuzhouHelper
 
 
 class TraktRatingsSync(_PluginBase):
+    """豆瓣书影音同步插件入口，负责配置、调度和多平台同步编排。"""
+
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.23"
+    plugin_version = "3.14.24"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -84,6 +86,7 @@ class TraktRatingsSync(_PluginBase):
     # ------------------------------------------------------------------
 
     def init_plugin(self, config: dict = None):
+        """初始化插件配置，并重置依赖配置的 Helper 实例。"""
         config = config or {}
         self._enable = config.get("enable", False)
         self._trakt_username = (config.get("trakt_username") or "").strip()
@@ -1175,16 +1178,20 @@ class TraktRatingsSync(_PluginBase):
     # ------------------------------------------------------------------
 
     def get_state(self) -> bool:
+        """返回插件启用状态。"""
         return self._enable
 
     def stop_service(self):
+        """停止插件服务。"""
         pass
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
+        """返回插件注册命令列表。"""
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
+        """返回插件暴露给 MoviePilot 的 API 定义。"""
         return [
             {
                 "path": "/sync",
@@ -1287,6 +1294,7 @@ class TraktRatingsSync(_PluginBase):
         }
 
     def get_service(self) -> List[Dict[str, Any]]:
+        """返回定时同步服务定义。"""
         if not self._enable:
             return []
         try:
@@ -1313,6 +1321,7 @@ class TraktRatingsSync(_PluginBase):
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """返回插件配置页表单结构和默认配置。"""
         return [
             {
                 "component": "VForm",
