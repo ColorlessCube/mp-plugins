@@ -140,13 +140,14 @@
   "CodexLibraryScraper": {
     "name": "媒体库刮削（本地版）",
     "description": "本地维护的媒体库刮削插件，支持本地目录和 MoviePilot 存储目录。",
-    "version": "2.2.1",
+    "version": "2.2.2",
     "icon": "scraper.png",
     "author": "MoviePilot Local",
     "level": 1,
     "v2": true,
     "labels": "刮削,媒体库,云盘,本地版",
     "history": {
+      "v2.2.2": "显式指定单个影片目录刮削时直接使用该目录，避免按全局重命名格式上推到分类目录。",
       "v2.2.1": "补齐公开接口中文说明，并明确空命令/API/页面返回。",
       "v2.2.0": "本地维护版本：支持使用 存储名:/路径#媒体类型 配置刮削 MoviePilot 存储目录。"
     }

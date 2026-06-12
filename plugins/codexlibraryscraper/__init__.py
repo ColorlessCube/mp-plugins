@@ -33,7 +33,7 @@ class CodexLibraryScraper(_PluginBase):
     # 插件图标
     plugin_icon = "scraper.png"
     # 插件版本
-    plugin_version = "2.2.1"
+    plugin_version = "2.2.2"
     # 插件作者
     plugin_author = "MoviePilot Local"
     # 作者主页
@@ -505,7 +505,10 @@ class CodexLibraryScraper(_PluginBase):
             file_mtype = mtype or self.__detect_media_type(file_path)
             if not file_mtype:
                 continue
-            media_path = self.__get_media_dir_path(file_path, file_mtype)
+            if mtype and file_path.parent == path:
+                media_path = path
+            else:
+                media_path = self.__get_media_dir_path(file_path, file_mtype)
             if not media_path:
                 continue
             dir_item = self.__build_dir_fileitem(
@@ -547,7 +550,10 @@ class CodexLibraryScraper(_PluginBase):
             file_mtype = mtype or self.__detect_media_type(file_path)
             if not file_mtype:
                 continue
-            media_path = self.__get_media_dir_path(file_path, file_mtype)
+            if mtype and self.__normalize_storage_path(file_path.parent) == storage_path:
+                media_path = storage_path
+            else:
+                media_path = self.__get_media_dir_path(file_path, file_mtype)
             if not media_path:
                 continue
             media_item = self.storagechain.get_file_item(storage=storage, path=media_path)

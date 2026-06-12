@@ -197,3 +197,57 @@ def test_library_scraper_parses_storage_path_with_media_type(monkeypatch):
     assert storage == "夸克网盘"
     assert path == Path("/电影/示例")
     assert media_type == module.MediaType.MOVIE
+
+
+def test_library_scraper_keeps_explicit_movie_directory(monkeypatch):
+    """显式影片目录包含视频文件时应刮削该目录本身。"""
+    module = _load_scraper_module(monkeypatch)
+    plugin = module.CodexLibraryScraper.__new__(module.CodexLibraryScraper)
+    root_item = types.SimpleNamespace(
+        storage="夸克网盘",
+        type="dir",
+        path="/media/movie/动画电影/Castle in the Sky (1986)/",
+        name="Castle in the Sky (1986)",
+    )
+    video_item = types.SimpleNamespace(
+        storage="夸克网盘",
+        type="file",
+        path="/media/movie/动画电影/Castle in the Sky (1986)/Castle in the Sky (1986) - 1080p.mkv",
+        name="Castle in the Sky (1986) - 1080p.mkv",
+    )
+
+    class StorageChainStub:
+        """测试用存储链。"""
+
+        def get_file_item(self, storage, path):
+            """返回根目录或按路径构造目录。"""
+            if storage == "夸克网盘" and path == Path("/media/movie/动画电影/Castle in the Sky (1986)"):
+                return root_item
+            return types.SimpleNamespace(
+                storage=storage,
+                type="dir",
+                path=f"{path.as_posix().rstrip('/')}/",
+                name=path.name,
+            )
+
+        def list_files(self, fileitem, recursion=False):
+            """返回根目录内的视频文件。"""
+            assert fileitem is root_item
+            assert recursion is True
+            return [video_item]
+
+    plugin._storagechain = StorageChainStub()
+    scraper_paths = []
+
+    plugin._CodexLibraryScraper__collect_storage_dirs(
+        storage="夸克网盘",
+        path=Path("/media/movie/动画电影/Castle in the Sky (1986)/"),
+        mtype=module.MediaType.MOVIE,
+        exclude_paths=[],
+        scraper_paths=scraper_paths,
+        scraper_seen=set(),
+    )
+
+    assert len(scraper_paths) == 1
+    assert scraper_paths[0][0].path == "/media/movie/动画电影/Castle in the Sky (1986)/"
+    assert scraper_paths[0][1] == module.MediaType.MOVIE
