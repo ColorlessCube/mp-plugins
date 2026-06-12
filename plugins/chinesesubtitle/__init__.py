@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.32"
+    plugin_version = "1.2.33"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -1283,12 +1283,15 @@ class ChineseSubtitle(_PluginBase):
     def _opensubtitles_download_quota_exhausted(self) -> bool:
         if self._opensubtitles_daily_limit <= 0:
             return False
+        if type(self)._scan_active and "opensubtitles" in type(self)._scan_disabled_sources:
+            return True
         quota = self._opensubtitles_download_quota()
         if quota["count"] < self._opensubtitles_daily_limit:
             return False
         logger.warn(
             f"OpenSubtitles 今日下载额度已用完：{quota['count']}/{self._opensubtitles_daily_limit}，跳过 OpenSubtitles"
         )
+        self._disable_source_for_scan("opensubtitles", "今日下载额度已用完")
         return True
 
     def _rollback_opensubtitles_download_quota(self):

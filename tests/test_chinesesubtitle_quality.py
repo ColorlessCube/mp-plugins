@@ -947,6 +947,33 @@ def test_opensubtitles_quota_exhausted_disables_source_for_scan(monkeypatch):
     assert disabled == [("opensubtitles", "今日下载额度已用完")]
 
 
+def test_opensubtitles_quota_exhausted_logs_once_per_scan(monkeypatch):
+    """OpenSubtitles 额度耗尽后本轮重复检查不应重复写日志。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    plugin.save_data(plugin._opensubtitles_quota_key, {
+        "date": plugin._today_key(),
+        "count": plugin._opensubtitles_daily_limit,
+    })
+    logs = []
+    module.ChineseSubtitle._scan_active = True
+    module.ChineseSubtitle._scan_disabled_sources = set()
+
+    monkeypatch.setattr(module.logger, "warn", lambda message: logs.append(message))
+
+    try:
+        assert plugin._opensubtitles_download_quota_exhausted()
+        assert plugin._opensubtitles_download_quota_exhausted()
+    finally:
+        module.ChineseSubtitle._scan_active = False
+        module.ChineseSubtitle._scan_disabled_sources = set()
+
+    assert logs == [
+        "OpenSubtitles 今日下载额度已用完：5/5，跳过 OpenSubtitles",
+        "opensubtitles 本轮目录扫描已暂停：今日下载额度已用完",
+    ]
+
+
 def test_save_from_zip_skips_invalid_members(monkeypatch, tmp_path):
     """压缩包保存时应跳过无效字幕成员。"""
     module = _load_plugin_module(monkeypatch)
