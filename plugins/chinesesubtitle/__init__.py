@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.30"
+    plugin_version = "1.2.31"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -250,6 +250,9 @@ class ChineseSubtitle(_PluginBase):
         downloaded = 0
         missing = 0
         cached_skipped = 0
+        duplicate_skipped = 0
+        seen_video_keys = set()
+        limit_reached = False
         logger.info(f"开始扫描缺失中文字幕视频，目录数：{len(scan_dirs)}")
         for scan_dir in scan_dirs:
             if not scan_dir.exists() or not scan_dir.is_dir():
@@ -258,7 +261,15 @@ class ChineseSubtitle(_PluginBase):
             for video_path in self._iter_video_files(scan_dir):
                 if attempted >= self._scan_limit:
                     logger.info(f"中文字幕目录扫描达到单次尝试上限：{self._scan_limit}")
-                    return
+                    limit_reached = True
+                    break
+                video_key = self._video_identity_key(video_path)
+                if video_key and video_key in seen_video_keys:
+                    duplicate_skipped += 1
+                    logger.info(f"中文字幕目录扫描跳过重复视频：{video_path.name}")
+                    continue
+                if video_key:
+                    seen_video_keys.add(video_key)
                 existing_subtitle_checked = False
                 if not self._overwrite:
                     existing_subtitle_checked = True
@@ -282,9 +293,12 @@ class ChineseSubtitle(_PluginBase):
                     downloaded += 1
                 else:
                     self._record_video_scan_miss(video_path)
+            if limit_reached:
+                break
         logger.info(
             f"中文字幕目录扫描完成，发现缺字幕视频 {missing} 个，"
-            f"缓存跳过 {cached_skipped} 个，尝试 {attempted} 个，成功下载 {downloaded} 个"
+            f"缓存跳过 {cached_skipped} 个，重复跳过 {duplicate_skipped} 个，"
+            f"尝试 {attempted} 个，成功下载 {downloaded} 个"
         )
 
     def _process_video(self, video_path: Optional[Path], mediainfo: Any = None,
@@ -617,11 +631,19 @@ class ChineseSubtitle(_PluginBase):
 
     def _enabled_sources(self) -> List[str]:
         sources = []
+        for source in self._configured_sources():
+            token_attr = self._sources.get(source)
+            if source in type(self)._scan_disabled_sources:
+                continue
+            if getattr(self, token_attr, None):
+                sources.append(source)
+        return sources
+
+    def _configured_sources(self) -> List[str]:
+        sources = []
         for source in re.split(r"[,，\s]+", self._source_order.lower()):
             token_attr = self._sources.get(source)
             if not token_attr or source in sources:
-                continue
-            if source in type(self)._scan_disabled_sources:
                 continue
             if getattr(self, token_attr, None):
                 sources.append(source)
@@ -636,6 +658,7 @@ class ChineseSubtitle(_PluginBase):
                 self._disable_source_for_scan("assrt", f"流控冷却期未结束，剩余 {backoff_wait:.1f} 秒")
                 return False
         if source == "opensubtitles" and self._opensubtitles_download_quota_exhausted():
+            self._disable_source_for_scan("opensubtitles", "今日下载额度已用完")
             return False
         return True
 
@@ -758,6 +781,20 @@ class ChineseSubtitle(_PluginBase):
         return cleaned
 
     def _video_scan_miss_cache_entry_key(self, video_path: Path) -> str:
+        identity_key = self._video_identity_key(video_path)
+        if not identity_key:
+            return ""
+        option_key = "|".join([
+            self._language_suffix or "",
+            str(bool(self._prefer_bilingual)),
+            str(bool(self._upgrade_existing_to_bilingual)),
+            ",".join(self._configured_sources()),
+            str(self._scan_miss_ttl_hours),
+        ])
+        return "|".join([identity_key, option_key])
+
+    @staticmethod
+    def _video_identity_key(video_path: Path) -> str:
         try:
             stat = video_path.stat()
         except OSError:
@@ -766,14 +803,7 @@ class ChineseSubtitle(_PluginBase):
             path_key = str(video_path.resolve())
         except Exception:
             path_key = str(video_path)
-        option_key = "|".join([
-            self._language_suffix or "",
-            str(bool(self._prefer_bilingual)),
-            str(bool(self._upgrade_existing_to_bilingual)),
-            ",".join(self._enabled_sources()),
-            str(self._scan_miss_ttl_hours),
-        ])
-        return "|".join([path_key, str(stat.st_size), str(stat.st_mtime_ns), option_key])
+        return "|".join([path_key, str(stat.st_size), str(stat.st_mtime_ns)])
 
     def _scan_miss_ttl_seconds(self) -> int:
         return max(0, int(self._scan_miss_ttl_hours or 0)) * 3600
