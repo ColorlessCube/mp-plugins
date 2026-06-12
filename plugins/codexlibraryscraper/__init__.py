@@ -33,7 +33,7 @@ class CodexLibraryScraper(_PluginBase):
     # 插件图标
     plugin_icon = "scraper.png"
     # 插件版本
-    plugin_version = "2.2.2"
+    plugin_version = "2.2.3"
     # 插件作者
     plugin_author = "MoviePilot Local"
     # 作者主页
@@ -450,6 +450,15 @@ class CodexLibraryScraper(_PluginBase):
         return None
 
     @staticmethod
+    def __infer_media_type_from_library_path(path: Path) -> Optional[MediaType]:
+        path_parts = [part.lower() for part in path.parts]
+        if any(part in {"movie", "movies", "film", "films"} or "电影" in part for part in path_parts):
+            return MediaType.MOVIE
+        if any(part in {"tv", "show", "shows", "series"} or "剧" in part for part in path_parts):
+            return MediaType.TV
+        return None
+
+    @staticmethod
     def __get_media_dir_path(file_path: Path, mtype: MediaType) -> Optional[Path]:
         rename_format = settings.TV_RENAME_FORMAT \
             if mtype == MediaType.TV else settings.MOVIE_RENAME_FORMAT
@@ -502,7 +511,8 @@ class CodexLibraryScraper(_PluginBase):
             if self.__is_excluded("local", file_path, exclude_paths):
                 logger.debug(f"{file_path} 在排除目录中，跳过 ...")
                 continue
-            file_mtype = mtype or self.__detect_media_type(file_path)
+            file_mtype = mtype or self.__detect_media_type(file_path) \
+                or self.__infer_media_type_from_library_path(path)
             if not file_mtype:
                 continue
             if mtype and file_path.parent == path:
@@ -511,6 +521,9 @@ class CodexLibraryScraper(_PluginBase):
                 media_path = self.__get_media_dir_path(file_path, file_mtype)
             if not media_path:
                 continue
+            if (not self.__path_is_relative_to(media_path, path)) or (
+                    media_path == path and file_path.parent != path):
+                media_path = file_path.parent
             dir_item = self.__build_dir_fileitem(
                 storage="local",
                 path=media_path,
@@ -547,7 +560,8 @@ class CodexLibraryScraper(_PluginBase):
             if self.__is_excluded(storage, file_path, exclude_paths):
                 logger.debug(f"{storage}:{file_path} 在排除目录中，跳过 ...")
                 continue
-            file_mtype = mtype or self.__detect_media_type(file_path)
+            file_mtype = mtype or self.__detect_media_type(file_path) \
+                or self.__infer_media_type_from_library_path(storage_path)
             if not file_mtype:
                 continue
             if mtype and self.__normalize_storage_path(file_path.parent) == storage_path:
@@ -556,6 +570,10 @@ class CodexLibraryScraper(_PluginBase):
                 media_path = self.__get_media_dir_path(file_path, file_mtype)
             if not media_path:
                 continue
+            media_path = self.__normalize_storage_path(media_path)
+            if (not self.__path_is_relative_to(media_path, storage_path)) or (
+                    media_path == storage_path and self.__normalize_storage_path(file_path.parent) != storage_path):
+                media_path = self.__normalize_storage_path(file_path.parent)
             media_item = self.storagechain.get_file_item(storage=storage, path=media_path)
             if not media_item:
                 media_item = self.__build_dir_fileitem(storage=storage, path=media_path)
