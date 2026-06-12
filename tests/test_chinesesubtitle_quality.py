@@ -329,6 +329,30 @@ def test_short_title_substring_does_not_score_as_exact_match(monkeypatch):
     assert score < 45
 
 
+def test_assrt_short_movie_title_embedded_in_unrelated_phrase_is_rejected(monkeypatch):
+    """短中文电影名嵌在无关长词中时不应被下载量推成高分候选。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+
+    rejected_score = plugin._assrt_candidate_score(
+        target_title="十二宫",
+        target_year="2007",
+        target_resolution="1080p",
+        query="十二宫",
+        match_text="聖鬥士星矢：黃道十二宮戰士 圣斗士星矢：黄道十二宫战士 Season 1 第一季",
+    )
+    accepted_score = plugin._assrt_candidate_score(
+        target_title="十二宫",
+        target_year="2007",
+        target_resolution="1080p",
+        query="十二宫",
+        match_text="十二宫 Zodiac 2007 1080p BluRay",
+    )
+
+    assert rejected_score is None
+    assert accepted_score is not None
+
+
 def test_iter_video_files_skips_bluray_stream_segments(monkeypatch, tmp_path):
     """目录扫描应跳过蓝光 BDMV/STREAM 分段文件。"""
     module = _load_plugin_module(monkeypatch)

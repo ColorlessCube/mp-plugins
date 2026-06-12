@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.22"
+    plugin_version = "1.2.23"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -1317,6 +1317,8 @@ class ChineseSubtitle(_PluginBase):
 
     def _assrt_candidate_score(self, target_title: str, target_year: str, target_resolution: str,
                                query: str, match_text: str) -> Optional[float]:
+        if self._short_chinese_title_embedded_in_long_phrase(target_title, match_text):
+            return None
         title_score = max(
             self._release_match_score(target_title, match_text),
             self._text_match_score(target_title, match_text),
@@ -1341,6 +1343,23 @@ class ChineseSubtitle(_PluginBase):
 
         year_score = 20 if target_year and self._year_matches(target_year, candidate_years) else 0
         return title_score + year_score + resolution_score
+
+    @classmethod
+    def _short_chinese_title_embedded_in_long_phrase(cls, target_title: str, match_text: str) -> bool:
+        title = cls._compact_chinese(cls._clean_query_title(target_title))
+        if not 2 <= len(title) <= 4:
+            return False
+        for chunk in re.findall(r"[\u4e00-\u9fff]+", match_text or ""):
+            compact_chunk = cls._compact_chinese(chunk)
+            if compact_chunk == title:
+                return False
+            if title in compact_chunk and not compact_chunk.startswith(title) and not compact_chunk.endswith(title):
+                return True
+        return False
+
+    @staticmethod
+    def _compact_chinese(text: str) -> str:
+        return "".join(re.findall(r"[\u4e00-\u9fff]", text or ""))
 
     @staticmethod
     def _clean_query_title(text: str) -> str:

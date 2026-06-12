@@ -60,7 +60,7 @@
   "ChineseSubtitle" : {
     "name": "中文字幕下载",
     "description": "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕",
-    "version": "1.2.22",
+    "version": "1.2.23",
     "icon": "subtitle.png",
     "author": "ColorlessCube",
     "level": 1,
@@ -91,7 +91,8 @@
       "v1.2.19": "增强目录扫描并发保护，重复触发时快速跳过，并在 ASSRT 熔断后停止本轮后续查询",
       "v1.2.20": "持久化 ASSRT 流控冷却时间，让插件热更新或多实例交叠时共享退避状态",
       "v1.2.21": "目录扫描会校验已有字幕内容，无效字幕不再阻止重新刮削；NFO episode 会参与剧集匹配",
-      "v1.2.22": "收紧 ASSRT 剧集查询：逐集只使用 SxxExx，整季包只使用带季号查询，避免 E/EP/第几集和纯剧名宽搜造成误匹配与流控噪音"
+      "v1.2.22": "收紧 ASSRT 剧集查询：逐集只使用 SxxExx，整季包只使用带季号查询，避免 E/EP/第几集和纯剧名宽搜造成误匹配与流控噪音",
+      "v1.2.23": "修正 ASSRT 短中文片名误匹配：短片名嵌在无关长词中时不再被下载量推成高分候选"
     }
   },
   "LocalMediaArchive": {
