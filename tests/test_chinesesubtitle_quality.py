@@ -929,6 +929,25 @@ def test_assrt_season_queries_are_bounded(monkeypatch, tmp_path):
     assert not any("全季" in query or query == "棋士" or "Season 1" in query for query in queries)
 
 
+def test_assrt_scan_season_queries_use_single_variant(monkeypatch, tmp_path):
+    """目录扫描期间 ASSRT 整季包查询应只保留最强变体。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "鬼灭之刃" / "Season 2" / "鬼灭之刃 - S02E01 - 第1集.mkv"
+    mediainfo = types.SimpleNamespace(type=module.MediaType.TV, title="鬼灭之刃", season=2)
+    meta = types.SimpleNamespace(type=module.MediaType.TV, begin_episode=1)
+
+    normal_queries = plugin._assrt_season_queries(video_path, mediainfo, meta, season=2)
+    module.ChineseSubtitle._scan_active = True
+    try:
+        scan_queries = plugin._assrt_season_queries(video_path, mediainfo, meta, season=2)
+    finally:
+        module.ChineseSubtitle._scan_active = False
+
+    assert normal_queries[:2] == ["鬼灭之刃 S02", "鬼灭之刃 第2季"]
+    assert scan_queries == ["鬼灭之刃 S02"]
+
+
 def test_assrt_backoff_skips_without_sleeping(monkeypatch):
     """ASSRT 流控冷却期内应快速跳过请求。"""
     module = _load_plugin_module(monkeypatch)

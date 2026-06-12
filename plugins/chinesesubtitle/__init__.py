@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.40"
+    plugin_version = "1.2.41"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -1964,7 +1964,7 @@ class ChineseSubtitle(_PluginBase):
                 query = re.sub(r"\s+", " ", f"{title} {season_text}").strip()
                 if query and query not in queries:
                     queries.append(query)
-        return queries[:3]
+        return queries[:1] if type(self)._scan_active else queries[:3]
 
     def _assrt_episode_query_texts(self, season: Optional[int], episode: Optional[int]) -> List[str]:
         texts = []
