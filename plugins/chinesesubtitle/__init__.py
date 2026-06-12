@@ -25,6 +25,10 @@ from app.utils.http import RequestUtils
 
 @dataclass
 class SubtitleCandidate:
+    """
+    字幕候选项，保存搜索源返回的可下载字幕元数据。
+    """
+
     source: str
     title: str
     file_name: str = ""
@@ -36,10 +40,14 @@ class SubtitleCandidate:
 
 
 class ChineseSubtitle(_PluginBase):
+    """
+    中文字幕下载插件，负责在媒体整理完成或目录扫描时补齐外挂中文字幕。
+    """
+
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.13"
+    plugin_version = "1.2.14"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -84,6 +92,7 @@ class ChineseSubtitle(_PluginBase):
     _opensubtitles_quota_key = "opensubtitles_download_quota"
 
     def init_plugin(self, config: dict = None):
+        """初始化插件配置。"""
         config = config or {}
         self._enable = config.get("enable", False)
         self._overwrite = config.get("overwrite", False)
@@ -125,22 +134,28 @@ class ChineseSubtitle(_PluginBase):
         return result
 
     def get_state(self) -> bool:
+        """获取插件启用状态。"""
         return self._enable
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
+        """获取插件命令列表。"""
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
+        """获取插件 API 列表。"""
         return []
 
     def get_page(self) -> Optional[List[dict]]:
+        """获取插件详情页配置。"""
         return None
 
     def stop_service(self):
+        """停止插件服务。"""
         pass
 
     def get_service(self) -> List[Dict[str, Any]]:
+        """获取定时扫描服务配置。"""
         if not self._enable or not self._scan_enable:
             return []
         try:
@@ -161,6 +176,7 @@ class ChineseSubtitle(_PluginBase):
 
     @eventmanager.register(EventType.TransferComplete)
     def transfer_complete(self, event: Event):
+        """处理媒体整理完成事件。"""
         with type(self)._subtitle_task_lock:
             if not self._enable:
                 return
@@ -176,6 +192,7 @@ class ChineseSubtitle(_PluginBase):
             self._process_video(video_path=video_path, mediainfo=mediainfo, meta=meta, storage=storage)
 
     def scan_library(self):
+        """扫描媒体库中缺少中文字幕的视频。"""
         with type(self)._subtitle_task_lock:
             if not self._enable or not self._scan_enable:
                 return
@@ -221,6 +238,7 @@ class ChineseSubtitle(_PluginBase):
             return False
 
         logger.info(f"开始搜索中文字幕：{video_path.name}")
+        all_candidates = []
         for source in self._enabled_sources():
             try:
                 if source == "assrt":
@@ -238,20 +256,24 @@ class ChineseSubtitle(_PluginBase):
                 if not candidates:
                     logger.info(f"{source} 未找到匹配中文字幕：{video_path.name}")
                     continue
-                for candidate in candidates[: self._max_candidates]:
-                    logger.info(f"尝试下载中文字幕候选：{video_path.name} - {candidate.source} - {candidate.title}")
-                    saved = self._download_candidate(candidate, video_path)
-                    if saved:
-                        logger.info(f"中文字幕下载完成：{saved}")
-                        if self._notify:
-                            self.systemmessage.put(
-                                title="中文字幕下载完成",
-                                message=f"{video_path.name}\n{candidate.source}: {candidate.title}",
-                                role="plugin",
-                            )
-                        return True
+                all_candidates.extend(candidates[: self._max_candidates])
             except Exception as err:
                 logger.error(f"{source} 中文字幕处理失败：{err}", exc_info=True)
+        for candidate in self._rank_candidates(all_candidates):
+            logger.info(
+                f"尝试下载中文字幕候选：{video_path.name} - {candidate.source} - "
+                f"{candidate.title} - score={candidate.score:.1f}"
+            )
+            saved = self._download_candidate(candidate, video_path)
+            if saved:
+                logger.info(f"中文字幕下载完成：{saved}")
+                if self._notify:
+                    self.systemmessage.put(
+                        title="中文字幕下载完成",
+                        message=f"{video_path.name}\n{candidate.source}: {candidate.title}",
+                        role="plugin",
+                    )
+                return True
         logger.warn(f"未能下载到中文字幕：{video_path.name}")
         return False
 
@@ -606,6 +628,8 @@ class ChineseSubtitle(_PluginBase):
             text = f"{item.get('native_name') or ''} {item.get('release_site') or ''} {lang_desc}"
             if not self._looks_chinese(text):
                 continue
+            if self._is_low_quality_subtitle_metadata(text):
+                continue
             match_text = f"{item.get('native_name') or ''} {item.get('videoname') or ''}"
             score_filter = self._assrt_candidate_score(
                 target_title=target_title,
@@ -620,7 +644,7 @@ class ChineseSubtitle(_PluginBase):
             score = (
                     score_filter
                     + float(item.get("vote_score") or 0) * 5
-                    + min(float(item.get("down_count") or 0), 10000) / 100
+                    + min(float(item.get("down_count") or 0), 5000) / 100
             )
             candidates.append(SubtitleCandidate(
                 source="ASSRT",
@@ -691,12 +715,20 @@ class ChineseSubtitle(_PluginBase):
             if not files:
                 continue
             if attrs.get("ai_translated") or attrs.get("machine_translated"):
-                score_penalty = 100
-            else:
-                score_penalty = 0
+                continue
+            if attrs.get("hearing_impaired"):
+                continue
             file_info = files[0]
-            score = float(attrs.get("download_count") or 0) + float(attrs.get("ratings") or 0) * 100 - score_penalty
-            score += self._release_match_score(video_path.name, file_info.get("file_name"))
+            title_text = " ".join(str(value or "") for value in (
+                attrs.get("release"),
+                attrs.get("feature_details", {}).get("title"),
+                file_info.get("file_name"),
+            ))
+            if self._is_low_quality_subtitle_metadata(title_text):
+                continue
+            score = self._release_match_score(video_path.name, file_info.get("file_name"))
+            score += min(float(attrs.get("download_count") or 0), 5000) / 100
+            score += float(attrs.get("ratings") or 0) * 10
             candidates.append(SubtitleCandidate(
                 source="OpenSubtitles",
                 title=attrs.get("release") or attrs.get("feature_details", {}).get("title") or item.get("id"),
@@ -744,9 +776,9 @@ class ChineseSubtitle(_PluginBase):
                 continue
             download_url = link if str(link).startswith("http") else urljoin("https://dl.subdl.com", str(link))
             release = item.get("release_name") or item.get("name") or item.get("subtitle_name") or ""
+            if item.get("hi") or self._is_low_quality_subtitle_metadata(release):
+                continue
             score = self._release_match_score(video_path.name, release)
-            if item.get("hi"):
-                score -= 10
             candidates.append(SubtitleCandidate(
                 source="SubDL",
                 title=release or download_url,
@@ -919,6 +951,9 @@ class ChineseSubtitle(_PluginBase):
         suffix = self._guess_subtitle_suffix(url, content)
         if suffix not in settings.RMT_SUBEXT:
             return None
+        if not self._valid_subtitle_content(content, suffix):
+            logger.warn(f"字幕文件内容校验失败，地址：{self._safe_url_for_log(url)}")
+            return None
         target = self._target_subtitle_path(video_path, suffix)
         target.write_bytes(content)
         return target
@@ -953,9 +988,13 @@ class ChineseSubtitle(_PluginBase):
             )
             for member in scored:
                 suffix = Path(member.filename).suffix.lower()
-                target = self._target_subtitle_path(video_path, suffix)
                 with zf.open(member) as src:
-                    target.write_bytes(src.read())
+                    content = src.read()
+                if not self._valid_subtitle_content(content, suffix):
+                    logger.info(f"跳过压缩包内无效字幕文件：{member.filename}")
+                    continue
+                target = self._target_subtitle_path(video_path, suffix)
+                target.write_bytes(content)
                 return target
         return None
 
@@ -976,6 +1015,34 @@ class ChineseSubtitle(_PluginBase):
     @staticmethod
     def _looks_chinese(text: str) -> bool:
         return bool(re.search(r"中|简|繁|双语|字幕组|人人|YYeTs|CHS|CHT|Chinese|zh", text, re.IGNORECASE))
+
+    @staticmethod
+    def _is_low_quality_subtitle_metadata(text: str) -> bool:
+        text = text or ""
+        return bool(re.search(
+            r"机翻|机器翻译|自动翻译|听障|听写|ai\s*translated|machine\s*translated|"
+            r"auto\s*translated|hearing\s*impaired|\bSDH\b|\bHI\b",
+            text,
+            re.IGNORECASE,
+        ))
+
+    @staticmethod
+    def _rank_candidates(candidates: List[SubtitleCandidate]) -> List[SubtitleCandidate]:
+        unique_candidates = []
+        seen_keys = set()
+        for candidate in candidates:
+            key = (
+                candidate.source,
+                candidate.file_id,
+                candidate.download_url,
+                candidate.title,
+                candidate.file_name,
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_candidates.append(candidate)
+        return sorted(unique_candidates, key=lambda x: x.score, reverse=True)
 
     def _assrt_queries(self, video_path: Path, mediainfo: Any, meta: Any) -> List[str]:
         queries = []
@@ -1294,6 +1361,36 @@ class ChineseSubtitle(_PluginBase):
             return ".ass"
         return ".srt"
 
+    @classmethod
+    def _valid_subtitle_content(cls, content: bytes, suffix: str) -> bool:
+        if not content or len(content.strip()) < 20:
+            return False
+        text = cls._decode_subtitle_text(content[:200000])
+        if not text:
+            return False
+        head = text[:500].lower()
+        if re.search(r"<\s*(html|body|script)\b|<!doctype\s+html", head):
+            return False
+        if suffix in {".ass", ".ssa"}:
+            return bool(
+                re.search(r"\[(script info|events)]", text, re.IGNORECASE)
+                and re.search(r"(?m)^\s*(Dialogue|Format)\s*:", text)
+            )
+        return bool(re.search(
+            r"(?m)^\s*\d+\s*\r?\n\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*"
+            r"\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}",
+            text,
+        ))
+
+    @staticmethod
+    def _decode_subtitle_text(content: bytes) -> str:
+        for encoding in ("utf-8-sig", "utf-16", "gb18030", "big5", "latin-1"):
+            try:
+                return content.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return ""
+
     def _opensubtitles_headers(self, token: str = "") -> dict:
         headers = {
             "Api-Key": self._opensubtitles_api_key,
@@ -1369,6 +1466,7 @@ class ChineseSubtitle(_PluginBase):
         return getattr(meta, "begin_episode", None)
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """获取插件配置表单。"""
         def field(model: str, label: str, **props) -> dict:
             return {"component": "VTextField", "props": {"model": model, "label": label, **props}}
 
