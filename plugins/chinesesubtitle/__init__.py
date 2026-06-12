@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.21"
+    plugin_version = "1.2.22"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -1218,6 +1218,8 @@ class ChineseSubtitle(_PluginBase):
         episode_texts = [""]
         if self._is_tv(mediainfo, meta):
             season, episode = self._season_episode_numbers(video_path, mediainfo, meta)
+            if not season or not episode:
+                return []
             episode_texts = self._assrt_episode_query_texts(season, episode)
         for title in self._assrt_query_titles(video_path, mediainfo, meta):
             for episode_text in episode_texts:
@@ -1225,11 +1227,11 @@ class ChineseSubtitle(_PluginBase):
                 query = re.sub(r"\s+", " ", query).strip()
                 if query and query not in queries:
                     queries.append(query)
-        return queries[:8] if self._is_tv(mediainfo, meta) else queries
+        return queries[:3] if self._is_tv(mediainfo, meta) else queries
 
     def _assrt_season_queries(self, video_path: Path, mediainfo: Any, meta: Any, season: int) -> List[str]:
         queries = []
-        season_texts = [f"S{int(season):02d}", "全季", ""]
+        season_texts = [f"S{int(season):02d}"]
         if int(season) > 1:
             season_texts.insert(1, f"第{int(season)}季")
         for title in self._assrt_query_titles(video_path, mediainfo, meta):
@@ -1237,19 +1239,12 @@ class ChineseSubtitle(_PluginBase):
                 query = re.sub(r"\s+", " ", f"{title} {season_text}").strip()
                 if query and query not in queries:
                     queries.append(query)
-        return queries[:6]
+        return queries[:3]
 
     def _assrt_episode_query_texts(self, season: Optional[int], episode: Optional[int]) -> List[str]:
         texts = []
         if season and episode:
             texts.append(f"S{int(season):02d}E{int(episode):02d}")
-        if episode:
-            episode_number = int(episode)
-            texts.extend([
-                f"E{episode_number:02d}",
-                f"第{episode_number}集",
-            ])
-        texts.append("")
         return self._unique_texts(texts)
 
     def _assrt_query_titles(self, video_path: Path, mediainfo: Any, meta: Any) -> List[str]:

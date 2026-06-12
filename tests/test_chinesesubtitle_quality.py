@@ -346,7 +346,7 @@ def test_iter_video_files_skips_bluray_stream_segments(monkeypatch, tmp_path):
 
 
 def test_assrt_tv_queries_are_bounded_and_prioritized(monkeypatch, tmp_path):
-    """ASSRT 剧集查询应限制数量并优先高价值片名变体。"""
+    """ASSRT 剧集查询应只使用精确季集号，避免宽查询误集。"""
     module = _load_plugin_module(monkeypatch)
     plugin = _plugin(module)
     video_path = tmp_path / "棋士" / "Season 1" / "棋士 - S01E02 - 第2集.mkv"
@@ -363,13 +363,25 @@ def test_assrt_tv_queries_are_bounded_and_prioritized(monkeypatch, tmp_path):
 
     queries = plugin._assrt_queries(video_path, mediainfo, meta)
 
-    assert len(queries) <= 8
-    assert queries[:4] == ["棋士 S01E02", "棋士 E02", "棋士 第2集", "棋士"]
-    assert not any("EP02" in query or "第二集" in query for query in queries)
+    assert len(queries) <= 3
+    assert queries == ["棋士 S01E02"]
+    assert not any(" E02" in query or "第2集" in query or query == "棋士" for query in queries)
+
+
+def test_assrt_tv_queries_skip_when_episode_unknown(monkeypatch, tmp_path):
+    """缺少集数时 ASSRT 不应退化为纯剧名宽搜。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "棋士" / "Season 1" / "棋士 - 第2集.mkv"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    mediainfo = types.SimpleNamespace(type=module.MediaType.TV, title="棋士", season=1)
+
+    assert plugin._assrt_queries(video_path, mediainfo, meta=None) == []
 
 
 def test_assrt_season_queries_are_bounded(monkeypatch, tmp_path):
-    """ASSRT 整季包查询应限制低价值季名变体。"""
+    """ASSRT 整季包查询应只使用带季号的高价值变体。"""
     module = _load_plugin_module(monkeypatch)
     plugin = _plugin(module)
     video_path = tmp_path / "棋士" / "Season 1" / "棋士 - S01E02 - 第2集.mkv"
@@ -378,9 +390,9 @@ def test_assrt_season_queries_are_bounded(monkeypatch, tmp_path):
 
     queries = plugin._assrt_season_queries(video_path, mediainfo, meta, season=1)
 
-    assert len(queries) <= 6
-    assert queries[:3] == ["棋士 S01", "棋士 全季", "棋士"]
-    assert not any("Season 1" in query or "全集" in query for query in queries)
+    assert len(queries) <= 3
+    assert queries == ["棋士 S01"]
+    assert not any("全季" in query or query == "棋士" or "Season 1" in query for query in queries)
 
 
 def test_assrt_backoff_skips_without_sleeping(monkeypatch):
