@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.34"
+    plugin_version = "1.2.35"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -124,6 +124,11 @@ class ChineseSubtitle(_PluginBase):
     _release_feature_mismatch_penalty = 12
     _release_group_match_score = 15
     _release_group_mismatch_penalty = 5
+    _subtitle_coverage_min_duration_seconds = 10 * 60
+    _subtitle_coverage_min_ratio = 0.65
+    _subtitle_coverage_end_min_ratio = 0.75
+    _subtitle_coverage_start_max_ratio = 0.25
+    _subtitle_coverage_start_max_seconds = 10 * 60
 
     def init_plugin(self, config: dict = None):
         """初始化插件配置。"""
@@ -374,7 +379,7 @@ class ChineseSubtitle(_PluginBase):
                 f"尝试下载中文字幕候选：{video_path.name} - {candidate.source} - "
                 f"{candidate.title} - score={effective_score:.1f}"
             )
-            saved = self._download_candidate(candidate, video_path)
+            saved = self._download_candidate(candidate, video_path, mediainfo, meta)
             if saved:
                 logger.info(f"中文字幕下载完成：{saved}")
                 if self._notify:
@@ -566,6 +571,7 @@ class ChineseSubtitle(_PluginBase):
             original_title=original_title,
             year=year,
             season=self._safe_int(self._nfo_first_text(root, "season")),
+            runtime=self._safe_int(self._nfo_first_text(root, "runtime")),
             tmdb_id=tmdb_id,
             imdb_id=imdb_id.strip() if imdb_id else None,
             tvdb_id=tvdb_id,
@@ -1081,7 +1087,7 @@ class ChineseSubtitle(_PluginBase):
             return None
         for url in urls:
             logger.info(f"开始下载 ASSRT 整季匹配字幕：{video_path.name}，地址：{self._safe_url_for_log(url)}")
-            saved = self._download_url(url, video_path)
+            saved = self._download_url(url, video_path, mediainfo, meta)
             if saved:
                 return saved
         return None
@@ -1332,16 +1338,18 @@ class ChineseSubtitle(_PluginBase):
             ))
         return sorted(candidates, key=self._candidate_sort_score, reverse=True)
 
-    def _download_candidate(self, candidate: SubtitleCandidate, video_path: Path) -> Optional[Path]:
+    def _download_candidate(self, candidate: SubtitleCandidate, video_path: Path,
+                            mediainfo: Any = None, meta: Any = None) -> Optional[Path]:
         if candidate.source == "ASSRT":
-            return self._download_assrt(candidate, video_path)
+            return self._download_assrt(candidate, video_path, mediainfo, meta)
         if candidate.source == "OpenSubtitles":
-            return self._download_opensubtitles(candidate, video_path)
+            return self._download_opensubtitles(candidate, video_path, mediainfo, meta)
         if candidate.download_url:
-            return self._download_url(candidate.download_url, video_path)
+            return self._download_url(candidate.download_url, video_path, mediainfo, meta)
         return None
 
-    def _download_assrt(self, candidate: SubtitleCandidate, video_path: Path) -> Optional[Path]:
+    def _download_assrt(self, candidate: SubtitleCandidate, video_path: Path,
+                        mediainfo: Any = None, meta: Any = None) -> Optional[Path]:
         sub_id = (candidate.raw or {}).get("id")
         if not sub_id:
             return None
@@ -1385,7 +1393,7 @@ class ChineseSubtitle(_PluginBase):
                 break
             attempted += 1
             logger.info(f"开始下载 ASSRT 字幕文件，ID：{sub_id}，地址：{self._safe_url_for_log(url)}")
-            saved = self._download_url(url, video_path)
+            saved = self._download_url(url, video_path, mediainfo, meta)
             if saved:
                 return saved
             logger.info(f"ASSRT 字幕文件下载未成功，ID：{sub_id}，地址：{self._safe_url_for_log(url)}")
@@ -1416,7 +1424,8 @@ class ChineseSubtitle(_PluginBase):
             unique_urls.append(url)
         return unique_urls
 
-    def _download_opensubtitles(self, candidate: SubtitleCandidate, video_path: Path) -> Optional[Path]:
+    def _download_opensubtitles(self, candidate: SubtitleCandidate, video_path: Path,
+                                mediainfo: Any = None, meta: Any = None) -> Optional[Path]:
         if not candidate.file_id:
             return None
         if not self._consume_opensubtitles_download_quota():
@@ -1443,7 +1452,7 @@ class ChineseSubtitle(_PluginBase):
             logger.warn(f"OpenSubtitles 下载链接为空，file_id={candidate.file_id}")
             self._rollback_opensubtitles_download_quota()
             return None
-        return self._download_url(link, video_path)
+        return self._download_url(link, video_path, mediainfo, meta)
 
     def _consume_opensubtitles_download_quota(self) -> bool:
         if self._opensubtitles_download_quota_exhausted():
@@ -1522,7 +1531,7 @@ class ChineseSubtitle(_PluginBase):
                 logger.warn(f"ASSRT 触发流控 509，暂停请求 {backoff_seconds} 秒")
             return res
 
-    def _download_url(self, url: str, video_path: Path) -> Optional[Path]:
+    def _download_url(self, url: str, video_path: Path, mediainfo: Any = None, meta: Any = None) -> Optional[Path]:
         if self._unsupported_subtitle_url_suffix(url):
             logger.info(f"跳过不支持的字幕文件格式，地址：{self._safe_url_for_log(url)}")
             return None
@@ -1542,7 +1551,7 @@ class ChineseSubtitle(_PluginBase):
             return None
         content_type = (response.get("headers", {}).get("Content-Type") or "").lower()
         if zipfile.is_zipfile(io.BytesIO(content)) or "zip" in content_type or url.lower().split("?")[0].endswith(".zip"):
-            saved = self._save_from_zip(content, video_path)
+            saved = self._save_from_zip(content, video_path, mediainfo, meta)
             if saved:
                 self._clear_download_failed_url(url)
             else:
@@ -1554,6 +1563,10 @@ class ChineseSubtitle(_PluginBase):
             return None
         if not self._valid_chinese_subtitle_content(content, suffix):
             logger.warn(f"字幕文件内容校验失败，地址：{self._safe_url_for_log(url)}")
+            self._record_download_failed_url(url)
+            return None
+        if not self._subtitle_timeline_coverage_ok(content, suffix, video_path, mediainfo, meta):
+            logger.warn(f"字幕文件时间轴覆盖不足，地址：{self._safe_url_for_log(url)}")
             self._record_download_failed_url(url)
             return None
         target = self._target_subtitle_path(video_path, suffix)
@@ -1652,7 +1665,8 @@ class ChineseSubtitle(_PluginBase):
             return max(10, min(int(retry_after), 300))
         return max(30, min(self._assrt_interval * 10, 300))
 
-    def _save_from_zip(self, content: bytes, video_path: Path) -> Optional[Path]:
+    def _save_from_zip(self, content: bytes, video_path: Path,
+                       mediainfo: Any = None, meta: Any = None) -> Optional[Path]:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:
             members = [m for m in zf.infolist() if Path(m.filename).suffix.lower() in settings.RMT_SUBEXT]
             if not members:
@@ -1673,6 +1687,9 @@ class ChineseSubtitle(_PluginBase):
                 if not self._valid_chinese_subtitle_content(content, suffix):
                     logger.info(f"跳过压缩包内无效字幕文件：{member.filename}")
                     continue
+                if not self._subtitle_timeline_coverage_ok(content, suffix, video_path, mediainfo, meta):
+                    logger.info(f"跳过压缩包内时间轴覆盖不足字幕文件：{member.filename}")
+                    continue
                 target = self._target_subtitle_path(video_path, suffix)
                 target.write_bytes(content)
                 return target
@@ -1688,7 +1705,7 @@ class ChineseSubtitle(_PluginBase):
         subtitle_path = self._existing_subtitle_path(video_path)
         if not subtitle_path:
             return False
-        if self._valid_existing_subtitle(subtitle_path):
+        if self._valid_existing_subtitle(subtitle_path, video_path):
             if self._should_upgrade_existing_subtitle(subtitle_path):
                 logger.info(f"已有中文字幕非双语，继续搜索中英双语字幕：{subtitle_path}")
                 return False
@@ -1703,12 +1720,16 @@ class ChineseSubtitle(_PluginBase):
                     return subtitle_path
         return None
 
-    def _valid_existing_subtitle(self, subtitle_path: Path) -> bool:
+    def _valid_existing_subtitle(self, subtitle_path: Path, video_path: Path) -> bool:
         suffix = subtitle_path.suffix.lower()
         if suffix not in settings.RMT_SUBEXT:
             return False
         try:
-            return self._valid_chinese_subtitle_content(subtitle_path.read_bytes(), suffix)
+            content = subtitle_path.read_bytes()
+            return (
+                    self._valid_chinese_subtitle_content(content, suffix)
+                    and self._subtitle_timeline_coverage_ok(content, suffix, video_path)
+            )
         except Exception as err:
             logger.warn(f"读取已有中文字幕失败：{subtitle_path} - {err}")
             return False
@@ -2267,6 +2288,156 @@ class ChineseSubtitle(_PluginBase):
         if b"[script info]" in head or b"[events]" in head:
             return ".ass"
         return ".srt"
+
+    def _subtitle_timeline_coverage_ok(self, content: bytes, suffix: str, video_path: Path,
+                                       mediainfo: Any = None, meta: Any = None) -> bool:
+        duration_seconds = self._media_duration_seconds(video_path, mediainfo, meta)
+        if not duration_seconds or duration_seconds < self._subtitle_coverage_min_duration_seconds:
+            return True
+        timeline_range = self._subtitle_timeline_range(content, suffix)
+        if not timeline_range:
+            logger.info(f"字幕时间轴解析失败：{video_path.name}")
+            return False
+        first_start, last_end, cue_count = timeline_range
+        start_limit = min(
+            duration_seconds * self._subtitle_coverage_start_max_ratio,
+            self._subtitle_coverage_start_max_seconds,
+        )
+        coverage_seconds = max(0, last_end - first_start)
+        if (
+                first_start > start_limit
+                or last_end < duration_seconds * self._subtitle_coverage_end_min_ratio
+                or coverage_seconds < duration_seconds * self._subtitle_coverage_min_ratio
+        ):
+            logger.info(
+                f"字幕时间轴覆盖不足：{video_path.name} "
+                f"start={first_start:.1f}s end={last_end:.1f}s "
+                f"duration={duration_seconds:.1f}s cues={cue_count}"
+            )
+            return False
+        return True
+
+    def _media_duration_seconds(self, video_path: Optional[Path], mediainfo: Any = None,
+                                meta: Any = None) -> Optional[float]:
+        for container in (mediainfo, meta):
+            for attr_name in ("runtime", "run_time", "duration_minutes"):
+                seconds = self._duration_value_seconds(getattr(container, attr_name, None), default_unit="minutes")
+                if seconds:
+                    return seconds
+            for attr_name in ("duration_seconds", "duration", "video_duration"):
+                seconds = self._duration_value_seconds(getattr(container, attr_name, None), default_unit="seconds")
+                if seconds:
+                    return seconds
+        if video_path:
+            nfo_mediainfo = self._mediainfo_from_local_nfo(video_path)
+            if nfo_mediainfo and nfo_mediainfo is not mediainfo:
+                return self._duration_value_seconds(getattr(nfo_mediainfo, "runtime", None), default_unit="minutes")
+        return None
+
+    @classmethod
+    def _duration_value_seconds(cls, value: Any, default_unit: str = "seconds") -> Optional[float]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, str):
+            text = value.strip().lower()
+            timestamp_seconds = cls._subtitle_timestamp_seconds(text)
+            if timestamp_seconds is not None and ":" in text:
+                return timestamp_seconds
+            match = re.search(r"\d+(?:\.\d+)?", text)
+            if not match:
+                return None
+            amount = float(match.group())
+            if re.search(r"毫秒|milliseconds?|ms\b", text):
+                return amount / 1000
+            if re.search(r"小时|hours?|hrs?|h\b", text):
+                return amount * 3600
+            if re.search(r"分钟|分|minutes?|mins?|m\b", text):
+                return amount * 60
+            if re.search(r"秒|seconds?|secs?|s\b", text):
+                return amount
+        else:
+            try:
+                amount = float(value)
+            except (TypeError, ValueError):
+                return None
+        if amount <= 0:
+            return None
+        if default_unit == "minutes" and amount < 1000:
+            return amount * 60
+        if default_unit == "milliseconds" or amount > 360000:
+            return amount / 1000
+        return amount
+
+    @classmethod
+    def _subtitle_timeline_range(cls, content: bytes, suffix: str) -> Optional[Tuple[float, float, int]]:
+        text = cls._decode_subtitle_text(content)
+        if not text:
+            return None
+        if suffix in {".ass", ".ssa"}:
+            return cls._ass_subtitle_timeline_range(text)
+        return cls._srt_subtitle_timeline_range(text)
+
+    @classmethod
+    def _srt_subtitle_timeline_range(cls, text: str) -> Optional[Tuple[float, float, int]]:
+        ranges = []
+        for match in re.finditer(
+                r"(?m)(\d+:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d+:\d{2}:\d{2}[,.]\d{1,3})",
+                text,
+        ):
+            start = cls._subtitle_timestamp_seconds(match.group(1))
+            end = cls._subtitle_timestamp_seconds(match.group(2))
+            if start is None or end is None or end <= start:
+                continue
+            ranges.append((start, end))
+        return cls._timeline_bounds(ranges)
+
+    @classmethod
+    def _ass_subtitle_timeline_range(cls, text: str) -> Optional[Tuple[float, float, int]]:
+        ranges = []
+        format_fields = []
+        for line in text.splitlines():
+            key, separator, value = line.partition(":")
+            if not separator:
+                continue
+            key = key.strip().lower()
+            value = value.strip()
+            if key == "format":
+                fields = [field.strip().lower() for field in value.split(",")]
+                if "start" in fields and "end" in fields:
+                    format_fields = fields
+                continue
+            if key != "dialogue":
+                continue
+            start_index = format_fields.index("start") if "start" in format_fields else 1
+            end_index = format_fields.index("end") if "end" in format_fields else 2
+            maxsplit = max(len(format_fields) - 1, start_index, end_index)
+            parts = value.split(",", maxsplit)
+            if len(parts) <= max(start_index, end_index):
+                continue
+            start = cls._subtitle_timestamp_seconds(parts[start_index].strip())
+            end = cls._subtitle_timestamp_seconds(parts[end_index].strip())
+            if start is None or end is None or end <= start:
+                continue
+            ranges.append((start, end))
+        return cls._timeline_bounds(ranges)
+
+    @staticmethod
+    def _timeline_bounds(ranges: List[Tuple[float, float]]) -> Optional[Tuple[float, float, int]]:
+        if not ranges:
+            return None
+        return min(start for start, _ in ranges), max(end for _, end in ranges), len(ranges)
+
+    @staticmethod
+    def _subtitle_timestamp_seconds(value: str) -> Optional[float]:
+        match = re.fullmatch(r"\s*(?:(\d+):)?(\d{1,2}):(\d{2})(?:[,.](\d{1,3}))?\s*", value or "")
+        if not match:
+            return None
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2))
+        seconds = int(match.group(3))
+        fraction_text = match.group(4) or ""
+        fraction = int(fraction_text) / (10 ** len(fraction_text)) if fraction_text else 0
+        return hours * 3600 + minutes * 60 + seconds + fraction
 
     @classmethod
     def _valid_subtitle_content(cls, content: bytes, suffix: str) -> bool:

@@ -139,7 +139,7 @@ def test_process_video_ranks_candidates_across_sources(monkeypatch, tmp_path):
             return [module.SubtitleCandidate(source="OpenSubtitles", title="high", score=140)]
         return []
 
-    def download_candidate(candidate, _video_path):
+    def download_candidate(candidate, _video_path, *_args):
         """记录实际尝试的候选。"""
         attempted.append(candidate.title)
         if candidate.title == "high":
@@ -172,7 +172,7 @@ def test_process_video_prefers_bilingual_candidate(monkeypatch, tmp_path):
             return [module.SubtitleCandidate(source="OpenSubtitles", title="Movie.2024.中英双语", score=90)]
         return []
 
-    def download_candidate(candidate, _video_path):
+    def download_candidate(candidate, _video_path, *_args):
         """记录实际尝试的候选。"""
         attempted.append(candidate.title)
         return _video_path.with_name(f"{_video_path.stem}.zh-CN.srt")
@@ -208,7 +208,7 @@ def test_process_video_prunes_low_value_download_candidates(monkeypatch, tmp_pat
             return [module.SubtitleCandidate(source="SubDL", title="third", score=90)]
         return []
 
-    def download_candidate(candidate, _video_path):
+    def download_candidate(candidate, _video_path, *_args):
         """记录实际尝试的候选。"""
         attempted.append(candidate.title)
         return None
@@ -362,6 +362,82 @@ def test_valid_subtitle_content_rejects_html_and_accepts_subtitles(monkeypatch):
     )
 
 
+def test_subtitle_timeline_coverage_rejects_short_file(monkeypatch, tmp_path):
+    """已知视频时长时应拒绝只覆盖片段的字幕。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    mediainfo = types.SimpleNamespace(runtime=100)
+    short_subtitle = "1\n00:00:01,000 --> 00:00:02,000\n你好\n".encode("utf-8")
+    full_subtitle = (
+        "1\n00:00:30,000 --> 00:01:00,000\n你好\n\n"
+        "2\n01:20:00,000 --> 01:21:00,000\n世界\n"
+    ).encode("utf-8")
+
+    assert not plugin._subtitle_timeline_coverage_ok(short_subtitle, ".srt", video_path, mediainfo=mediainfo)
+    assert plugin._subtitle_timeline_coverage_ok(full_subtitle, ".srt", video_path, mediainfo=mediainfo)
+
+
+def test_ass_subtitle_timeline_coverage(monkeypatch, tmp_path):
+    """ASS 字幕也应按 Dialogue 时间轴校验覆盖范围。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    mediainfo = types.SimpleNamespace(runtime=90)
+    subtitle = (
+        b"[Script Info]\nTitle: demo\n[Events]\n"
+        b"Format: Layer, Start, End, Style, Text\n"
+        b"Dialogue: 0,0:00:10.00,0:00:20.00,Default,\xe4\xbd\xa0\xe5\xa5\xbd\n"
+        b"Dialogue: 0,1:15:00.00,1:16:00.00,Default,\xe4\xb8\x96\xe7\x95\x8c\n"
+    )
+
+    assert plugin._subtitle_timeline_coverage_ok(subtitle, ".ass", video_path, mediainfo=mediainfo)
+
+
+def test_download_url_rejects_short_timeline_when_runtime_known(monkeypatch, tmp_path):
+    """下载直链字幕在时长覆盖不足时不应写入目标文件。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    subtitle = "1\n00:00:01,000 --> 00:00:02,000\n你好\n".encode("utf-8")
+
+    class SubtitleResponse:
+        """测试用字幕下载响应。"""
+
+        status_code = 200
+        headers = {}
+        content = subtitle
+
+        @staticmethod
+        def close():
+            """关闭响应。"""
+
+    class FakeRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **_kwargs):
+            """忽略请求参数。"""
+
+        @staticmethod
+        def get_res(_url, **_kwargs):
+            """返回短时间轴字幕。"""
+            return SubtitleResponse()
+
+    monkeypatch.setattr(module, "RequestUtils", FakeRequestUtils)
+
+    saved = plugin._download_url(
+        "https://example.com/sub.srt",
+        video_path,
+        mediainfo=types.SimpleNamespace(runtime=100),
+    )
+
+    assert saved is None
+    assert not (tmp_path / "Movie.2026.zh-CN.srt").exists()
+
+
 def test_invalid_existing_subtitle_does_not_skip_search(monkeypatch, tmp_path):
     """已有字幕无效时应继续搜索并允许新字幕覆盖目标文件。"""
     module = _load_plugin_module(monkeypatch)
@@ -377,7 +453,7 @@ def test_invalid_existing_subtitle_does_not_skip_search(monkeypatch, tmp_path):
         searched_sources.append(source)
         return [module.SubtitleCandidate(source="SubDL", title="good", score=100, download_url="https://example/sub.srt")]
 
-    def download_candidate(_candidate, _video_path):
+    def download_candidate(_candidate, _video_path, *_args):
         """模拟下载到目标字幕文件。"""
         subtitle_path.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
         return subtitle_path
@@ -388,6 +464,22 @@ def test_invalid_existing_subtitle_does_not_skip_search(monkeypatch, tmp_path):
 
     assert plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
     assert searched_sources == ["subdl"]
+
+
+def test_short_existing_subtitle_does_not_skip_when_runtime_known(monkeypatch, tmp_path):
+    """已有中文字幕时间轴覆盖不足时应继续搜索。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    video_path.with_suffix(".nfo").write_text(
+        "<movie><title>Movie</title><runtime>100</runtime></movie>",
+        encoding="utf-8",
+    )
+    subtitle_path = tmp_path / "Movie.2026.zh-CN.srt"
+    subtitle_path.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+
+    assert not plugin._has_existing_subtitle(video_path)
 
 
 def test_bilingual_existing_subtitle_still_skips_search(monkeypatch, tmp_path):
@@ -427,7 +519,7 @@ def test_pure_chinese_existing_subtitle_searches_for_bilingual_upgrade(monkeypat
         searched_sources.append(source)
         return [module.SubtitleCandidate(source="SubDL", title="Movie.2026.中英双语", score=100)]
 
-    def download_candidate(_candidate, _video_path):
+    def download_candidate(_candidate, _video_path, *_args):
         """模拟双语字幕覆盖保存。"""
         subtitle_path.write_text(
             "1\n00:00:01,000 --> 00:00:02,000\n你好 hello\n\n"
@@ -459,7 +551,7 @@ def test_non_chinese_existing_subtitle_does_not_skip_search(monkeypatch, tmp_pat
         searched_sources.append(source)
         return [module.SubtitleCandidate(source="SubDL", title="good", score=100, download_url="https://example/sub.srt")]
 
-    def download_candidate(_candidate, _video_path):
+    def download_candidate(_candidate, _video_path, *_args):
         """模拟下载到目标字幕文件。"""
         subtitle_path.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
         return subtitle_path
@@ -483,6 +575,7 @@ def test_nfo_episode_is_used_when_filename_has_no_sxxexx(monkeypatch, tmp_path):
           <showtitle>棋士</showtitle>
           <season>1</season>
           <episode>7.0</episode>
+          <runtime>45</runtime>
           <uniqueid type="tmdb">6062096</uniqueid>
         </episodedetails>
         """,
@@ -494,6 +587,7 @@ def test_nfo_episode_is_used_when_filename_has_no_sxxexx(monkeypatch, tmp_path):
     mediainfo = plugin._parse_nfo_mediainfo(nfo_path)
 
     assert mediainfo.episode == 7
+    assert mediainfo.runtime == 45
     assert plugin._season_episode_numbers(video_path, mediainfo, meta=None) == (1, 7)
     assert plugin._season_episode_from_meta(mediainfo, meta=None) == "S01E07"
 
@@ -1078,6 +1172,31 @@ def test_save_from_zip_prefers_bilingual_member(monkeypatch, tmp_path):
     assert saved.read_text() == "1\n00:00:01,000 --> 00:00:02,000\n你好 hello\n"
 
 
+def test_save_from_zip_skips_short_timeline_member(monkeypatch, tmp_path):
+    """压缩包内字幕时间轴覆盖不足时应继续尝试其他成员。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.1080p.WEB-DL-GRP.mkv"
+    video_path.write_bytes(b"video")
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zf:
+        zf.writestr("Movie.2024.1080p.WEB-DL-GRP.srt", "1\n00:00:01,000 --> 00:00:02,000\n你好\n")
+        zf.writestr(
+            "fallback.srt",
+            "1\n00:00:30,000 --> 00:01:00,000\n你好\n\n"
+            "2\n01:20:00,000 --> 01:21:00,000\n世界\n",
+        )
+
+    saved = plugin._save_from_zip(
+        zip_buffer.getvalue(),
+        video_path,
+        mediainfo=types.SimpleNamespace(runtime=100),
+    )
+
+    assert saved == tmp_path / "Movie.2024.1080p.WEB-DL-GRP.zh-CN.srt"
+    assert "01:20:00,000" in saved.read_text()
+
+
 def test_download_url_caches_failed_url(monkeypatch, tmp_path):
     """下载失败的字幕地址应短期缓存并跳过重复请求。"""
     module = _load_plugin_module(monkeypatch)
@@ -1193,7 +1312,7 @@ def test_download_assrt_limits_urls_per_candidate(monkeypatch, tmp_path):
 
     monkeypatch.setattr(plugin, "_assrt_get_res", lambda *_args, **_kwargs: DetailResponse())
 
-    def download_url(url, _video_path):
+    def download_url(url, _video_path, *_args):
         """记录实际尝试下载的地址。"""
         attempted_urls.append(url)
         return None
@@ -1236,7 +1355,7 @@ def test_download_assrt_deduplicates_repeated_file_urls(monkeypatch, tmp_path):
             }
 
     monkeypatch.setattr(plugin, "_assrt_get_res", lambda *_args, **_kwargs: DetailResponse())
-    monkeypatch.setattr(plugin, "_download_url", lambda url, _video_path: attempted_urls.append(url) or None)
+    monkeypatch.setattr(plugin, "_download_url", lambda url, _video_path, *_args: attempted_urls.append(url) or None)
 
     candidate = module.SubtitleCandidate(source="ASSRT", title="dup", raw={"id": "dup"})
 
@@ -1274,7 +1393,7 @@ def test_download_assrt_skips_unsupported_file_entries(monkeypatch, tmp_path):
             }
 
     monkeypatch.setattr(plugin, "_assrt_get_res", lambda *_args, **_kwargs: DetailResponse())
-    monkeypatch.setattr(plugin, "_download_url", lambda url, _video_path: attempted_urls.append(url) or None)
+    monkeypatch.setattr(plugin, "_download_url", lambda url, _video_path, *_args: attempted_urls.append(url) or None)
 
     candidate = module.SubtitleCandidate(source="ASSRT", title="mixed", raw={"id": "mixed"})
 
