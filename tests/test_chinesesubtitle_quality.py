@@ -187,6 +187,60 @@ def test_process_video_prefers_bilingual_candidate(monkeypatch, tmp_path):
     assert attempted == ["Movie.2024.中英双语"]
 
 
+def test_process_video_prunes_low_value_download_candidates(monkeypatch, tmp_path):
+    """下载阶段应只尝试排序后的高价值候选，避免低分候选拖慢扫描。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    plugin._max_candidates = 2
+    video_path = tmp_path / "Movie.2024.1080p.WEB-DL-GRP.mkv"
+    video_path.write_bytes(b"video")
+    attempted = []
+
+    def search_source(source, *_args):
+        """返回多个候选用于验证最终下载尝试数。"""
+        if source == "assrt":
+            return [
+                module.SubtitleCandidate(source="ASSRT", title="best", score=120),
+                module.SubtitleCandidate(source="ASSRT", title="second", score=100),
+                module.SubtitleCandidate(source="ASSRT", title="low", score=40),
+            ]
+        if source == "subdl":
+            return [module.SubtitleCandidate(source="SubDL", title="third", score=90)]
+        return []
+
+    def download_candidate(candidate, _video_path):
+        """记录实际尝试的候选。"""
+        attempted.append(candidate.title)
+        return None
+
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["assrt", "subdl"])
+    monkeypatch.setattr(plugin, "_download_assrt_season_episode", lambda *_args: None)
+    monkeypatch.setattr(plugin, "_search_source", search_source)
+    monkeypatch.setattr(plugin, "_download_candidate", download_candidate)
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+
+    assert not plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+    assert attempted == ["best", "second"]
+
+
+def test_downloadable_candidates_prunes_non_bilingual_when_bilingual_available(monkeypatch):
+    """已有双语候选时，低于双语质量线的普通候选不应进入下载尝试。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    candidates = [
+        module.SubtitleCandidate(source="ASSRT", title="Movie.2024.中英双语", score=80),
+        module.SubtitleCandidate(source="ASSRT", title="Movie.2024.简体中文", score=130),
+        module.SubtitleCandidate(source="SubDL", title="Movie.2024.高分纯中文", score=190),
+    ]
+
+    downloadable = plugin._downloadable_candidates(candidates)
+
+    assert [candidate.title for candidate in downloadable] == [
+        "Movie.2024.高分纯中文",
+        "Movie.2024.中英双语",
+    ]
+
+
 def test_process_video_reuses_scan_existing_subtitle_check(monkeypatch, tmp_path):
     """扫描阶段已检查已有字幕时处理函数不应重复读取字幕。"""
     module = _load_plugin_module(monkeypatch)
@@ -1091,3 +1145,49 @@ def test_download_assrt_deduplicates_repeated_file_urls(monkeypatch, tmp_path):
 
     assert plugin._download_assrt(candidate, video_path) is None
     assert attempted_urls == ["https://example.com/sub.srt"]
+
+
+def test_download_assrt_skips_unsupported_file_entries(monkeypatch, tmp_path):
+    """ASSRT 详情中的非文本字幕文件应按文件名和编码 URL 提前跳过。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.mkv"
+    video_path.write_bytes(b"video")
+    attempted_urls = []
+
+    class DetailResponse:
+        """测试用 ASSRT 详情响应。"""
+
+        status_code = 200
+
+        @staticmethod
+        def json():
+            """返回混合字幕文件详情。"""
+            return {
+                "status": 0,
+                "sub": {
+                    "subs": [{
+                        "filelist": [
+                            {"f": "Movie.2024.sup", "url": "https://example.com/no-suffix"},
+                            {"url": "https://example.com/Movie%2E2024%2Esup"},
+                            {"f": "Movie.2024.srt", "url": "https://example.com/Movie.2024.srt"},
+                        ],
+                    }],
+                },
+            }
+
+    monkeypatch.setattr(plugin, "_assrt_get_res", lambda *_args, **_kwargs: DetailResponse())
+    monkeypatch.setattr(plugin, "_download_url", lambda url, _video_path: attempted_urls.append(url) or None)
+
+    candidate = module.SubtitleCandidate(source="ASSRT", title="mixed", raw={"id": "mixed"})
+
+    assert plugin._download_assrt(candidate, video_path) is None
+    assert attempted_urls == ["https://example.com/Movie.2024.srt"]
+
+
+def test_unsupported_subtitle_url_suffix_decodes_encoded_extension(monkeypatch):
+    """编码后的不支持字幕后缀也应被识别。"""
+    module = _load_plugin_module(monkeypatch)
+
+    assert module.ChineseSubtitle._unsupported_subtitle_url_suffix("https://example.com/Movie%2E2024%2Esup")
+    assert not module.ChineseSubtitle._unsupported_subtitle_url_suffix("https://example.com/Movie%2E2024%2Esrt")

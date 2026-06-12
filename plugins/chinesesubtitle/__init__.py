@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from apscheduler.triggers.cron import CronTrigger
 
@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.31"
+    plugin_version = "1.2.32"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -113,6 +113,8 @@ class ChineseSubtitle(_PluginBase):
     _subtitle_download_max_bytes = 8 * 1024 * 1024
     _subtitle_download_deadline_extra_seconds = 2
     _bilingual_preference_score = 80
+    _candidate_download_score_floor = 70
+    _non_bilingual_keep_margin = 20
     _release_feature_match_score = 15
     _release_feature_mismatch_penalty = 12
     _release_group_match_score = 15
@@ -351,7 +353,7 @@ class ChineseSubtitle(_PluginBase):
                 all_candidates.extend(candidates[: self._max_candidates])
             except Exception as err:
                 logger.error(f"{source} 中文字幕处理失败：{err}", exc_info=True)
-        for candidate in self._rank_candidates(all_candidates):
+        for candidate in self._downloadable_candidates(all_candidates):
             effective_score = self._candidate_sort_score(candidate)
             logger.info(
                 f"尝试下载中文字幕候选：{video_path.name} - {candidate.source} - "
@@ -953,9 +955,7 @@ class ChineseSubtitle(_PluginBase):
             return []
         detail = details[0]
         file_urls = [f.get("url") for f in detail.get("filelist") or [] if f.get("url")]
-        supported_urls = self._unique_urls([
-            url for url in file_urls if not self._unsupported_subtitle_url_suffix(url)
-        ])
+        supported_urls = self._assrt_supported_file_urls(detail.get("filelist") or [])
         if not file_urls and detail.get("url") and not self._unsupported_subtitle_url_suffix(detail.get("url")):
             supported_urls.append(detail.get("url"))
         return supported_urls
@@ -1183,10 +1183,9 @@ class ChineseSubtitle(_PluginBase):
             logger.info(f"ASSRT 字幕详情无可下载文件，ID：{sub_id}")
             return None
         detail = details[0]
-        file_urls = [f.get("url") for f in detail.get("filelist") or [] if f.get("url")]
-        supported_file_urls = self._unique_urls([
-            url for url in file_urls if not self._unsupported_subtitle_url_suffix(url)
-        ])
+        file_entries = detail.get("filelist") or []
+        file_urls = [f.get("url") for f in file_entries if f.get("url")]
+        supported_file_urls = self._assrt_supported_file_urls(file_entries)
         if file_urls and not supported_file_urls:
             logger.info(f"ASSRT 字幕详情仅包含不支持的字幕文件，跳过候选，ID：{sub_id}")
             return None
@@ -1215,6 +1214,20 @@ class ChineseSubtitle(_PluginBase):
                 return saved
             logger.info(f"ASSRT 字幕文件下载未成功，ID：{sub_id}，地址：{self._safe_url_for_log(url)}")
         return None
+
+    def _assrt_supported_file_urls(self, file_entries: List[dict]) -> List[str]:
+        urls = []
+        for entry in file_entries:
+            url = entry.get("url")
+            if not url:
+                continue
+            file_name = entry.get("f") or entry.get("filename") or entry.get("name") or ""
+            if file_name and self._unsupported_subtitle_file_reference(file_name):
+                continue
+            if self._unsupported_subtitle_url_suffix(url):
+                continue
+            urls.append(url)
+        return self._unique_urls(urls)
 
     @staticmethod
     def _unique_urls(urls: List[str]) -> List[str]:
@@ -1446,8 +1459,13 @@ class ChineseSubtitle(_PluginBase):
 
     @staticmethod
     def _unsupported_subtitle_url_suffix(url: str) -> bool:
-        url_suffix = Path(urlparse(url or "").path).suffix.lower()
+        url_suffix = Path(unquote(urlparse(url or "").path)).suffix.lower()
         return bool(url_suffix and url_suffix != ".zip" and url_suffix not in settings.RMT_SUBEXT)
+
+    @staticmethod
+    def _unsupported_subtitle_file_reference(text: str) -> bool:
+        file_suffix = Path(unquote(urlparse(text or "").path or text or "")).suffix.lower()
+        return bool(file_suffix and file_suffix != ".zip" and file_suffix not in settings.RMT_SUBEXT)
 
     def _assrt_backoff_seconds(self, res) -> int:
         retry_after = (res.headers.get("Retry-After") or "").strip() if getattr(res, "headers", None) else ""
@@ -1557,6 +1575,37 @@ class ChineseSubtitle(_PluginBase):
             seen_keys.add(key)
             unique_candidates.append(candidate)
         return sorted(unique_candidates, key=self._candidate_sort_score, reverse=True)
+
+    def _downloadable_candidates(self, candidates: List[SubtitleCandidate]) -> List[SubtitleCandidate]:
+        ranked_candidates = self._rank_candidates(candidates)
+        if not ranked_candidates:
+            return []
+        top_score = self._candidate_sort_score(ranked_candidates[0])
+        bilingual_scores = [
+            self._candidate_sort_score(candidate)
+            for candidate in ranked_candidates
+            if self._looks_chinese_english_bilingual(self._candidate_bilingual_text(candidate))
+        ]
+        best_bilingual_score = max(bilingual_scores) if bilingual_scores else 0
+        downloadable = []
+        for candidate in ranked_candidates:
+            if not self._candidate_download_filter(candidate, top_score, best_bilingual_score):
+                continue
+            downloadable.append(candidate)
+            if len(downloadable) >= self._max_candidates:
+                break
+        return downloadable
+
+    def _candidate_download_filter(self, candidate: SubtitleCandidate, top_score: float,
+                                   best_bilingual_score: float = 0) -> bool:
+        score = self._candidate_sort_score(candidate)
+        if score < self._candidate_download_score_floor and score < top_score:
+            return False
+        if not self._prefer_bilingual or not best_bilingual_score:
+            return True
+        if self._looks_chinese_english_bilingual(self._candidate_bilingual_text(candidate)):
+            return True
+        return score >= best_bilingual_score + self._non_bilingual_keep_margin
 
     def _candidate_sort_score(self, candidate: SubtitleCandidate) -> float:
         return candidate.score + self._bilingual_sort_bonus(self._candidate_bilingual_text(candidate))
