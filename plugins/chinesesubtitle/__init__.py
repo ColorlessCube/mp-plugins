@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.33"
+    plugin_version = "1.2.34"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -103,8 +103,13 @@ class ChineseSubtitle(_PluginBase):
     _source_miss_cache_key = "source_miss_cache"
     _source_miss_cache_ttl = 24 * 3600
     _source_miss_cache_limit = 2000
+    _season_source_miss_cache_key = "season_source_miss_cache"
+    _season_source_miss_cache_limit = 2000
+    _season_source_miss_threshold = 3
     _video_scan_miss_cache_key = "video_scan_miss_cache"
     _video_scan_miss_cache_limit = 5000
+    _scan_cursor_cache_key = "scan_cursor_cache"
+    _scan_cursor_cache_limit = 200
     _nfo_mediainfo_cache_limit = 1000
     _download_failed_url_cache_key = "download_failed_url_cache"
     _download_failed_url_cache_ttl = 24 * 3600
@@ -260,11 +265,13 @@ class ChineseSubtitle(_PluginBase):
             if not scan_dir.exists() or not scan_dir.is_dir():
                 logger.warn(f"中文字幕扫描目录不存在或不是目录：{scan_dir}")
                 continue
-            for video_path in self._iter_video_files(scan_dir):
+            last_scanned_key = ""
+            for video_path in self._scan_video_files_from_cursor(scan_dir):
                 if attempted >= self._scan_limit:
                     logger.info(f"中文字幕目录扫描达到单次尝试上限：{self._scan_limit}")
                     limit_reached = True
                     break
+                last_scanned_key = self._scan_cursor_file_key(video_path)
                 video_key = self._video_identity_key(video_path)
                 if video_key and video_key in seen_video_keys:
                     duplicate_skipped += 1
@@ -295,6 +302,8 @@ class ChineseSubtitle(_PluginBase):
                     downloaded += 1
                 else:
                     self._record_video_scan_miss(video_path)
+            if last_scanned_key:
+                self._record_scan_cursor(scan_dir, last_scanned_key)
             if limit_reached:
                 break
         logger.info(
@@ -327,12 +336,16 @@ class ChineseSubtitle(_PluginBase):
                 if self._source_miss_cache_hit(source, video_path, mediainfo, meta):
                     logger.info(f"{source} 最近未命中过，跳过重复搜索：{video_path.name}")
                     continue
+                if self._season_source_miss_cache_hit(source, video_path, mediainfo, meta):
+                    logger.info(f"{source} 本季近期连续未命中，跳过重复搜索：{video_path.name}")
+                    continue
                 if not self._source_search_available(source):
                     continue
                 if source == "assrt":
                     saved = self._download_assrt_season_episode(video_path, mediainfo, meta)
                     if saved:
                         self._clear_source_miss(source, video_path, mediainfo, meta)
+                        self._clear_season_source_miss(source, video_path, mediainfo, meta)
                         logger.info(f"中文字幕下载完成：{saved}")
                         if self._notify:
                             self.systemmessage.put(
@@ -348,8 +361,10 @@ class ChineseSubtitle(_PluginBase):
                     logger.info(f"{source} 未找到匹配中文字幕：{video_path.name}")
                     if self._source_search_available(source):
                         self._record_source_miss(source, video_path, mediainfo, meta)
+                        self._record_season_source_miss(source, video_path, mediainfo, meta)
                     continue
                 self._clear_source_miss(source, video_path, mediainfo, meta)
+                self._clear_season_source_miss(source, video_path, mediainfo, meta)
                 all_candidates.extend(candidates[: self._max_candidates])
             except Exception as err:
                 logger.error(f"{source} 中文字幕处理失败：{err}", exc_info=True)
@@ -408,6 +423,59 @@ class ChineseSubtitle(_PluginBase):
                     and not ChineseSubtitle._is_bluray_stream_segment(item)
             ):
                 yield item
+
+    def _scan_video_files_from_cursor(self, scan_dir: Path) -> List[Path]:
+        files = self._scan_video_files(scan_dir)
+        if not files:
+            return []
+        cursor = self._scan_cursor_cache().get(self._scan_cursor_cache_entry_key(scan_dir), "")
+        if not cursor:
+            return files
+        file_keys = [self._scan_cursor_file_key(video_path) for video_path in files]
+        if cursor not in file_keys:
+            return files
+        cursor_index = file_keys.index(cursor)
+        return files[cursor_index + 1:] + files[:cursor_index + 1]
+
+    def _scan_video_files(self, scan_dir: Path) -> List[Path]:
+        return sorted(self._iter_video_files(scan_dir), key=self._scan_cursor_file_key)
+
+    def _record_scan_cursor(self, scan_dir: Path, file_key: str):
+        directory_key = self._scan_cursor_cache_entry_key(scan_dir)
+        if not directory_key or not file_key:
+            return
+        cache = self._scan_cursor_cache()
+        cache[directory_key] = file_key
+        if len(cache) > self._scan_cursor_cache_limit:
+            cache = dict(list(cache.items())[-self._scan_cursor_cache_limit:])
+        self.save_data(self._scan_cursor_cache_key, cache)
+
+    def _scan_cursor_cache(self) -> Dict[str, str]:
+        cache = self.get_data(self._scan_cursor_cache_key) or {}
+        if not isinstance(cache, dict):
+            return {}
+        cleaned = {
+            str(directory_key): str(file_key)
+            for directory_key, file_key in cache.items()
+            if directory_key and file_key
+        }
+        if len(cleaned) != len(cache):
+            self.save_data(self._scan_cursor_cache_key, cleaned)
+        return cleaned
+
+    @staticmethod
+    def _scan_cursor_cache_entry_key(scan_dir: Path) -> str:
+        try:
+            return str(scan_dir.resolve())
+        except Exception:
+            return str(scan_dir)
+
+    @staticmethod
+    def _scan_cursor_file_key(video_path: Path) -> str:
+        try:
+            return str(video_path.resolve())
+        except Exception:
+            return str(video_path)
 
     @staticmethod
     def _is_bluray_stream_segment(video_path: Path) -> bool:
@@ -710,6 +778,114 @@ class ChineseSubtitle(_PluginBase):
         if key in cache:
             cache.pop(key, None)
             self.save_data(self._source_miss_cache_key, cache)
+
+    def _season_source_miss_cache_hit(self, source: str, video_path: Path, mediainfo: Any, meta: Any) -> bool:
+        if not type(self)._scan_active:
+            return False
+        key = self._season_source_miss_cache_entry_key(source, video_path, mediainfo, meta)
+        if not key:
+            return False
+        entry = self._season_source_miss_cache().get(key) or {}
+        return int(entry.get("count") or 0) >= self._season_source_miss_threshold
+
+    def _record_season_source_miss(self, source: str, video_path: Path, mediainfo: Any, meta: Any):
+        if not type(self)._scan_active:
+            return
+        ttl = self._scan_miss_ttl_seconds()
+        key = self._season_source_miss_cache_entry_key(source, video_path, mediainfo, meta)
+        if ttl <= 0 or not key:
+            return
+        cache = self._season_source_miss_cache()
+        entry = cache.get(key) or {}
+        cache[key] = {
+            "count": int(entry.get("count") or 0) + 1,
+            "expires": time.time() + ttl,
+        }
+        if len(cache) > self._season_source_miss_cache_limit:
+            cache = dict(sorted(
+                cache.items(),
+                key=lambda item: float((item[1] or {}).get("expires") or 0),
+            )[-self._season_source_miss_cache_limit:])
+        self.save_data(self._season_source_miss_cache_key, cache)
+
+    def _clear_season_source_miss(self, source: str, video_path: Path, mediainfo: Any, meta: Any):
+        key = self._season_source_miss_cache_entry_key(source, video_path, mediainfo, meta)
+        if not key:
+            return
+        cache = self._season_source_miss_cache()
+        if key in cache:
+            cache.pop(key, None)
+            self.save_data(self._season_source_miss_cache_key, cache)
+
+    def _season_source_miss_cache(self) -> Dict[str, dict]:
+        ttl = self._scan_miss_ttl_seconds()
+        if ttl <= 0:
+            return {}
+        now = time.time()
+        cache = self.get_data(self._season_source_miss_cache_key) or {}
+        if not isinstance(cache, dict):
+            return {}
+        cleaned = {}
+        for key, entry in cache.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                count = int(entry.get("count") or 0)
+                expires_value = float(entry.get("expires") or 0)
+            except (TypeError, ValueError):
+                continue
+            if count > 0 and expires_value > now:
+                cleaned[str(key)] = {
+                    "count": count,
+                    "expires": expires_value,
+                }
+        if len(cleaned) != len(cache):
+            self.save_data(self._season_source_miss_cache_key, cleaned)
+        return cleaned
+
+    def _season_source_miss_cache_entry_key(self, source: str, video_path: Path, mediainfo: Any, meta: Any) -> str:
+        season, _ = self._season_episode_numbers(video_path, mediainfo, meta)
+        if not season:
+            return ""
+        if not self._is_tv(mediainfo, meta) and not self._season_episode_from_path(video_path):
+            return ""
+        series_title = self._season_source_miss_series_title(video_path, mediainfo, meta)
+        if not series_title:
+            return ""
+        imdb_id = str(getattr(mediainfo, "imdb_id", None) or "")
+        tmdb_id = str(getattr(mediainfo, "tmdb_id", None) or "")
+        option_key = self._season_source_miss_option_key(source)
+        return "|".join([
+            source,
+            series_title.lower(),
+            f"S{int(season):02d}",
+            imdb_id,
+            tmdb_id,
+            option_key,
+        ])
+
+    def _season_source_miss_series_title(self, video_path: Path, mediainfo: Any, meta: Any) -> str:
+        for title in (
+                self._series_title_from_filename(video_path),
+                self._series_title_from_path(video_path),
+                self._target_title(video_path, mediainfo, meta),
+        ):
+            title = self._clean_query_title(title or "")
+            if title and not self._is_generic_tv_title(title):
+                return title
+        return ""
+
+    def _season_source_miss_option_key(self, source: str) -> str:
+        source_languages = {
+            "opensubtitles": self._opensubtitles_languages,
+            "subdl": self._subdl_languages,
+        }.get(source, "")
+        return "|".join([
+            self._language_suffix or "",
+            str(bool(self._prefer_bilingual)),
+            str(bool(self._upgrade_existing_to_bilingual)),
+            source_languages or "",
+        ])
 
     def _source_miss_cache(self) -> Dict[str, float]:
         now = time.time()

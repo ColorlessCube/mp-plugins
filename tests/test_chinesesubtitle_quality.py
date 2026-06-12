@@ -774,6 +774,33 @@ def test_scan_library_logs_summary_after_limit(monkeypatch, tmp_path):
     assert any("中文字幕目录扫描完成" in message for message in logs)
 
 
+def test_scan_library_resumes_from_scan_cursor(monkeypatch, tmp_path):
+    """目录扫描达到单次上限后，下一轮应从上次游标之后继续。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    plugin._scan_limit = 2
+    for name in ("A.mkv", "B.mkv", "C.mkv"):
+        (tmp_path / name).write_bytes(b"video")
+    processed = []
+
+    def process_video(**kwargs):
+        """记录实际进入字幕搜索的视频。"""
+        processed.append(kwargs["video_path"].name)
+        return False
+
+    monkeypatch.setattr(plugin, "_scan_directories", lambda: [tmp_path])
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+    monkeypatch.setattr(plugin, "_mediainfo_from_local_nfo", lambda _video_path: None)
+    monkeypatch.setattr(plugin, "_video_scan_miss_cache_hit", lambda _video_path: False)
+    monkeypatch.setattr(plugin, "_record_video_scan_miss", lambda _video_path: None)
+    monkeypatch.setattr(plugin, "_process_video", process_video)
+
+    plugin._scan_library_locked()
+    plugin._scan_library_locked()
+
+    assert processed == ["A.mkv", "B.mkv", "C.mkv", "A.mkv"]
+
+
 def test_assrt_search_stops_after_scan_source_disabled(monkeypatch, tmp_path):
     """本轮 ASSRT 熔断后应停止后续查询变体。"""
     module = _load_plugin_module(monkeypatch)
@@ -908,6 +935,49 @@ def test_source_miss_cache_skips_repeated_source_search(monkeypatch, tmp_path):
     assert not plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
 
     assert searched_sources == ["subdl"]
+
+
+def test_season_source_miss_cache_skips_same_season_after_threshold(monkeypatch, tmp_path):
+    """扫描中同季同源连续未命中达到阈值后应跳过后续同季搜索。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_paths = []
+    for episode in range(1, 5):
+        video_path = tmp_path / f"Show - S01E{episode:02d}.mkv"
+        video_path.write_bytes(b"video")
+        video_paths.append(video_path)
+    mediainfo = types.SimpleNamespace(
+        type=module.MediaType.TV,
+        title="Show",
+        season=1,
+        imdb_id="tt1234567",
+        tmdb_id=12345,
+    )
+    searched_files = []
+
+    def search_source(source, video_path, *_args):
+        """记录实际搜索的视频并模拟未命中。"""
+        searched_files.append((source, video_path.name))
+        return []
+
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["subdl"])
+    monkeypatch.setattr(plugin, "_search_source", search_source)
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+    module.ChineseSubtitle._scan_active = True
+    module.ChineseSubtitle._scan_disabled_sources = set()
+
+    try:
+        for video_path in video_paths:
+            assert not plugin._process_video(video_path=video_path, mediainfo=mediainfo, meta=None, storage="local")
+    finally:
+        module.ChineseSubtitle._scan_active = False
+        module.ChineseSubtitle._scan_disabled_sources = set()
+
+    assert searched_files == [
+        ("subdl", "Show - S01E01.mkv"),
+        ("subdl", "Show - S01E02.mkv"),
+        ("subdl", "Show - S01E03.mkv"),
+    ]
 
 
 def test_video_scan_miss_key_ignores_scan_disabled_sources(monkeypatch, tmp_path):
