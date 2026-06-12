@@ -300,6 +300,67 @@ def test_assrt_backoff_skips_without_sleeping(monkeypatch):
         module.ChineseSubtitle._assrt_backoff_until = 0
 
 
+def test_assrt_509_disables_source_for_current_scan(monkeypatch):
+    """ASSRT 触发 509 后应暂停本轮目录扫描中的 ASSRT。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+
+    class FakeResponse:
+        """测试用 ASSRT 509 响应。"""
+
+        status_code = 509
+        headers = {}
+
+    class FakeRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **_kwargs):
+            """忽略请求参数。"""
+
+        @staticmethod
+        def get_res(_url, params=None):
+            """返回流控响应。"""
+            return FakeResponse()
+
+    monkeypatch.setattr(module, "RequestUtils", FakeRequestUtils)
+    module.ChineseSubtitle._scan_active = True
+    module.ChineseSubtitle._scan_disabled_sources = set()
+    module.ChineseSubtitle._assrt_backoff_until = 0
+    module.ChineseSubtitle._assrt_last_request_time = 0
+
+    try:
+        assert plugin._assrt_get_res("https://api.assrt.net/v1/sub/search", params={}).status_code == 509
+        assert "assrt" in module.ChineseSubtitle._scan_disabled_sources
+        assert "assrt" not in plugin._enabled_sources()
+    finally:
+        module.ChineseSubtitle._scan_active = False
+        module.ChineseSubtitle._scan_disabled_sources = set()
+        module.ChineseSubtitle._assrt_backoff_until = 0
+
+
+def test_source_miss_cache_skips_repeated_source_search(monkeypatch, tmp_path):
+    """源级未命中缓存应跳过短期内重复搜索。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    searched_sources = []
+
+    def search_source(source, *_args):
+        """记录实际搜索的字幕源。"""
+        searched_sources.append(source)
+        return []
+
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["subdl"])
+    monkeypatch.setattr(plugin, "_search_source", search_source)
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+
+    assert not plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+    assert not plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+
+    assert searched_sources == ["subdl"]
+
+
 def test_save_from_zip_skips_invalid_members(monkeypatch, tmp_path):
     """压缩包保存时应跳过无效字幕成员。"""
     module = _load_plugin_module(monkeypatch)

@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 from apscheduler.triggers.cron import CronTrigger
@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.17"
+    plugin_version = "1.2.18"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -83,6 +83,8 @@ class ChineseSubtitle(_PluginBase):
     _assrt_request_lock = threading.Lock()
     _subtitle_task_lock = threading.RLock()
     _assrt_season_cache: Dict[str, List[str]] = {}
+    _scan_active: bool = False
+    _scan_disabled_sources: Set[str] = set()
 
     _sources = {
         "assrt": "_assrt_token",
@@ -90,6 +92,9 @@ class ChineseSubtitle(_PluginBase):
         "subdl": "_subdl_api_key",
     }
     _opensubtitles_quota_key = "opensubtitles_download_quota"
+    _source_miss_cache_key = "source_miss_cache"
+    _source_miss_cache_ttl = 24 * 3600
+    _source_miss_cache_limit = 2000
 
     def init_plugin(self, config: dict = None):
         """初始化插件配置。"""
@@ -196,30 +201,40 @@ class ChineseSubtitle(_PluginBase):
         with type(self)._subtitle_task_lock:
             if not self._enable or not self._scan_enable:
                 return
-            scan_dirs = self._scan_directories()
-            if not scan_dirs:
-                logger.warn("中文字幕目录扫描未配置扫描目录")
-                return
-            attempted = 0
-            downloaded = 0
-            missing = 0
-            logger.info(f"开始扫描缺失中文字幕视频，目录数：{len(scan_dirs)}")
-            for scan_dir in scan_dirs:
-                if not scan_dir.exists() or not scan_dir.is_dir():
-                    logger.warn(f"中文字幕扫描目录不存在或不是目录：{scan_dir}")
+            cls = type(self)
+            cls._scan_active = True
+            cls._scan_disabled_sources = set()
+            try:
+                self._scan_library_locked()
+            finally:
+                cls._scan_active = False
+                cls._scan_disabled_sources = set()
+
+    def _scan_library_locked(self):
+        scan_dirs = self._scan_directories()
+        if not scan_dirs:
+            logger.warn("中文字幕目录扫描未配置扫描目录")
+            return
+        attempted = 0
+        downloaded = 0
+        missing = 0
+        logger.info(f"开始扫描缺失中文字幕视频，目录数：{len(scan_dirs)}")
+        for scan_dir in scan_dirs:
+            if not scan_dir.exists() or not scan_dir.is_dir():
+                logger.warn(f"中文字幕扫描目录不存在或不是目录：{scan_dir}")
+                continue
+            for video_path in self._iter_video_files(scan_dir):
+                if attempted >= self._scan_limit:
+                    logger.info(f"中文字幕目录扫描达到单次尝试上限：{self._scan_limit}")
+                    return
+                if self._has_existing_subtitle(video_path):
                     continue
-                for video_path in self._iter_video_files(scan_dir):
-                    if attempted >= self._scan_limit:
-                        logger.info(f"中文字幕目录扫描达到单次尝试上限：{self._scan_limit}")
-                        return
-                    if self._has_existing_subtitle(video_path):
-                        continue
-                    missing += 1
-                    attempted += 1
-                    mediainfo = self._mediainfo_from_local_nfo(video_path)
-                    if self._process_video(video_path=video_path, mediainfo=mediainfo, meta=None, storage="local"):
-                        downloaded += 1
-            logger.info(f"中文字幕目录扫描完成，发现缺字幕视频 {missing} 个，尝试 {attempted} 个，成功下载 {downloaded} 个")
+                missing += 1
+                attempted += 1
+                mediainfo = self._mediainfo_from_local_nfo(video_path)
+                if self._process_video(video_path=video_path, mediainfo=mediainfo, meta=None, storage="local"):
+                    downloaded += 1
+        logger.info(f"中文字幕目录扫描完成，发现缺字幕视频 {missing} 个，尝试 {attempted} 个，成功下载 {downloaded} 个")
 
     def _process_video(self, video_path: Optional[Path], mediainfo: Any = None,
                        meta: Any = None, storage: str = "local") -> bool:
@@ -241,9 +256,15 @@ class ChineseSubtitle(_PluginBase):
         all_candidates = []
         for source in self._enabled_sources():
             try:
+                if self._source_miss_cache_hit(source, video_path, mediainfo, meta):
+                    logger.info(f"{source} 最近未命中过，跳过重复搜索：{video_path.name}")
+                    continue
+                if not self._source_search_available(source):
+                    continue
                 if source == "assrt":
                     saved = self._download_assrt_season_episode(video_path, mediainfo, meta)
                     if saved:
+                        self._clear_source_miss(source, video_path, mediainfo, meta)
                         logger.info(f"中文字幕下载完成：{saved}")
                         if self._notify:
                             self.systemmessage.put(
@@ -252,10 +273,15 @@ class ChineseSubtitle(_PluginBase):
                                 role="plugin",
                             )
                         return True
+                    if not self._source_search_available(source):
+                        continue
                 candidates = self._search_source(source, video_path, mediainfo, meta)
                 if not candidates:
                     logger.info(f"{source} 未找到匹配中文字幕：{video_path.name}")
+                    if self._source_search_available(source):
+                        self._record_source_miss(source, video_path, mediainfo, meta)
                     continue
+                self._clear_source_miss(source, video_path, mediainfo, meta)
                 all_candidates.extend(candidates[: self._max_candidates])
             except Exception as err:
                 logger.error(f"{source} 中文字幕处理失败：{err}", exc_info=True)
@@ -513,9 +539,74 @@ class ChineseSubtitle(_PluginBase):
             token_attr = self._sources.get(source)
             if not token_attr or source in sources:
                 continue
+            if source in type(self)._scan_disabled_sources:
+                continue
             if getattr(self, token_attr, None):
                 sources.append(source)
         return sources
+
+    def _source_search_available(self, source: str) -> bool:
+        if source in type(self)._scan_disabled_sources:
+            return False
+        if source == "assrt" and type(self)._assrt_backoff_until > time.time():
+            self._disable_source_for_scan("assrt", "流控冷却期未结束")
+            return False
+        if source == "opensubtitles" and self._opensubtitles_download_quota_exhausted():
+            return False
+        return True
+
+    def _disable_source_for_scan(self, source: str, reason: str):
+        cls = type(self)
+        if not cls._scan_active or source in cls._scan_disabled_sources:
+            return
+        cls._scan_disabled_sources.add(source)
+        logger.warn(f"{source} 本轮目录扫描已暂停：{reason}")
+
+    def _source_miss_cache_hit(self, source: str, video_path: Path, mediainfo: Any, meta: Any) -> bool:
+        cache = self._source_miss_cache()
+        key = self._source_miss_cache_entry_key(source, video_path, mediainfo, meta)
+        return key in cache and cache[key] > time.time()
+
+    def _record_source_miss(self, source: str, video_path: Path, mediainfo: Any, meta: Any):
+        cache = self._source_miss_cache()
+        key = self._source_miss_cache_entry_key(source, video_path, mediainfo, meta)
+        cache[key] = time.time() + self._source_miss_cache_ttl
+        if len(cache) > self._source_miss_cache_limit:
+            cache = dict(sorted(cache.items(), key=lambda item: item[1])[-self._source_miss_cache_limit:])
+        self.save_data(self._source_miss_cache_key, cache)
+
+    def _clear_source_miss(self, source: str, video_path: Path, mediainfo: Any, meta: Any):
+        cache = self._source_miss_cache()
+        key = self._source_miss_cache_entry_key(source, video_path, mediainfo, meta)
+        if key in cache:
+            cache.pop(key, None)
+            self.save_data(self._source_miss_cache_key, cache)
+
+    def _source_miss_cache(self) -> Dict[str, float]:
+        now = time.time()
+        cache = self.get_data(self._source_miss_cache_key) or {}
+        if not isinstance(cache, dict):
+            return {}
+        cleaned = {}
+        for key, expires_at in cache.items():
+            try:
+                expires_value = float(expires_at)
+            except (TypeError, ValueError):
+                continue
+            if expires_value > now:
+                cleaned[str(key)] = expires_value
+        if len(cleaned) != len(cache):
+            self.save_data(self._source_miss_cache_key, cleaned)
+        return cleaned
+
+    def _source_miss_cache_entry_key(self, source: str, video_path: Path, mediainfo: Any, meta: Any) -> str:
+        try:
+            path_key = str(video_path.resolve())
+        except Exception:
+            path_key = str(video_path)
+        season_episode = self._season_episode_from_path(video_path) or self._season_episode_from_meta(mediainfo, meta)
+        title = self._target_title(video_path, mediainfo, meta)
+        return "|".join([source, path_key, title or "", season_episode or ""])
 
     def _search_source(self, source: str, video_path: Path, mediainfo: Any, meta: Any) -> List[SubtitleCandidate]:
         if source == "assrt":
@@ -946,6 +1037,7 @@ class ChineseSubtitle(_PluginBase):
             if res is not None and res.status_code == 509:
                 backoff_seconds = self._assrt_backoff_seconds(res)
                 cls._assrt_backoff_until = time.time() + backoff_seconds
+                self._disable_source_for_scan("assrt", f"触发 509 流控，冷却 {backoff_seconds} 秒")
                 logger.warn(f"ASSRT 触发流控 509，暂停请求 {backoff_seconds} 秒")
             return res
 
