@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.18"
+    plugin_version = "1.2.19"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -82,6 +82,7 @@ class ChineseSubtitle(_PluginBase):
     _assrt_backoff_until: float = 0
     _assrt_request_lock = threading.Lock()
     _subtitle_task_lock = threading.RLock()
+    _scan_task_lock = threading.Lock()
     _assrt_season_cache: Dict[str, List[str]] = {}
     _scan_active: bool = False
     _scan_disabled_sources: Set[str] = set()
@@ -198,17 +199,23 @@ class ChineseSubtitle(_PluginBase):
 
     def scan_library(self):
         """扫描媒体库中缺少中文字幕的视频。"""
-        with type(self)._subtitle_task_lock:
-            if not self._enable or not self._scan_enable:
-                return
-            cls = type(self)
-            cls._scan_active = True
-            cls._scan_disabled_sources = set()
-            try:
-                self._scan_library_locked()
-            finally:
-                cls._scan_active = False
+        cls = type(self)
+        if not cls._scan_task_lock.acquire(blocking=False):
+            logger.warn("中文字幕目录扫描仍在运行，跳过本次重复触发")
+            return
+        try:
+            with cls._subtitle_task_lock:
+                if not self._enable or not self._scan_enable:
+                    return
+                cls._scan_active = True
                 cls._scan_disabled_sources = set()
+                try:
+                    self._scan_library_locked()
+                finally:
+                    cls._scan_active = False
+                    cls._scan_disabled_sources = set()
+        finally:
+            cls._scan_task_lock.release()
 
     def _scan_library_locked(self):
         scan_dirs = self._scan_directories()
@@ -622,6 +629,8 @@ class ChineseSubtitle(_PluginBase):
         target_year = self._target_year(video_path, mediainfo, meta)
         target_resolution = self._target_resolution(video_path)
         for query in self._assrt_queries(video_path, mediainfo, meta):
+            if not self._source_search_available("assrt"):
+                break
             candidates = self._search_assrt_by_query(
                 video_path=video_path,
                 target_title=target_title,
@@ -663,6 +672,8 @@ class ChineseSubtitle(_PluginBase):
         target_resolution = self._target_resolution(video_path)
         _, episode = self._season_episode_numbers(video_path, mediainfo, meta)
         for query in self._assrt_season_queries(video_path, mediainfo, meta, season):
+            if not self._source_search_available("assrt"):
+                break
             candidates = self._search_assrt_by_query(
                 video_path=video_path,
                 target_title=target_title,
@@ -1032,6 +1043,12 @@ class ChineseSubtitle(_PluginBase):
             if interval_wait > 0:
                 logger.info(f"ASSRT 请求节流等待 {interval_wait:.1f} 秒")
                 time.sleep(interval_wait)
+                if "assrt" in cls._scan_disabled_sources:
+                    return None
+                backoff_wait = cls._assrt_backoff_until - time.time()
+                if backoff_wait > 0:
+                    logger.info(f"ASSRT 处于流控冷却期，跳过请求，剩余 {backoff_wait:.1f} 秒")
+                    return None
             res = RequestUtils(timeout=self._timeout).get_res(url, params=params)
             cls._assrt_last_request_time = time.time()
             if res is not None and res.status_code == 509:

@@ -338,6 +338,86 @@ def test_assrt_509_disables_source_for_current_scan(monkeypatch):
         module.ChineseSubtitle._assrt_backoff_until = 0
 
 
+def test_scan_library_skips_duplicate_trigger(monkeypatch):
+    """目录扫描重复触发时应快速跳过。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    plugin._scan_enable = True
+
+    def fail_scan():
+        """重复触发时不应进入实际扫描。"""
+        raise AssertionError("duplicate scan should be skipped")
+
+    monkeypatch.setattr(plugin, "_scan_library_locked", fail_scan)
+    module.ChineseSubtitle._scan_task_lock.acquire()
+    try:
+        plugin.scan_library()
+    finally:
+        module.ChineseSubtitle._scan_task_lock.release()
+
+
+def test_assrt_search_stops_after_scan_source_disabled(monkeypatch, tmp_path):
+    """本轮 ASSRT 熔断后应停止后续查询变体。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "棋士 - S01E02 - 第2集.mkv"
+    video_path.write_bytes(b"video")
+    searched_queries = []
+
+    def search_by_query(**kwargs):
+        """记录查询并模拟首次查询触发本轮熔断。"""
+        searched_queries.append(kwargs["query"])
+        plugin._disable_source_for_scan("assrt", "测试熔断")
+        return []
+
+    monkeypatch.setattr(plugin, "_assrt_queries", lambda *_args: ["棋士 S01E02", "棋士 E02"])
+    monkeypatch.setattr(plugin, "_search_assrt_by_query", search_by_query)
+    module.ChineseSubtitle._scan_active = True
+    module.ChineseSubtitle._scan_disabled_sources = set()
+    module.ChineseSubtitle._assrt_backoff_until = 0
+
+    try:
+        assert plugin._search_assrt(video_path, mediainfo=None, meta=None) == []
+    finally:
+        module.ChineseSubtitle._scan_active = False
+        module.ChineseSubtitle._scan_disabled_sources = set()
+
+    assert searched_queries == ["棋士 S01E02"]
+
+
+def test_assrt_interval_wait_rechecks_backoff_before_request(monkeypatch):
+    """ASSRT 节流等待后应复查冷却状态再决定是否请求。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    plugin._assrt_interval = 10
+
+    class FakeRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **_kwargs):
+            """忽略请求参数。"""
+
+        @staticmethod
+        def get_res(_url, params=None):
+            """等待后进入冷却期时不应发起请求。"""
+            raise AssertionError("request should not be sent after backoff starts")
+
+    def start_backoff(_seconds):
+        """模拟等待期间其他路径设置了 ASSRT 冷却。"""
+        module.ChineseSubtitle._assrt_backoff_until = module.time.time() + 60
+
+    monkeypatch.setattr(module, "RequestUtils", FakeRequestUtils)
+    monkeypatch.setattr(module.time, "sleep", start_backoff)
+    module.ChineseSubtitle._assrt_backoff_until = 0
+    module.ChineseSubtitle._assrt_last_request_time = module.time.time()
+
+    try:
+        assert plugin._assrt_get_res("https://api.assrt.net/v1/sub/search", params={}) is None
+    finally:
+        module.ChineseSubtitle._assrt_backoff_until = 0
+        module.ChineseSubtitle._assrt_last_request_time = 0
+
+
 def test_source_miss_cache_skips_repeated_source_search(monkeypatch, tmp_path):
     """源级未命中缓存应跳过短期内重复搜索。"""
     module = _load_plugin_module(monkeypatch)
