@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.25"
+    plugin_version = "1.2.26"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -59,6 +59,8 @@ class ChineseSubtitle(_PluginBase):
     _language_suffix: str = ".zh-CN"
     _timeout: int = 20
     _source_order: str = "assrt,opensubtitles,subdl"
+    _prefer_bilingual: bool = True
+    _upgrade_existing_to_bilingual: bool = True
     _max_candidates: int = 5
     _scan_enable: bool = False
     _scan_system_library_dirs: bool = True
@@ -98,6 +100,10 @@ class ChineseSubtitle(_PluginBase):
     _source_miss_cache_ttl = 24 * 3600
     _source_miss_cache_limit = 2000
     _bilingual_preference_score = 80
+    _release_feature_match_score = 15
+    _release_feature_mismatch_penalty = 12
+    _release_group_match_score = 15
+    _release_group_mismatch_penalty = 5
 
     def init_plugin(self, config: dict = None):
         """初始化插件配置。"""
@@ -108,6 +114,8 @@ class ChineseSubtitle(_PluginBase):
         self._language_suffix = (config.get("language_suffix") or ".zh-CN").strip()
         self._timeout = self._config_int(config.get("timeout"), 20, minimum=1)
         self._source_order = (config.get("source_order") or "assrt,opensubtitles,subdl").strip()
+        self._prefer_bilingual = config.get("prefer_bilingual", True)
+        self._upgrade_existing_to_bilingual = config.get("upgrade_existing_to_bilingual", True)
         self._max_candidates = self._config_int(config.get("max_candidates"), 5, minimum=1)
         self._scan_enable = config.get("scan_enable", False)
         self._scan_system_library_dirs = config.get("scan_system_library_dirs", True)
@@ -658,6 +666,7 @@ class ChineseSubtitle(_PluginBase):
         target_title = self._target_title(video_path, mediainfo, meta)
         target_year = self._target_year(video_path, mediainfo, meta)
         target_resolution = self._target_resolution(video_path)
+        target_release_text = video_path.name
         for query in self._assrt_queries(video_path, mediainfo, meta):
             if not self._source_search_available("assrt"):
                 break
@@ -666,6 +675,7 @@ class ChineseSubtitle(_PluginBase):
                 target_title=target_title,
                 target_year=target_year,
                 target_resolution=target_resolution,
+                target_release_text=target_release_text,
                 query=query,
             )
             if candidates:
@@ -700,6 +710,7 @@ class ChineseSubtitle(_PluginBase):
         target_title = self._target_title(video_path, mediainfo, meta)
         target_year = self._target_year(video_path, mediainfo, meta)
         target_resolution = self._target_resolution(video_path)
+        target_release_text = video_path.name
         _, episode = self._season_episode_numbers(video_path, mediainfo, meta)
         for query in self._assrt_season_queries(video_path, mediainfo, meta, season):
             if not self._source_search_available("assrt"):
@@ -709,6 +720,7 @@ class ChineseSubtitle(_PluginBase):
                 target_title=target_title,
                 target_year=target_year,
                 target_resolution=target_resolution,
+                target_release_text=target_release_text,
                 query=query,
                 filelist=True,
             )
@@ -747,7 +759,8 @@ class ChineseSubtitle(_PluginBase):
         return supported_urls
 
     def _search_assrt_by_query(self, video_path: Path, target_title: str, target_year: str,
-                               target_resolution: str, query: str, filelist: bool = False) -> List[SubtitleCandidate]:
+                               target_resolution: str, target_release_text: str,
+                               query: str, filelist: bool = False) -> List[SubtitleCandidate]:
         seen_ids = set()
         params = {
             "token": self._assrt_token,
@@ -783,6 +796,7 @@ class ChineseSubtitle(_PluginBase):
                 target_title=target_title,
                 target_year=target_year,
                 target_resolution=target_resolution,
+                target_release_text=target_release_text,
                 query=query,
                 match_text=match_text,
             )
@@ -875,6 +889,7 @@ class ChineseSubtitle(_PluginBase):
             if self._is_low_quality_subtitle_metadata(title_text):
                 continue
             score = self._release_match_score(video_path.name, file_info.get("file_name"))
+            score += self._release_feature_score(video_path.name, title_text)
             score += min(float(attrs.get("download_count") or 0), 5000) / 100
             score += float(attrs.get("ratings") or 0) * 10
             candidates.append(SubtitleCandidate(
@@ -927,6 +942,7 @@ class ChineseSubtitle(_PluginBase):
             if item.get("hi") or self._is_low_quality_subtitle_metadata(release):
                 continue
             score = self._release_match_score(video_path.name, release)
+            score += self._release_feature_score(video_path.name, release)
             candidates.append(SubtitleCandidate(
                 source="SubDL",
                 title=release or download_url,
@@ -1154,7 +1170,8 @@ class ChineseSubtitle(_PluginBase):
                 members,
                 key=lambda m: (
                     self._release_match_score(video_path.name, Path(m.filename).name)
-                    + self._bilingual_preference_bonus(Path(m.filename).name)
+                    + self._release_feature_score(video_path.name, Path(m.filename).name)
+                    + self._bilingual_sort_bonus(Path(m.filename).name)
                 ),
                 reverse=True,
             )
@@ -1181,6 +1198,9 @@ class ChineseSubtitle(_PluginBase):
         if not subtitle_path:
             return False
         if self._valid_existing_subtitle(subtitle_path):
+            if self._should_upgrade_existing_subtitle(subtitle_path):
+                logger.info(f"已有中文字幕非双语，继续搜索中英双语字幕：{subtitle_path}")
+                return False
             return True
         logger.warn(f"已有中文字幕无效，重新搜索：{subtitle_path}")
         return False
@@ -1200,6 +1220,17 @@ class ChineseSubtitle(_PluginBase):
             return self._valid_chinese_subtitle_content(subtitle_path.read_bytes(), suffix)
         except Exception as err:
             logger.warn(f"读取已有中文字幕失败：{subtitle_path} - {err}")
+            return False
+
+    def _should_upgrade_existing_subtitle(self, subtitle_path: Path) -> bool:
+        if not self._prefer_bilingual or not self._upgrade_existing_to_bilingual:
+            return False
+        if self._looks_chinese_english_bilingual(subtitle_path.name):
+            return False
+        try:
+            return not self._bilingual_subtitle_content(subtitle_path.read_bytes())
+        except Exception as err:
+            logger.warn(f"检查已有字幕双语内容失败：{subtitle_path} - {err}")
             return False
 
     @staticmethod
@@ -1234,7 +1265,7 @@ class ChineseSubtitle(_PluginBase):
         return sorted(unique_candidates, key=self._candidate_sort_score, reverse=True)
 
     def _candidate_sort_score(self, candidate: SubtitleCandidate) -> float:
-        return candidate.score + self._bilingual_preference_bonus(self._candidate_bilingual_text(candidate))
+        return candidate.score + self._bilingual_sort_bonus(self._candidate_bilingual_text(candidate))
 
     @staticmethod
     def _candidate_bilingual_text(candidate: SubtitleCandidate) -> str:
@@ -1259,6 +1290,11 @@ class ChineseSubtitle(_PluginBase):
     @classmethod
     def _bilingual_preference_bonus(cls, text: str) -> int:
         return cls._bilingual_preference_score if cls._looks_chinese_english_bilingual(text) else 0
+
+    def _bilingual_sort_bonus(self, text: str) -> int:
+        if not self._prefer_bilingual:
+            return 0
+        return self._bilingual_preference_bonus(text)
 
     @staticmethod
     def _looks_chinese_english_bilingual(text: str) -> bool:
@@ -1376,7 +1412,7 @@ class ChineseSubtitle(_PluginBase):
         return Path(urlparse(url or "").path).name
 
     def _assrt_candidate_score(self, target_title: str, target_year: str, target_resolution: str,
-                               query: str, match_text: str) -> Optional[float]:
+                               target_release_text: str, query: str, match_text: str) -> Optional[float]:
         if self._short_chinese_title_embedded_in_long_phrase(target_title, match_text):
             return None
         title_score = max(
@@ -1402,7 +1438,8 @@ class ChineseSubtitle(_PluginBase):
                 resolution_score = 20
 
         year_score = 20 if target_year and self._year_matches(target_year, candidate_years) else 0
-        return title_score + year_score + resolution_score
+        release_feature_score = self._release_feature_score(target_release_text, match_text)
+        return title_score + year_score + resolution_score + release_feature_score
 
     @classmethod
     def _short_chinese_title_embedded_in_long_phrase(cls, target_title: str, match_text: str) -> bool:
@@ -1556,6 +1593,107 @@ class ChineseSubtitle(_PluginBase):
             return ""
         return f"S{int(season):02d}E{int(episode):02d}"
 
+    def _release_feature_score(self, video_name: str, release_name: Optional[str]) -> float:
+        if not release_name:
+            return 0
+        video_features = self._release_features(video_name)
+        release_features = self._release_features(release_name)
+        score = 0
+        for feature_name in ("resolution", "source", "hdr", "codec", "audio", "fps"):
+            video_values = video_features.get(feature_name) or set()
+            release_values = release_features.get(feature_name) or set()
+            if not video_values or not release_values:
+                continue
+            if video_values & release_values:
+                score += self._release_feature_match_score
+            else:
+                score -= self._release_feature_mismatch_penalty
+        video_groups = video_features.get("group") or set()
+        release_groups = release_features.get("group") or set()
+        if video_groups and release_groups:
+            if video_groups & release_groups:
+                score += self._release_group_match_score
+            else:
+                score -= self._release_group_mismatch_penalty
+        return score
+
+    @classmethod
+    def _release_features(cls, text: str) -> Dict[str, Set[str]]:
+        normalized = cls._normalized_release_text(text)
+        features: Dict[str, Set[str]] = {
+            "resolution": set(),
+            "source": set(),
+            "hdr": set(),
+            "codec": set(),
+            "audio": set(),
+            "fps": set(),
+            "group": set(),
+        }
+        for resolution in re.findall(r"\b(720p|1080p|2160p|4k|8k)\b", normalized, re.IGNORECASE):
+            features["resolution"].add(cls._normalize_resolution(resolution))
+        source_patterns = {
+            "webdl": r"\bweb\s*dl\b",
+            "webrip": r"\bweb\s*rip\b",
+            "bluray": r"\bblu\s*ray\b|\bbluray\b|\bbd\s*rip\b|\bbr\s*rip\b",
+            "hdtv": r"\bhdtv\b",
+            "remux": r"\bremux\b",
+        }
+        for source, pattern in source_patterns.items():
+            if re.search(pattern, normalized, re.IGNORECASE):
+                features["source"].add(source)
+        hdr_patterns = {
+            "hdr": r"\bhdr(?:10(?:plus|\+)?)?\b",
+            "dv": r"\bdv\b|\bdolby\s*vision\b",
+        }
+        for hdr, pattern in hdr_patterns.items():
+            if re.search(pattern, normalized, re.IGNORECASE):
+                features["hdr"].add(hdr)
+        codec_patterns = {
+            "x264": r"\bx264\b|\bh\.?264\b|\bavc\b",
+            "x265": r"\bx265\b|\bh\.?265\b|\bhevc\b",
+        }
+        for codec, pattern in codec_patterns.items():
+            if re.search(pattern, normalized, re.IGNORECASE):
+                features["codec"].add(codec)
+        audio_patterns = {
+            "aac": r"\baac\b",
+            "ac3": r"\bac3\b|\beac3\b|\bddp?\s*5?\.?1?\b",
+            "dts": r"\bdts\b",
+            "truehd": r"\btruehd\b",
+            "atmos": r"\batmos\b",
+        }
+        for audio, pattern in audio_patterns.items():
+            if re.search(pattern, normalized, re.IGNORECASE):
+                features["audio"].add(audio)
+        for fps in re.findall(r"\b(23\.976|24|25|29\.970|30|50|60)\s*fps\b", normalized, re.IGNORECASE):
+            features["fps"].add(fps)
+        release_group = cls._release_group(text)
+        if release_group:
+            features["group"].add(release_group)
+        return features
+
+    @staticmethod
+    def _normalized_release_text(text: str) -> str:
+        text = Path(text or "").name
+        text = re.sub(r"[_+.]+", " ", text)
+        text = re.sub(r"[-]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip().lower()
+
+    @staticmethod
+    def _release_group(text: str) -> str:
+        stem = Path(text or "").name
+        stem = re.sub(r"\.(mkv|mp4|avi|mov|wmv|m2ts|ts|srt|ass|ssa|zip)$", "", stem, flags=re.IGNORECASE)
+        match = re.search(r"[-. ]([A-Za-z0-9]{2,20})$", stem)
+        if not match:
+            return ""
+        group = match.group(1).lower()
+        if group in {
+            "webdl", "webrip", "bluray", "bdrip", "brrip", "hdtv", "remux",
+            "x264", "x265", "h264", "h265", "hevc", "aac", "dts", "truehd",
+        }:
+            return ""
+        return group
+
     @staticmethod
     def _release_match_score(video_name: str, release_name: Optional[str]) -> float:
         if not release_name:
@@ -1635,6 +1773,17 @@ class ChineseSubtitle(_PluginBase):
             return False
         text = cls._decode_subtitle_text(content[:200000])
         return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+    @classmethod
+    def _bilingual_subtitle_content(cls, content: bytes) -> bool:
+        text = cls._decode_subtitle_text(content[:200000])
+        if not text or not re.search(r"[\u4e00-\u9fff]", text):
+            return False
+        dialogue_lines = [
+            line for line in text.splitlines()
+            if re.search(r"[\u4e00-\u9fff]", line) and re.search(r"[A-Za-z]{2,}", line)
+        ]
+        return len(dialogue_lines) >= 2 or cls._looks_chinese_english_bilingual(text[:2000])
 
     @staticmethod
     def _decode_subtitle_text(content: bytes) -> str:
@@ -1749,9 +1898,11 @@ class ChineseSubtitle(_PluginBase):
                     col(field("language_suffix", "字幕文件语言后缀"), md=3),
                 ),
                 row(
-                    col(field("source_order", "字幕源顺序", placeholder="assrt,opensubtitles,subdl"), md=6),
-                    col(field("max_candidates", "每源尝试数量", type="number"), md=3),
-                    col(field("timeout", "请求超时秒数", type="number"), md=3),
+                    col(field("source_order", "字幕源顺序", placeholder="assrt,opensubtitles,subdl"), md=4),
+                    col(field("max_candidates", "每源尝试数量", type="number"), md=2),
+                    col(field("timeout", "请求超时秒数", type="number"), md=2),
+                    col(switch("prefer_bilingual", "优先中英双语"), md=2),
+                    col(switch("upgrade_existing_to_bilingual", "纯中文字幕升级双语"), md=2),
                 ),
                 row(
                     col(switch("scan_enable", "启用目录扫描"), md=3),
@@ -1790,6 +1941,8 @@ class ChineseSubtitle(_PluginBase):
             "notify": False,
             "language_suffix": ".zh-CN",
             "source_order": "assrt,opensubtitles,subdl",
+            "prefer_bilingual": True,
+            "upgrade_existing_to_bilingual": True,
             "max_candidates": 5,
             "timeout": 20,
             "scan_enable": False,

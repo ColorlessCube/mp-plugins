@@ -186,6 +186,41 @@ def test_process_video_prefers_bilingual_candidate(monkeypatch, tmp_path):
     assert attempted == ["Movie.2024.中英双语"]
 
 
+def test_opensubtitles_candidates_prefer_matching_release_features(monkeypatch, tmp_path):
+    """候选排序应优先匹配片源、编码、音频和发布组的字幕。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.1080p.WEB-DL.x265.DDP5.1-GRP.mkv"
+    data = {
+        "data": [
+            {
+                "id": "mismatch",
+                "attributes": {
+                    "release": "Movie.2024.1080p.BluRay.x264.DTS-OTHER",
+                    "language": "zh-cn",
+                    "download_count": 5000,
+                    "ratings": 10,
+                    "files": [{"file_id": 1, "file_name": "Movie.2024.1080p.BluRay.x264.DTS-OTHER.srt"}],
+                },
+            },
+            {
+                "id": "match",
+                "attributes": {
+                    "release": "Movie.2024.1080p.WEB-DL.x265.DDP5.1-GRP",
+                    "language": "zh-cn",
+                    "download_count": 1,
+                    "ratings": 1,
+                    "files": [{"file_id": 2, "file_name": "Movie.2024.1080p.WEB-DL.x265.DDP5.1-GRP.srt"}],
+                },
+            },
+        ]
+    }
+
+    candidates = plugin._opensubtitles_candidates(data, video_path)
+
+    assert [candidate.file_id for candidate in candidates] == [2, 1]
+
+
 def test_opensubtitles_candidates_filters_machine_and_hearing_impaired(monkeypatch, tmp_path):
     """OpenSubtitles 应排除机翻和听障字幕。"""
     module = _load_plugin_module(monkeypatch)
@@ -276,14 +311,18 @@ def test_invalid_existing_subtitle_does_not_skip_search(monkeypatch, tmp_path):
     assert searched_sources == ["subdl"]
 
 
-def test_valid_existing_subtitle_still_skips_search(monkeypatch, tmp_path):
-    """已有字幕有效时仍应按默认策略跳过。"""
+def test_bilingual_existing_subtitle_still_skips_search(monkeypatch, tmp_path):
+    """已有中英双语字幕有效时仍应跳过。"""
     module = _load_plugin_module(monkeypatch)
     plugin = _plugin(module)
     video_path = tmp_path / "Movie.2026.mkv"
     video_path.write_bytes(b"video")
     subtitle_path = tmp_path / "Movie.2026.zh-CN.srt"
-    subtitle_path.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+    subtitle_path.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n你好 hello\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n世界 world\n",
+        encoding="utf-8",
+    )
 
     def fail_enabled_sources():
         """已有有效中文字幕时不应进入搜索源。"""
@@ -292,6 +331,38 @@ def test_valid_existing_subtitle_still_skips_search(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin, "_enabled_sources", fail_enabled_sources)
 
     assert not plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+
+
+def test_pure_chinese_existing_subtitle_searches_for_bilingual_upgrade(monkeypatch, tmp_path):
+    """偏好双语时已有纯中文字幕不应阻止继续搜索。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    subtitle_path = tmp_path / "Movie.2026.zh-CN.srt"
+    subtitle_path.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+    searched_sources = []
+
+    def search_source(source, *_args):
+        """记录搜索源并返回双语候选。"""
+        searched_sources.append(source)
+        return [module.SubtitleCandidate(source="SubDL", title="Movie.2026.中英双语", score=100)]
+
+    def download_candidate(_candidate, _video_path):
+        """模拟双语字幕覆盖保存。"""
+        subtitle_path.write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\n你好 hello\n\n"
+            "2\n00:00:03,000 --> 00:00:04,000\n世界 world\n",
+            encoding="utf-8",
+        )
+        return subtitle_path
+
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["subdl"])
+    monkeypatch.setattr(plugin, "_search_source", search_source)
+    monkeypatch.setattr(plugin, "_download_candidate", download_candidate)
+
+    assert plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+    assert searched_sources == ["subdl"]
 
 
 def test_non_chinese_existing_subtitle_does_not_skip_search(monkeypatch, tmp_path):
@@ -369,6 +440,7 @@ def test_assrt_short_movie_title_embedded_in_unrelated_phrase_is_rejected(monkey
         target_title="十二宫",
         target_year="2007",
         target_resolution="1080p",
+        target_release_text="Zodiac.2007.1080p.BluRay.mkv",
         query="十二宫",
         match_text="聖鬥士星矢：黃道十二宮戰士 圣斗士星矢：黄道十二宫战士 Season 1 第一季",
     )
@@ -376,6 +448,7 @@ def test_assrt_short_movie_title_embedded_in_unrelated_phrase_is_rejected(monkey
         target_title="十二宫",
         target_year="2007",
         target_resolution="1080p",
+        target_release_text="Zodiac.2007.1080p.BluRay.mkv",
         query="十二宫",
         match_text="十二宫 Zodiac 2007 1080p BluRay",
     )
