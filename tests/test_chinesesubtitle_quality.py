@@ -643,3 +643,40 @@ def test_save_from_zip_skips_invalid_members(monkeypatch, tmp_path):
 
     assert saved == tmp_path / "Movie.2024.1080p.WEB-DL-GRP.zh-CN.srt"
     assert saved.read_text() == "1\n00:00:01,000 --> 00:00:02,000\n你好\n"
+
+
+def test_download_assrt_deduplicates_repeated_file_urls(monkeypatch, tmp_path):
+    """ASSRT 详情返回重复下载地址时应只尝试一次。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.mkv"
+    video_path.write_bytes(b"video")
+    attempted_urls = []
+
+    class DetailResponse:
+        """测试用 ASSRT 详情响应。"""
+
+        status_code = 200
+
+        @staticmethod
+        def json():
+            """返回包含重复地址的详情。"""
+            return {
+                "status": 0,
+                "sub": {
+                    "subs": [{
+                        "filelist": [
+                            {"url": "https://example.com/sub.srt"},
+                            {"url": "https://example.com/sub.srt"},
+                        ],
+                    }],
+                },
+            }
+
+    monkeypatch.setattr(plugin, "_assrt_get_res", lambda *_args, **_kwargs: DetailResponse())
+    monkeypatch.setattr(plugin, "_download_url", lambda url, _video_path: attempted_urls.append(url) or None)
+
+    candidate = module.SubtitleCandidate(source="ASSRT", title="dup", raw={"id": "dup"})
+
+    assert plugin._download_assrt(candidate, video_path) is None
+    assert attempted_urls == ["https://example.com/sub.srt"]
