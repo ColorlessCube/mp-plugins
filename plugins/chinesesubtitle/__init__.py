@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.20"
+    plugin_version = "1.2.21"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -405,7 +405,7 @@ class ChineseSubtitle(_PluginBase):
             )
         original_title = self._nfo_first_text(root, "originaltitle")
         year = self._nfo_year(root)
-        return MediaInfo(
+        mediainfo = MediaInfo(
             source="nfo",
             type=media_type,
             title=title,
@@ -417,6 +417,8 @@ class ChineseSubtitle(_PluginBase):
             imdb_id=imdb_id.strip() if imdb_id else None,
             tvdb_id=tvdb_id,
         )
+        mediainfo.episode = self._safe_int(self._nfo_first_text(root, "episode"))
+        return mediainfo
 
     @staticmethod
     def _nfo_media_type(root_tag: str) -> Optional[MediaType]:
@@ -491,7 +493,10 @@ class ChineseSubtitle(_PluginBase):
     @staticmethod
     def _safe_int(value: Any) -> Optional[int]:
         try:
-            return int(str(value).strip())
+            text = str(value).strip()
+            if re.fullmatch(r"\d+\.0+", text):
+                text = text.split(".", 1)[0]
+            return int(text)
         except (TypeError, ValueError):
             return None
 
@@ -811,7 +816,7 @@ class ChineseSubtitle(_PluginBase):
             params["query"] = self._target_title(video_path, mediainfo, meta)
         if self._is_tv(mediainfo, meta):
             season = self._season(mediainfo, meta)
-            episode = self._episode(meta)
+            episode = self._episode(mediainfo, meta)
             if season:
                 params["season_number"] = season
             if episode:
@@ -892,7 +897,7 @@ class ChineseSubtitle(_PluginBase):
         if self._is_tv(mediainfo, meta):
             params["type"] = "tv"
             season = self._season(mediainfo, meta)
-            episode = self._episode(meta)
+            episode = self._episode(mediainfo, meta)
             if season:
                 params["season_number"] = season
             if episode:
@@ -1097,7 +1102,7 @@ class ChineseSubtitle(_PluginBase):
         suffix = self._guess_subtitle_suffix(url, content)
         if suffix not in settings.RMT_SUBEXT:
             return None
-        if not self._valid_subtitle_content(content, suffix):
+        if not self._valid_chinese_subtitle_content(content, suffix):
             logger.warn(f"字幕文件内容校验失败，地址：{self._safe_url_for_log(url)}")
             return None
         target = self._target_subtitle_path(video_path, suffix)
@@ -1136,7 +1141,7 @@ class ChineseSubtitle(_PluginBase):
                 suffix = Path(member.filename).suffix.lower()
                 with zf.open(member) as src:
                     content = src.read()
-                if not self._valid_subtitle_content(content, suffix):
+                if not self._valid_chinese_subtitle_content(content, suffix):
                     logger.info(f"跳过压缩包内无效字幕文件：{member.filename}")
                     continue
                 target = self._target_subtitle_path(video_path, suffix)
@@ -1151,12 +1156,30 @@ class ChineseSubtitle(_PluginBase):
         return video_path.with_name(f"{video_path.stem}{lang_suffix}{suffix}")
 
     def _has_existing_subtitle(self, video_path: Path) -> bool:
-        for suffix in settings.RMT_SUBEXT:
-            if video_path.with_suffix(suffix).exists():
-                return True
-            if self._target_subtitle_path(video_path, suffix).exists():
-                return True
+        subtitle_path = self._existing_subtitle_path(video_path)
+        if not subtitle_path:
+            return False
+        if self._valid_existing_subtitle(subtitle_path):
+            return True
+        logger.warn(f"已有中文字幕无效，重新搜索：{subtitle_path}")
         return False
+
+    def _existing_subtitle_path(self, video_path: Path) -> Optional[Path]:
+        for suffix in settings.RMT_SUBEXT:
+            for subtitle_path in (video_path.with_suffix(suffix), self._target_subtitle_path(video_path, suffix)):
+                if subtitle_path.exists():
+                    return subtitle_path
+        return None
+
+    def _valid_existing_subtitle(self, subtitle_path: Path) -> bool:
+        suffix = subtitle_path.suffix.lower()
+        if suffix not in settings.RMT_SUBEXT:
+            return False
+        try:
+            return self._valid_chinese_subtitle_content(subtitle_path.read_bytes(), suffix)
+        except Exception as err:
+            logger.warn(f"读取已有中文字幕失败：{subtitle_path} - {err}")
+            return False
 
     @staticmethod
     def _looks_chinese(text: str) -> bool:
@@ -1241,7 +1264,7 @@ class ChineseSubtitle(_PluginBase):
         if match:
             return int(match.group(1)), int(match.group(2))
         season = self._season(mediainfo, meta)
-        episode = self._episode(meta)
+        episode = self._episode(mediainfo, meta)
         return int(season) if season else None, int(episode) if episode else None
 
     def _assrt_season_cache_key(self, video_path: Path, mediainfo: Any, meta: Any, season: int) -> str:
@@ -1454,7 +1477,7 @@ class ChineseSubtitle(_PluginBase):
 
     def _season_episode_from_meta(self, mediainfo: Any, meta: Any) -> str:
         season = self._season(mediainfo, meta)
-        episode = self._episode(meta)
+        episode = self._episode(mediainfo, meta)
         if not season or not episode:
             return ""
         return f"S{int(season):02d}E{int(episode):02d}"
@@ -1531,6 +1554,13 @@ class ChineseSubtitle(_PluginBase):
             r"\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}",
             text,
         ))
+
+    @classmethod
+    def _valid_chinese_subtitle_content(cls, content: bytes, suffix: str) -> bool:
+        if not cls._valid_subtitle_content(content, suffix):
+            return False
+        text = cls._decode_subtitle_text(content[:200000])
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
 
     @staticmethod
     def _decode_subtitle_text(content: bytes) -> str:
@@ -1612,8 +1642,8 @@ class ChineseSubtitle(_PluginBase):
         return getattr(meta, "begin_season", None) or getattr(mediainfo, "season", None)
 
     @staticmethod
-    def _episode(meta: Any) -> Optional[int]:
-        return getattr(meta, "begin_episode", None)
+    def _episode(mediainfo: Any, meta: Any) -> Optional[int]:
+        return getattr(meta, "begin_episode", None) or getattr(mediainfo, "episode", None)
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """获取插件配置表单。"""

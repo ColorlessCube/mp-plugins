@@ -217,6 +217,106 @@ def test_valid_subtitle_content_rejects_html_and_accepts_subtitles(monkeypatch):
     )
 
 
+def test_invalid_existing_subtitle_does_not_skip_search(monkeypatch, tmp_path):
+    """已有字幕无效时应继续搜索并允许新字幕覆盖目标文件。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    subtitle_path = tmp_path / "Movie.2026.zh-CN.srt"
+    subtitle_path.write_text("<html>bad gateway</html>", encoding="utf-8")
+    searched_sources = []
+
+    def search_source(source, *_args):
+        """返回可下载候选并记录搜索发生。"""
+        searched_sources.append(source)
+        return [module.SubtitleCandidate(source="SubDL", title="good", score=100, download_url="https://example/sub.srt")]
+
+    def download_candidate(_candidate, _video_path):
+        """模拟下载到目标字幕文件。"""
+        subtitle_path.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+        return subtitle_path
+
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["subdl"])
+    monkeypatch.setattr(plugin, "_search_source", search_source)
+    monkeypatch.setattr(plugin, "_download_candidate", download_candidate)
+
+    assert plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+    assert searched_sources == ["subdl"]
+
+
+def test_valid_existing_subtitle_still_skips_search(monkeypatch, tmp_path):
+    """已有字幕有效时仍应按默认策略跳过。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    subtitle_path = tmp_path / "Movie.2026.zh-CN.srt"
+    subtitle_path.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+
+    def fail_enabled_sources():
+        """已有有效中文字幕时不应进入搜索源。"""
+        raise AssertionError("search should be skipped")
+
+    monkeypatch.setattr(plugin, "_enabled_sources", fail_enabled_sources)
+
+    assert not plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+
+
+def test_non_chinese_existing_subtitle_does_not_skip_search(monkeypatch, tmp_path):
+    """已有非中文字幕时不应阻止重新搜索。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    subtitle_path = tmp_path / "Movie.2026.zh-CN.srt"
+    subtitle_path.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8")
+    searched_sources = []
+
+    def search_source(source, *_args):
+        """记录搜索源并返回中文候选。"""
+        searched_sources.append(source)
+        return [module.SubtitleCandidate(source="SubDL", title="good", score=100, download_url="https://example/sub.srt")]
+
+    def download_candidate(_candidate, _video_path):
+        """模拟下载到目标字幕文件。"""
+        subtitle_path.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+        return subtitle_path
+
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["subdl"])
+    monkeypatch.setattr(plugin, "_search_source", search_source)
+    monkeypatch.setattr(plugin, "_download_candidate", download_candidate)
+
+    assert plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+    assert searched_sources == ["subdl"]
+
+
+def test_nfo_episode_is_used_when_filename_has_no_sxxexx(monkeypatch, tmp_path):
+    """NFO 中的 episode 应作为非标准剧集文件名的集数来源。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    nfo_path = tmp_path / "episode.nfo"
+    nfo_path.write_text(
+        """
+        <episodedetails>
+          <showtitle>棋士</showtitle>
+          <season>1</season>
+          <episode>7.0</episode>
+          <uniqueid type="tmdb">6062096</uniqueid>
+        </episodedetails>
+        """,
+        encoding="utf-8",
+    )
+    video_path = tmp_path / "棋士 第七集.mkv"
+    video_path.write_bytes(b"video")
+
+    mediainfo = plugin._parse_nfo_mediainfo(nfo_path)
+
+    assert mediainfo.episode == 7
+    assert plugin._season_episode_numbers(video_path, mediainfo, meta=None) == (1, 7)
+    assert plugin._season_episode_from_meta(mediainfo, meta=None) == "S01E07"
+
+
 def test_short_title_substring_does_not_score_as_exact_match(monkeypatch):
     """短片名只是长标题子串时不应按精确匹配评分。"""
     module = _load_plugin_module(monkeypatch)
@@ -501,9 +601,9 @@ def test_save_from_zip_skips_invalid_members(monkeypatch, tmp_path):
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as zf:
         zf.writestr("Movie.2024.1080p.WEB-DL-GRP.srt", "<html>bad</html>")
-        zf.writestr("fallback.srt", "1\n00:00:01,000 --> 00:00:02,000\nhello\n")
+        zf.writestr("fallback.srt", "1\n00:00:01,000 --> 00:00:02,000\n你好\n")
 
     saved = plugin._save_from_zip(zip_buffer.getvalue(), video_path)
 
     assert saved == tmp_path / "Movie.2024.1080p.WEB-DL-GRP.zh-CN.srt"
-    assert saved.read_text() == "1\n00:00:01,000 --> 00:00:02,000\nhello\n"
+    assert saved.read_text() == "1\n00:00:01,000 --> 00:00:02,000\n你好\n"
