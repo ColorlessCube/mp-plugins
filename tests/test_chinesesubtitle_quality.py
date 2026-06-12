@@ -245,6 +245,44 @@ def test_iter_video_files_skips_bluray_stream_segments(monkeypatch, tmp_path):
     assert segment not in files
 
 
+def test_assrt_tv_queries_are_bounded_and_prioritized(monkeypatch, tmp_path):
+    """ASSRT 剧集查询应限制数量并优先高价值片名变体。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "棋士" / "Season 1" / "棋士 - S01E02 - 第2集.mkv"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    mediainfo = types.SimpleNamespace(
+        type=module.MediaType.TV,
+        title="棋士",
+        en_title="The Match",
+        original_title="棋士",
+        season=1,
+    )
+    meta = types.SimpleNamespace(type=module.MediaType.TV, begin_episode=2)
+
+    queries = plugin._assrt_queries(video_path, mediainfo, meta)
+
+    assert len(queries) <= 8
+    assert queries[:4] == ["棋士 S01E02", "棋士 E02", "棋士 第2集", "棋士"]
+    assert not any("EP02" in query or "第二集" in query for query in queries)
+
+
+def test_assrt_season_queries_are_bounded(monkeypatch, tmp_path):
+    """ASSRT 整季包查询应限制低价值季名变体。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "棋士" / "Season 1" / "棋士 - S01E02 - 第2集.mkv"
+    mediainfo = types.SimpleNamespace(type=module.MediaType.TV, title="棋士", en_title="The Match", season=1)
+    meta = types.SimpleNamespace(type=module.MediaType.TV, begin_episode=2)
+
+    queries = plugin._assrt_season_queries(video_path, mediainfo, meta, season=1)
+
+    assert len(queries) <= 6
+    assert queries[:3] == ["棋士 S01", "棋士 全季", "棋士"]
+    assert not any("Season 1" in query or "全集" in query for query in queries)
+
+
 def test_save_from_zip_skips_invalid_members(monkeypatch, tmp_path):
     """压缩包保存时应跳过无效字幕成员。"""
     module = _load_plugin_module(monkeypatch)

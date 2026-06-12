@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.15"
+    plugin_version = "1.2.16"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -1064,30 +1064,25 @@ class ChineseSubtitle(_PluginBase):
         if self._is_tv(mediainfo, meta):
             season, episode = self._season_episode_numbers(video_path, mediainfo, meta)
             episode_texts = self._assrt_episode_query_texts(season, episode)
-        for title in self._title_candidates(video_path, mediainfo, meta) or [video_path.stem]:
+        for title in self._assrt_query_titles(video_path, mediainfo, meta):
             for episode_text in episode_texts:
                 query = f"{title} {episode_text}" if episode_text else title
                 query = re.sub(r"\s+", " ", query).strip()
                 if query and query not in queries:
                     queries.append(query)
-        return queries
+        return queries[:8] if self._is_tv(mediainfo, meta) else queries
 
     def _assrt_season_queries(self, video_path: Path, mediainfo: Any, meta: Any, season: int) -> List[str]:
         queries = []
-        for title in self._title_candidates(video_path, mediainfo, meta):
-            for season_text in (
-                    f"S{int(season):02d}",
-                    f"Season {int(season)}",
-                    f"第{int(season)}季",
-                    f"第{self._number_to_chinese(int(season))}季",
-                    "全季",
-                    "全集",
-                    "",
-            ):
+        season_texts = [f"S{int(season):02d}", "全季", ""]
+        if int(season) > 1:
+            season_texts.insert(1, f"第{int(season)}季")
+        for title in self._assrt_query_titles(video_path, mediainfo, meta):
+            for season_text in season_texts:
                 query = re.sub(r"\s+", " ", f"{title} {season_text}").strip()
                 if query and query not in queries:
                     queries.append(query)
-        return queries
+        return queries[:6]
 
     def _assrt_episode_query_texts(self, season: Optional[int], episode: Optional[int]) -> List[str]:
         texts = []
@@ -1097,12 +1092,17 @@ class ChineseSubtitle(_PluginBase):
             episode_number = int(episode)
             texts.extend([
                 f"E{episode_number:02d}",
-                f"EP{episode_number:02d}",
                 f"第{episode_number}集",
-                f"第{self._number_to_chinese(episode_number)}集",
             ])
         texts.append("")
         return self._unique_texts(texts)
+
+    def _assrt_query_titles(self, video_path: Path, mediainfo: Any, meta: Any) -> List[str]:
+        titles = self._title_candidates(video_path, mediainfo, meta)
+        chinese_titles = [title for title in titles if re.search(r"[\u4e00-\u9fff]", title)]
+        other_titles = [title for title in titles if title not in chinese_titles]
+        prioritized_titles = self._unique_texts([*chinese_titles[:2], *other_titles[:1]])
+        return prioritized_titles or [video_path.stem]
 
     def _season_episode_numbers(self, video_path: Path, mediainfo: Any, meta: Any) -> Tuple[Optional[int], Optional[int]]:
         match = re.search(r"S(\d{1,2})E(\d{1,3})", video_path.stem, re.IGNORECASE)
