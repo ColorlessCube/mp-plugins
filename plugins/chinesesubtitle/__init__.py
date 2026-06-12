@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.16"
+    plugin_version = "1.2.17"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -931,16 +931,16 @@ class ChineseSubtitle(_PluginBase):
         cls = type(self)
         with cls._assrt_request_lock:
             now = time.time()
+            backoff_wait = cls._assrt_backoff_until - now
+            if backoff_wait > 0:
+                logger.info(f"ASSRT 处于流控冷却期，跳过请求，剩余 {backoff_wait:.1f} 秒")
+                return None
             interval_wait = 0
             if self._assrt_interval > 0 and cls._assrt_last_request_time:
                 interval_wait = self._assrt_interval - (now - cls._assrt_last_request_time)
-            wait_seconds = max(
-                cls._assrt_backoff_until - now,
-                interval_wait,
-            )
-            if wait_seconds > 0:
-                logger.info(f"ASSRT 请求节流等待 {wait_seconds:.1f} 秒")
-                time.sleep(wait_seconds)
+            if interval_wait > 0:
+                logger.info(f"ASSRT 请求节流等待 {interval_wait:.1f} 秒")
+                time.sleep(interval_wait)
             res = RequestUtils(timeout=self._timeout).get_res(url, params=params)
             cls._assrt_last_request_time = time.time()
             if res is not None and res.status_code == 509:

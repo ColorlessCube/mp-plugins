@@ -283,6 +283,23 @@ def test_assrt_season_queries_are_bounded(monkeypatch, tmp_path):
     assert not any("Season 1" in query or "全集" in query for query in queries)
 
 
+def test_assrt_backoff_skips_without_sleeping(monkeypatch):
+    """ASSRT 流控冷却期内应快速跳过请求。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    module.ChineseSubtitle._assrt_backoff_until = module.time.time() + 60
+
+    def fail_sleep(_seconds):
+        """冷却期不应进入 sleep。"""
+        raise AssertionError("sleep should not be called during ASSRT backoff")
+
+    monkeypatch.setattr(module.time, "sleep", fail_sleep)
+    try:
+        assert plugin._assrt_get_res("https://api.assrt.net/v1/sub/search", params={}) is None
+    finally:
+        module.ChineseSubtitle._assrt_backoff_until = 0
+
+
 def test_save_from_zip_skips_invalid_members(monkeypatch, tmp_path):
     """压缩包保存时应跳过无效字幕成员。"""
     module = _load_plugin_module(monkeypatch)
