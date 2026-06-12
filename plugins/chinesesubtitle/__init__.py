@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.24"
+    plugin_version = "1.2.25"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -97,6 +97,7 @@ class ChineseSubtitle(_PluginBase):
     _source_miss_cache_key = "source_miss_cache"
     _source_miss_cache_ttl = 24 * 3600
     _source_miss_cache_limit = 2000
+    _bilingual_preference_score = 80
 
     def init_plugin(self, config: dict = None):
         """初始化插件配置。"""
@@ -294,9 +295,10 @@ class ChineseSubtitle(_PluginBase):
             except Exception as err:
                 logger.error(f"{source} 中文字幕处理失败：{err}", exc_info=True)
         for candidate in self._rank_candidates(all_candidates):
+            effective_score = self._candidate_sort_score(candidate)
             logger.info(
                 f"尝试下载中文字幕候选：{video_path.name} - {candidate.source} - "
-                f"{candidate.title} - score={candidate.score:.1f}"
+                f"{candidate.title} - score={effective_score:.1f}"
             )
             saved = self._download_candidate(candidate, video_path)
             if saved:
@@ -803,7 +805,7 @@ class ChineseSubtitle(_PluginBase):
             logger.info(f"ASSRT 通过片名 `{query}` 找到 {len(candidates)} 条候选：{video_path.name}")
         else:
             logger.info(f"ASSRT 通过片名 `{query}` 未找到匹配中文字幕：{video_path.name}")
-        return sorted(candidates, key=lambda x: x.score, reverse=True)
+        return sorted(candidates, key=self._candidate_sort_score, reverse=True)
 
     def _search_opensubtitles(self, video_path: Path, mediainfo: Any, meta: Any) -> List[SubtitleCandidate]:
         if self._opensubtitles_download_quota_exhausted():
@@ -884,7 +886,7 @@ class ChineseSubtitle(_PluginBase):
                 file_id=file_info.get("file_id"),
                 raw=item,
             ))
-        return sorted(candidates, key=lambda x: x.score, reverse=True)
+        return sorted(candidates, key=self._candidate_sort_score, reverse=True)
 
     def _search_subdl(self, video_path: Path, mediainfo: Any, meta: Any) -> List[SubtitleCandidate]:
         params = {
@@ -934,7 +936,7 @@ class ChineseSubtitle(_PluginBase):
                 download_url=download_url,
                 raw=item,
             ))
-        return sorted(candidates, key=lambda x: x.score, reverse=True)
+        return sorted(candidates, key=self._candidate_sort_score, reverse=True)
 
     def _download_candidate(self, candidate: SubtitleCandidate, video_path: Path) -> Optional[Path]:
         if candidate.source == "ASSRT":
@@ -1150,7 +1152,10 @@ class ChineseSubtitle(_PluginBase):
                 return None
             scored = sorted(
                 members,
-                key=lambda m: self._release_match_score(video_path.name, Path(m.filename).name),
+                key=lambda m: (
+                    self._release_match_score(video_path.name, Path(m.filename).name)
+                    + self._bilingual_preference_bonus(Path(m.filename).name)
+                ),
                 reverse=True,
             )
             for member in scored:
@@ -1211,8 +1216,7 @@ class ChineseSubtitle(_PluginBase):
             re.IGNORECASE,
         ))
 
-    @staticmethod
-    def _rank_candidates(candidates: List[SubtitleCandidate]) -> List[SubtitleCandidate]:
+    def _rank_candidates(self, candidates: List[SubtitleCandidate]) -> List[SubtitleCandidate]:
         unique_candidates = []
         seen_keys = set()
         for candidate in candidates:
@@ -1227,7 +1231,47 @@ class ChineseSubtitle(_PluginBase):
                 continue
             seen_keys.add(key)
             unique_candidates.append(candidate)
-        return sorted(unique_candidates, key=lambda x: x.score, reverse=True)
+        return sorted(unique_candidates, key=self._candidate_sort_score, reverse=True)
+
+    def _candidate_sort_score(self, candidate: SubtitleCandidate) -> float:
+        return candidate.score + self._bilingual_preference_bonus(self._candidate_bilingual_text(candidate))
+
+    @staticmethod
+    def _candidate_bilingual_text(candidate: SubtitleCandidate) -> str:
+        raw = candidate.raw if isinstance(candidate.raw, dict) else {}
+        raw_attrs = raw.get("attributes") or {}
+        raw_file = next(iter(raw_attrs.get("files") or []), {}) if isinstance(raw_attrs.get("files"), list) else {}
+        return " ".join(str(value or "") for value in (
+            candidate.title,
+            candidate.file_name,
+            candidate.language,
+            raw.get("native_name"),
+            raw.get("videoname"),
+            raw.get("release_name"),
+            raw.get("subtitle_name"),
+            raw.get("name"),
+            raw.get("comment"),
+            raw_attrs.get("release"),
+            raw_attrs.get("language"),
+            raw_file.get("file_name"),
+        ))
+
+    @classmethod
+    def _bilingual_preference_bonus(cls, text: str) -> int:
+        return cls._bilingual_preference_score if cls._looks_chinese_english_bilingual(text) else 0
+
+    @staticmethod
+    def _looks_chinese_english_bilingual(text: str) -> bool:
+        text = text or ""
+        return bool(re.search(
+            r"中英|英中|中\s*[/&+._ -]\s*英|英\s*[/&+._ -]\s*中|"
+            r"简英|繁英|简体.*英|繁体.*英|双语|bilingual|dual\s*sub|"
+            r"chs\s*[/&+._ -]?\s*(eng|en)|cht\s*[/&+._ -]?\s*(eng|en)|"
+            r"chi(nese)?\s*[/&+._ -]\s*eng(lish)?|"
+            r"zh\s*[/&+._ -]\s*en|cn\s*[/&+._ -]\s*en",
+            text,
+            re.IGNORECASE,
+        ))
 
     def _assrt_queries(self, video_path: Path, mediainfo: Any, meta: Any) -> List[str]:
         queries = []

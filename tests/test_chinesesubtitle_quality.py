@@ -155,6 +155,37 @@ def test_process_video_ranks_candidates_across_sources(monkeypatch, tmp_path):
     assert attempted == ["high"]
 
 
+def test_process_video_prefers_bilingual_candidate(monkeypatch, tmp_path):
+    """中英双语候选应在质量接近时优先尝试。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.1080p.WEB-DL-GRP.mkv"
+    video_path.write_bytes(b"video")
+    attempted = []
+
+    def search_source(source, *_args):
+        """返回普通中文字幕和中英双语候选。"""
+        if source == "assrt":
+            return [module.SubtitleCandidate(source="ASSRT", title="Movie.2024.简体中文", score=140)]
+        if source == "opensubtitles":
+            return [module.SubtitleCandidate(source="OpenSubtitles", title="Movie.2024.中英双语", score=90)]
+        return []
+
+    def download_candidate(candidate, _video_path):
+        """记录实际尝试的候选。"""
+        attempted.append(candidate.title)
+        return _video_path.with_name(f"{_video_path.stem}.zh-CN.srt")
+
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["assrt", "opensubtitles"])
+    monkeypatch.setattr(plugin, "_download_assrt_season_episode", lambda *_args: None)
+    monkeypatch.setattr(plugin, "_search_source", search_source)
+    monkeypatch.setattr(plugin, "_download_candidate", download_candidate)
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+
+    assert plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+    assert attempted == ["Movie.2024.中英双语"]
+
+
 def test_opensubtitles_candidates_filters_machine_and_hearing_impaired(monkeypatch, tmp_path):
     """OpenSubtitles 应排除机翻和听障字幕。"""
     module = _load_plugin_module(monkeypatch)
@@ -643,6 +674,23 @@ def test_save_from_zip_skips_invalid_members(monkeypatch, tmp_path):
 
     assert saved == tmp_path / "Movie.2024.1080p.WEB-DL-GRP.zh-CN.srt"
     assert saved.read_text() == "1\n00:00:01,000 --> 00:00:02,000\n你好\n"
+
+
+def test_save_from_zip_prefers_bilingual_member(monkeypatch, tmp_path):
+    """压缩包内多个字幕有效时应优先选择中英双语文件。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.1080p.WEB-DL-GRP.mkv"
+    video_path.write_bytes(b"video")
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zf:
+        zf.writestr("Movie.2024.1080p.WEB-DL-GRP.srt", "1\n00:00:01,000 --> 00:00:02,000\n你好\n")
+        zf.writestr("Movie.2024.1080p.WEB-DL-GRP.中英双语.srt", "1\n00:00:01,000 --> 00:00:02,000\n你好 hello\n")
+
+    saved = plugin._save_from_zip(zip_buffer.getvalue(), video_path)
+
+    assert saved == tmp_path / "Movie.2024.1080p.WEB-DL-GRP.zh-CN.srt"
+    assert saved.read_text() == "1\n00:00:01,000 --> 00:00:02,000\n你好 hello\n"
 
 
 def test_download_assrt_deduplicates_repeated_file_urls(monkeypatch, tmp_path):
