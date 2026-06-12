@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from xml.sax.saxutils import escape
 
-import requests
+from requests import Response
 
 import schemas
 from app.core.cache import TTLCache
 from app.core.config import settings
 from app.log import logger
+from app.utils.http import RequestUtils
 
 
 class RateLimiter:
@@ -260,7 +261,7 @@ class QuarkApi:
 
         return False
 
-    def _update_cookie_from_response(self, response: requests.Response):
+    def _update_cookie_from_response(self, response: Response):
         if not response or not response.cookies:
             return
         cookie_dict = {}
@@ -309,13 +310,15 @@ class QuarkApi:
         last_error = None
         for retry in range(self._max_retries):
             try:
-                resp = requests.request(
-                    method=method,
+                resp = RequestUtils(
+                    headers=request_headers,
+                    timeout=timeout or self._timeout,
+                ).request(
+                    method=method.lower(),
                     url=url,
                     params=request_params,
                     json=json_data,
-                    headers=request_headers,
-                    timeout=timeout or self._timeout,
+                    raise_exception=True,
                 )
                 self._update_cookie_from_response(resp)
                 if resp.status_code != 200:
@@ -919,9 +922,7 @@ class QuarkApi:
                 )
                 auth_key = self._request_upload_auth(pre_data=pre_data, auth_meta=auth_meta)
 
-                response = requests.put(
-                    target_url,
-                    params={"partNumber": part_number, "uploadId": upload_id},
+                response = RequestUtils(
                     headers={
                         "Authorization": auth_key,
                         "Content-Type": mime_type,
@@ -929,8 +930,12 @@ class QuarkApi:
                         "x-oss-date": time_str,
                         "x-oss-user-agent": signed_headers["x-oss-user-agent"],
                     },
-                    data=chunk,
                     timeout=max(self._timeout, 120),
+                ).put_res(
+                    target_url,
+                    params={"partNumber": part_number, "uploadId": upload_id},
+                    data=chunk,
+                    raise_exception=True,
                 )
                 if response.status_code != 200:
                     raise Exception(f"分片上传失败: part={part_number}, status={response.status_code}, body={response.text}")
@@ -986,9 +991,7 @@ class QuarkApi:
         auth_key = self._request_upload_auth(pre_data=pre_data, auth_meta=auth_meta)
 
         target_url = self._build_oss_url(pre_data)
-        response = requests.post(
-            target_url,
-            params={"uploadId": upload_id},
+        response = RequestUtils(
             headers={
                 "Authorization": auth_key,
                 "Content-MD5": content_md5,
@@ -998,8 +1001,12 @@ class QuarkApi:
                 "x-oss-date": time_str,
                 "x-oss-user-agent": signed_headers["x-oss-user-agent"],
             },
-            data=body.encode("utf-8"),
             timeout=max(self._timeout, 120),
+        ).post_res(
+            target_url,
+            params={"uploadId": upload_id},
+            data=body.encode("utf-8"),
+            raise_exception=True,
         )
         if response.status_code != 200:
             raise Exception(f"上传提交失败: status={response.status_code}, body={response.text}")
@@ -1080,16 +1087,18 @@ class QuarkApi:
 
             logger.info(f"【夸克】开始下载: {fileitem.name} -> {local_path}")
 
-            resp = requests.get(
-                download_url,
+            resp = RequestUtils(
                 headers={
                     "User-Agent": self._headers.get("User-Agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                     "Referer": "https://pan.quark.cn/",
                     "Cookie": self._cookie,
                     "Accept": "*/*",
                 },
-                stream=True,
                 timeout=max(self._timeout, 120),
+            ).get_res(
+                download_url,
+                stream=True,
+                raise_exception=True,
             )
             if resp.status_code != 200:
                 logger.error(f"【夸克】下载失败，请求下载链接返回异常: status={resp.status_code}")

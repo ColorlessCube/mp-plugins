@@ -11,7 +11,12 @@ from app.schemas import StorageOperSelectionEventData, FileItem
 
 from .quark_api import QuarkApi
 
+
 class CodexQuarkDisk(_PluginBase):
+    """
+    夸克网盘存储插件，将夸克网盘接入 MoviePilot 标准存储接口。
+    """
+
     # 插件名称
     plugin_name = "夸克网盘存储（本地版）"
     # 插件描述
@@ -19,7 +24,7 @@ class CodexQuarkDisk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/quark.ico"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "MoviePilot Local"
     # 作者主页
@@ -39,6 +44,9 @@ class CodexQuarkDisk(_PluginBase):
     _inited = False
 
     def __init__(self, *args, **kwargs):
+        """
+        初始化插件实例。
+        """
         super().__init__(*args, **kwargs)
 
     def _ensure_quark_api(self) -> bool:
@@ -59,6 +67,11 @@ class CodexQuarkDisk(_PluginBase):
             return False
 
     def init_plugin(self, config: dict = None):
+        """
+        初始化插件配置并按需注册夸克网盘存储。
+
+        :param config: 插件配置字典
+        """
         if not CodexQuarkDisk._inited:
             logger.info("【夸克】开始初始化插件")
             CodexQuarkDisk._inited = True
@@ -95,13 +108,22 @@ class CodexQuarkDisk(_PluginBase):
                 logger.warning("【夸克】插件未启用或Cookie未设置,跳过API客户端创建")
 
     def get_state(self) -> bool:
+        """
+        获取插件启用状态。
+        """
         return bool(self._enabled and self._cookie)
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        """
+        获取插件命令列表。
+        """
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
+        """
+        获取插件 API 路由。
+        """
         return [
             {
                 "path": "/clear_cache",
@@ -291,6 +313,9 @@ class CodexQuarkDisk(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
+        """
+        获取插件详情页面配置。
+        """
         status_text = "已配置" if self.get_state() else "未配置"
         status_color = "success" if self.get_state() else "warning"
 
@@ -815,4 +840,4 @@ class CodexQuarkDisk(_PluginBase):
         """
         退出插件
         """
-        pass 
+        pass

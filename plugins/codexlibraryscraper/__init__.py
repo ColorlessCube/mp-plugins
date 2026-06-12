@@ -22,6 +22,10 @@ from app.utils.system import SystemUtils
 
 
 class CodexLibraryScraper(_PluginBase):
+    """
+    媒体库刮削插件，支持本地目录与 MoviePilot 存储目录刮削。
+    """
+
     # 插件名称
     plugin_name = "媒体库刮削（本地版）"
     # 插件描述
@@ -29,7 +33,7 @@ class CodexLibraryScraper(_PluginBase):
     # 插件图标
     plugin_icon = "scraper.png"
     # 插件版本
-    plugin_version = "2.2.0"
+    plugin_version = "2.2.1"
     # 插件作者
     plugin_author = "MoviePilot Local"
     # 作者主页
@@ -56,6 +60,11 @@ class CodexLibraryScraper(_PluginBase):
     _event = Event()
 
     def init_plugin(self, config: dict = None):
+        """
+        初始化插件配置并按需创建一次性刮削任务。
+
+        :param config: 插件配置字典
+        """
 
         # 读取配置
         if config:
@@ -94,14 +103,23 @@ class CodexLibraryScraper(_PluginBase):
                     self._scheduler.start()
 
     def get_state(self) -> bool:
+        """
+        获取插件启用状态。
+        """
         return self._enabled
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        """
+        获取插件命令列表。
+        """
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        """
+        获取插件 API 路由。
+        """
+        return []
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -133,6 +151,9 @@ class CodexLibraryScraper(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """
+        获取插件配置页面与默认配置。
+        """
         return [
             {
                 'component': 'VForm',
@@ -294,7 +315,10 @@ class CodexLibraryScraper(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        pass
+        """
+        获取插件详情页面配置。
+        """
+        return []
 
     def __libraryscraper(self):
         """
@@ -337,6 +361,9 @@ class CodexLibraryScraper(_PluginBase):
 
     @property
     def storagechain(self) -> StorageChain:
+        """
+        获取存储处理链实例。
+        """
         if not self._storagechain:
             self._storagechain = StorageChain()
         return self._storagechain

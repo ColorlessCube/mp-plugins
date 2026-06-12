@@ -60,7 +60,7 @@
   "ChineseSubtitle" : {
     "name": "中文字幕下载",
     "description": "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕",
-    "version": "1.2.36",
+    "version": "1.2.37",
     "release": true,
     "icon": "subtitle.png",
     "author": "ColorlessCube",
@@ -106,7 +106,8 @@
       "v1.2.33": "修复 OpenSubtitles 额度耗尽后的重复日志：本轮扫描禁用后直接复用源熔断状态，避免后续视频反复输出日限 warning",
       "v1.2.34": "优化目录扫描进度：新增剧集季级源未命中缓存，连续未命中后跳过同季重复搜索；新增扫描游标轮转，达到单次上限后下一轮从上次位置继续",
       "v1.2.35": "新增字幕时间轴覆盖校验：已知媒体时长时拒绝只覆盖片段的 SRT/ASS 字幕，避免短样本或错集字幕被保存为有效中文字幕",
-      "v1.2.36": "提高候选召回与下载成功率：双语候选失败后保留强匹配普通中文字幕兜底；ASSRT 汇总多个高价值查询候选；OpenSubtitles ID 未命中时回退片名查询"
+      "v1.2.36": "提高候选召回与下载成功率：双语候选失败后保留强匹配普通中文字幕兜底；ASSRT 汇总多个高价值查询候选；OpenSubtitles ID 未命中时回退片名查询",
+      "v1.2.37": "收紧 ASSRT 多查询请求上限：候选达到下载尝试数后停止继续查询，降低目录扫描触发 ASSRT 509 流控的概率"
     }
   },
   "LocalMediaArchive": {
@@ -125,26 +126,28 @@
   "CodexQuarkDisk": {
     "name": "夸克网盘存储（本地版）",
     "description": "本地维护的夸克网盘存储插件，为 MoviePilot 存储系统集成夸克网盘支持。",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "icon": "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/quark.ico",
     "author": "MoviePilot Local",
     "level": 1,
     "v2": true,
     "labels": "存储,夸克网盘,云盘,本地版",
     "history": {
+      "v1.1.1": "夸克网盘外部请求改用 RequestUtils，并补齐公开接口中文说明。",
       "v1.1.0": "本地维护版本：接入夸克网盘为 MoviePilot 存储。"
     }
   },
   "CodexLibraryScraper": {
     "name": "媒体库刮削（本地版）",
     "description": "本地维护的媒体库刮削插件，支持本地目录和 MoviePilot 存储目录。",
-    "version": "2.2.0",
+    "version": "2.2.1",
     "icon": "scraper.png",
     "author": "MoviePilot Local",
     "level": 1,
     "v2": true,
     "labels": "刮削,媒体库,云盘,本地版",
     "history": {
+      "v2.2.1": "补齐公开接口中文说明，并明确空命令/API/页面返回。",
       "v2.2.0": "本地维护版本：支持使用 存储名:/路径#媒体类型 配置刮削 MoviePilot 存储目录。"
     }
   }
