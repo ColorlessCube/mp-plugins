@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.38"
+    plugin_version = "1.2.39"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -1338,7 +1338,11 @@ class ChineseSubtitle(_PluginBase):
 
     def _subdl_search_params_list(self, params: dict, mediainfo: Any, meta: Any) -> List[dict]:
         search_params_list = [params]
-        if self._is_tv(mediainfo, meta) and ("imdb_id" in params or "tmdb_id" in params):
+        if (
+            not type(self)._scan_active
+            and self._is_tv(mediainfo, meta)
+            and ("imdb_id" in params or "tmdb_id" in params)
+        ):
             fallback_params = {
                 key: value
                 for key, value in params.items()

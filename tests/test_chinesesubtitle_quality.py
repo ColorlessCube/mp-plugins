@@ -438,7 +438,7 @@ def test_opensubtitles_candidates_filters_machine_and_hearing_impaired(monkeypat
 
 
 def test_subdl_falls_back_without_media_ids_for_tv_episode(monkeypatch, tmp_path):
-    """SubDL 剧集媒体 ID 未命中时应去掉 ID 后重试。"""
+    """SubDL 剧集手动搜索媒体 ID 未命中时应去掉 ID 后重试。"""
     module = _load_plugin_module(monkeypatch)
     plugin = _plugin(module)
     video_path = tmp_path / "凡人修仙传 - S01E09 - 第9集.mkv"
@@ -495,6 +495,58 @@ def test_subdl_falls_back_without_media_ids_for_tv_episode(monkeypatch, tmp_path
     assert requested_params[1]["season_number"] == 1
     assert requested_params[1]["episode_number"] == 9
     assert [candidate.title for candidate in candidates] == ["凡人修仙传 S01E09 简体中文"]
+
+
+def test_subdl_scan_does_not_fall_back_without_media_ids(monkeypatch, tmp_path):
+    """目录扫描期间 SubDL 媒体 ID 未命中不应放大全量重试。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "剑来 - S01E25 - 第25集.mkv"
+    video_path.write_bytes(b"video")
+    requested_params = []
+
+    class FakeResponse:
+        """测试用 SubDL 空搜索响应。"""
+
+        status_code = 200
+
+        @staticmethod
+        def json():
+            """返回空字幕结果。"""
+            return {"status": True, "subtitles": []}
+
+    class FakeRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **_kwargs):
+            """忽略请求参数。"""
+
+        @staticmethod
+        def get_res(_url, params=None):
+            """记录搜索参数并返回空结果。"""
+            requested_params.append(dict(params or {}))
+            return FakeResponse()
+
+    monkeypatch.setattr(module, "RequestUtils", FakeRequestUtils)
+    module.ChineseSubtitle._scan_active = True
+    mediainfo = types.SimpleNamespace(
+        type=module.MediaType.TV,
+        title="剑来",
+        season=1,
+        episode=25,
+        tmdb_id=5531214,
+    )
+
+    try:
+        candidates = plugin._search_subdl(video_path, mediainfo=mediainfo, meta=None)
+    finally:
+        module.ChineseSubtitle._scan_active = False
+
+    assert candidates == []
+    assert len(requested_params) == 1
+    assert requested_params[0]["tmdb_id"] == 5531214
+    assert requested_params[0]["season_number"] == 1
+    assert requested_params[0]["episode_number"] == 25
 
 
 def test_valid_subtitle_content_rejects_html_and_accepts_subtitles(monkeypatch):
