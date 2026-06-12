@@ -418,6 +418,57 @@ def test_assrt_interval_wait_rechecks_backoff_before_request(monkeypatch):
         module.ChineseSubtitle._assrt_last_request_time = 0
 
 
+def test_assrt_backoff_is_persisted_between_instances(monkeypatch):
+    """ASSRT 流控冷却应通过插件数据在实例之间共享。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+
+    class RateLimitedResponse:
+        """测试用 ASSRT 509 响应。"""
+
+        status_code = 509
+        headers = {}
+
+    class RateLimitedRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **_kwargs):
+            """忽略请求参数。"""
+
+        @staticmethod
+        def get_res(_url, params=None):
+            """返回流控响应。"""
+            return RateLimitedResponse()
+
+    monkeypatch.setattr(module, "RequestUtils", RateLimitedRequestUtils)
+    module.ChineseSubtitle._assrt_backoff_until = 0
+    module.ChineseSubtitle._assrt_last_request_time = 0
+    assert plugin._assrt_get_res("https://api.assrt.net/v1/sub/search", params={}).status_code == 509
+
+    class FailRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **_kwargs):
+            """忽略请求参数。"""
+
+        @staticmethod
+        def get_res(_url, params=None):
+            """持久化冷却生效时不应发起请求。"""
+            raise AssertionError("request should not be sent while persisted backoff is active")
+
+    next_plugin = _plugin(module)
+    next_plugin._data = plugin._data
+    monkeypatch.setattr(module, "RequestUtils", FailRequestUtils)
+    module.ChineseSubtitle._assrt_backoff_until = 0
+    module.ChineseSubtitle._assrt_last_request_time = 0
+
+    try:
+        assert next_plugin._assrt_get_res("https://api.assrt.net/v1/sub/search", params={}) is None
+    finally:
+        module.ChineseSubtitle._assrt_backoff_until = 0
+        module.ChineseSubtitle._assrt_last_request_time = 0
+
+
 def test_source_miss_cache_skips_repeated_source_search(monkeypatch, tmp_path):
     """源级未命中缓存应跳过短期内重复搜索。"""
     module = _load_plugin_module(monkeypatch)

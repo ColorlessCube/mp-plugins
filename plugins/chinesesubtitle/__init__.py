@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.19"
+    plugin_version = "1.2.20"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -92,6 +92,7 @@ class ChineseSubtitle(_PluginBase):
         "opensubtitles": "_opensubtitles_api_key",
         "subdl": "_subdl_api_key",
     }
+    _assrt_backoff_key = "assrt_backoff_until"
     _opensubtitles_quota_key = "opensubtitles_download_quota"
     _source_miss_cache_key = "source_miss_cache"
     _source_miss_cache_ttl = 24 * 3600
@@ -555,9 +556,11 @@ class ChineseSubtitle(_PluginBase):
     def _source_search_available(self, source: str) -> bool:
         if source in type(self)._scan_disabled_sources:
             return False
-        if source == "assrt" and type(self)._assrt_backoff_until > time.time():
-            self._disable_source_for_scan("assrt", "流控冷却期未结束")
-            return False
+        if source == "assrt":
+            backoff_wait = self._assrt_backoff_remaining()
+            if backoff_wait > 0:
+                self._disable_source_for_scan("assrt", f"流控冷却期未结束，剩余 {backoff_wait:.1f} 秒")
+                return False
         if source == "opensubtitles" and self._opensubtitles_download_quota_exhausted():
             return False
         return True
@@ -568,6 +571,26 @@ class ChineseSubtitle(_PluginBase):
             return
         cls._scan_disabled_sources.add(source)
         logger.warn(f"{source} 本轮目录扫描已暂停：{reason}")
+
+    def _assrt_backoff_remaining(self) -> float:
+        now = time.time()
+        persisted_until = 0
+        try:
+            persisted_until = float(self.get_data(self._assrt_backoff_key) or 0)
+        except (TypeError, ValueError):
+            persisted_until = 0
+        backoff_until = max(type(self)._assrt_backoff_until, persisted_until)
+        if backoff_until <= now:
+            if persisted_until > 0:
+                self.save_data(self._assrt_backoff_key, 0)
+            return 0
+        type(self)._assrt_backoff_until = backoff_until
+        return backoff_until - now
+
+    def _set_assrt_backoff(self, backoff_seconds: int):
+        backoff_until = time.time() + backoff_seconds
+        type(self)._assrt_backoff_until = backoff_until
+        self.save_data(self._assrt_backoff_key, backoff_until)
 
     def _source_miss_cache_hit(self, source: str, video_path: Path, mediainfo: Any, meta: Any) -> bool:
         cache = self._source_miss_cache()
@@ -1033,7 +1056,7 @@ class ChineseSubtitle(_PluginBase):
         cls = type(self)
         with cls._assrt_request_lock:
             now = time.time()
-            backoff_wait = cls._assrt_backoff_until - now
+            backoff_wait = self._assrt_backoff_remaining()
             if backoff_wait > 0:
                 logger.info(f"ASSRT 处于流控冷却期，跳过请求，剩余 {backoff_wait:.1f} 秒")
                 return None
@@ -1045,7 +1068,7 @@ class ChineseSubtitle(_PluginBase):
                 time.sleep(interval_wait)
                 if "assrt" in cls._scan_disabled_sources:
                     return None
-                backoff_wait = cls._assrt_backoff_until - time.time()
+                backoff_wait = self._assrt_backoff_remaining()
                 if backoff_wait > 0:
                     logger.info(f"ASSRT 处于流控冷却期，跳过请求，剩余 {backoff_wait:.1f} 秒")
                     return None
@@ -1053,7 +1076,7 @@ class ChineseSubtitle(_PluginBase):
             cls._assrt_last_request_time = time.time()
             if res is not None and res.status_code == 509:
                 backoff_seconds = self._assrt_backoff_seconds(res)
-                cls._assrt_backoff_until = time.time() + backoff_seconds
+                self._set_assrt_backoff(backoff_seconds)
                 self._disable_source_for_scan("assrt", f"触发 509 流控，冷却 {backoff_seconds} 秒")
                 logger.warn(f"ASSRT 触发流控 509，暂停请求 {backoff_seconds} 秒")
             return res
