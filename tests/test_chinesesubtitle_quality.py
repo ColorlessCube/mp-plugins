@@ -1329,6 +1329,52 @@ def test_season_source_miss_cache_skips_same_season_after_threshold(monkeypatch,
     ]
 
 
+def test_season_source_miss_cache_ignores_episode_media_ids(monkeypatch, tmp_path):
+    """季级未命中缓存不应被单集 NFO 媒体 ID 拆散。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    season_dir = tmp_path / "Nirvana" / "Season 01"
+    season_dir.mkdir(parents=True)
+    video_paths = []
+    for episode in range(1, 5):
+        video_path = season_dir / f"Nirvana - S01E{episode:02d}.mkv"
+        video_path.write_bytes(b"video")
+        video_paths.append(video_path)
+    searched_files = []
+
+    def search_source(source, video_path, *_args):
+        """记录实际搜索的视频并模拟未命中。"""
+        searched_files.append((source, video_path.name))
+        return []
+
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["subdl"])
+    monkeypatch.setattr(plugin, "_search_source", search_source)
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+    module.ChineseSubtitle._scan_active = True
+    module.ChineseSubtitle._scan_disabled_sources = set()
+
+    try:
+        for episode, video_path in enumerate(video_paths, start=1):
+            mediainfo = types.SimpleNamespace(
+                type=module.MediaType.TV,
+                title="Nirvana",
+                season=1,
+                episode=episode,
+                imdb_id="",
+                tmdb_id=10000 + episode,
+            )
+            assert not plugin._process_video(video_path=video_path, mediainfo=mediainfo, meta=None, storage="local")
+    finally:
+        module.ChineseSubtitle._scan_active = False
+        module.ChineseSubtitle._scan_disabled_sources = set()
+
+    assert searched_files == [
+        ("subdl", "Nirvana - S01E01.mkv"),
+        ("subdl", "Nirvana - S01E02.mkv"),
+        ("subdl", "Nirvana - S01E03.mkv"),
+    ]
+
+
 def test_video_scan_miss_key_ignores_scan_disabled_sources(monkeypatch, tmp_path):
     """视频级未命中缓存不应受本轮源熔断状态影响。"""
     module = _load_plugin_module(monkeypatch)

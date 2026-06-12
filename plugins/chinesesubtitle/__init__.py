@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.39"
+    plugin_version = "1.2.40"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -859,17 +859,25 @@ class ChineseSubtitle(_PluginBase):
         series_title = self._season_source_miss_series_title(video_path, mediainfo, meta)
         if not series_title:
             return ""
-        imdb_id = str(getattr(mediainfo, "imdb_id", None) or "")
-        tmdb_id = str(getattr(mediainfo, "tmdb_id", None) or "")
+        scope_key = self._season_source_miss_scope_key(video_path)
         option_key = self._season_source_miss_option_key(source)
         return "|".join([
             source,
             series_title.lower(),
             f"S{int(season):02d}",
-            imdb_id,
-            tmdb_id,
+            scope_key,
             option_key,
         ])
+
+    def _season_source_miss_scope_key(self, video_path: Path) -> str:
+        parent = video_path.parent
+        scope_path = parent
+        if self._is_generic_tv_title(parent.name) and parent.parent != parent:
+            scope_path = parent.parent
+        try:
+            return str(scope_path.resolve())
+        except Exception:
+            return str(scope_path)
 
     def _season_source_miss_series_title(self, video_path: Path, mediainfo: Any, meta: Any) -> str:
         for title in (
