@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import sys
+import time
 import types
 import zipfile
 from enum import Enum
@@ -879,6 +880,52 @@ def test_download_url_caches_failed_url(monkeypatch, tmp_path):
     assert plugin._download_url("https://example.com/sub.srt", video_path) is None
 
     assert calls == [("https://example.com/sub.srt", 15, True)]
+
+
+def test_download_url_enforces_total_deadline(monkeypatch, tmp_path):
+    """下载地址整体耗时超限时应快速跳过并缓存失败。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.mkv"
+    video_path.write_bytes(b"video")
+    calls = []
+
+    class SlowResponse:
+        """测试用慢响应。"""
+
+        status_code = 200
+        headers = {"Content-Type": "text/plain"}
+
+        @staticmethod
+        def iter_content(chunk_size=64 * 1024):
+            """模拟长时间阻塞的响应读取。"""
+            time.sleep(0.2)
+            yield "1\n00:00:01,000 --> 00:00:02,000\n你好 hello\n".encode()
+
+        @staticmethod
+        def close():
+            """关闭响应。"""
+
+    class FakeRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **_kwargs):
+            """初始化测试客户端。"""
+
+        def get_res(self, url, **_kwargs):
+            """记录请求并返回慢响应。"""
+            calls.append(url)
+            return SlowResponse()
+
+    monkeypatch.setattr(module, "RequestUtils", FakeRequestUtils)
+    monkeypatch.setattr(plugin, "_download_deadline_seconds", lambda: 0.01)
+
+    started = time.time()
+
+    assert plugin._download_url("https://example.com/slow.srt", video_path) is None
+    assert time.time() - started < 0.15
+    assert plugin._download_url("https://example.com/slow.srt", video_path) is None
+    assert calls == ["https://example.com/slow.srt"]
 
 
 def test_download_assrt_limits_urls_per_candidate(monkeypatch, tmp_path):

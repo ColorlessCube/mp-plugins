@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import hashlib
 import io
+import queue
 import re
 import threading
 import time
@@ -48,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.28"
+    plugin_version = "1.2.29"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -110,6 +111,7 @@ class ChineseSubtitle(_PluginBase):
     _download_failed_url_cache_limit = 5000
     _assrt_candidate_url_attempt_limit = 2
     _subtitle_download_max_bytes = 8 * 1024 * 1024
+    _subtitle_download_deadline_extra_seconds = 2
     _bilingual_preference_score = 80
     _release_feature_match_score = 15
     _release_feature_mismatch_penalty = 12
@@ -1305,20 +1307,18 @@ class ChineseSubtitle(_PluginBase):
         if self._download_failed_url_cache_hit(url):
             logger.info(f"跳过近期下载失败的字幕地址：{self._safe_url_for_log(url)}")
             return None
-        res = RequestUtils(timeout=self._download_timeout()).get_res(url, stream=True)
-        if not res or res.status_code != 200:
-            status_code = res.status_code if res is not None else "无响应"
+        response = self._download_response(url)
+        if not response or response.get("status_code") != 200:
+            status_code = response.get("status_code") if response else "无响应"
             logger.warn(f"字幕文件下载失败，状态：{status_code}，地址：{self._safe_url_for_log(url)}")
-            self._close_response(res)
             self._record_download_failed_url(url)
             return None
-        content = self._response_content(res)
-        self._close_response(res)
+        content = response.get("content") or b""
         if not content:
             logger.warn(f"字幕文件下载内容为空或超限，地址：{self._safe_url_for_log(url)}")
             self._record_download_failed_url(url)
             return None
-        content_type = (res.headers.get("Content-Type") or "").lower()
+        content_type = (response.get("headers", {}).get("Content-Type") or "").lower()
         if zipfile.is_zipfile(io.BytesIO(content)) or "zip" in content_type or url.lower().split("?")[0].endswith(".zip"):
             saved = self._save_from_zip(content, video_path)
             if saved:
@@ -1341,6 +1341,44 @@ class ChineseSubtitle(_PluginBase):
 
     def _download_timeout(self) -> int:
         return max(1, min(int(self._timeout or 20), 15))
+
+    def _download_deadline_seconds(self) -> int:
+        return self._download_timeout() + self._subtitle_download_deadline_extra_seconds
+
+    def _download_response(self, url: str) -> Optional[dict]:
+        result_queue = queue.Queue(maxsize=1)
+
+        def fetch_response():
+            res = None
+            try:
+                res = RequestUtils(timeout=self._download_timeout()).get_res(url, stream=True)
+                if res is None:
+                    result_queue.put({"status_code": None, "headers": {}, "content": b""})
+                    return
+                result_queue.put({
+                    "status_code": res.status_code,
+                    "headers": dict(getattr(res, "headers", {}) or {}),
+                    "content": self._response_content(res),
+                })
+            except Exception as err:
+                logger.warn(f"字幕文件下载请求异常：{err}，地址：{self._safe_url_for_log(url)}")
+                result_queue.put({"status_code": None, "headers": {}, "content": b""})
+            finally:
+                self._close_response(res)
+
+        download_thread = threading.Thread(target=fetch_response, daemon=True)
+        download_thread.start()
+        download_thread.join(timeout=self._download_deadline_seconds())
+        if download_thread.is_alive():
+            logger.warn(
+                f"字幕文件下载超过总耗时限制 {self._download_deadline_seconds()} 秒，"
+                f"跳过地址：{self._safe_url_for_log(url)}"
+            )
+            return None
+        try:
+            return result_queue.get_nowait()
+        except queue.Empty:
+            return None
 
     def _response_content(self, res) -> bytes:
         if not hasattr(res, "iter_content"):
