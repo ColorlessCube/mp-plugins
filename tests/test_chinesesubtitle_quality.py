@@ -217,6 +217,34 @@ def test_valid_subtitle_content_rejects_html_and_accepts_subtitles(monkeypatch):
     )
 
 
+def test_short_title_substring_does_not_score_as_exact_match(monkeypatch):
+    """短片名只是长标题子串时不应按精确匹配评分。"""
+    module = _load_plugin_module(monkeypatch)
+
+    score = module.ChineseSubtitle._text_match_score(
+        "植物学家",
+        "The Chinese Botanists Daughters 植物学家的中国女孩",
+    )
+
+    assert score < 45
+
+
+def test_iter_video_files_skips_bluray_stream_segments(monkeypatch, tmp_path):
+    """目录扫描应跳过蓝光 BDMV/STREAM 分段文件。"""
+    module = _load_plugin_module(monkeypatch)
+    stream_dir = tmp_path / "Movie" / "BDMV" / "STREAM"
+    stream_dir.mkdir(parents=True)
+    segment = stream_dir / "00000.m2ts"
+    normal = tmp_path / "Movie.2026.mkv"
+    segment.write_bytes(b"video")
+    normal.write_bytes(b"video")
+
+    files = list(module.ChineseSubtitle._iter_video_files(tmp_path))
+
+    assert normal in files
+    assert segment not in files
+
+
 def test_save_from_zip_skips_invalid_members(monkeypatch, tmp_path):
     """压缩包保存时应跳过无效字幕成员。"""
     module = _load_plugin_module(monkeypatch)

@@ -47,7 +47,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.14"
+    plugin_version = "1.2.15"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -307,8 +307,22 @@ class ChineseSubtitle(_PluginBase):
     @staticmethod
     def _iter_video_files(scan_dir: Path):
         for item in scan_dir.rglob("*"):
-            if item.is_file() and item.suffix.lower() in settings.RMT_MEDIAEXT:
+            if (
+                    item.is_file()
+                    and item.suffix.lower() in settings.RMT_MEDIAEXT
+                    and not ChineseSubtitle._is_bluray_stream_segment(item)
+            ):
                 yield item
+
+    @staticmethod
+    def _is_bluray_stream_segment(video_path: Path) -> bool:
+        parts = [part.lower() for part in video_path.parts]
+        return (
+                video_path.suffix.lower() == ".m2ts"
+                and video_path.stem.isdigit()
+                and "bdmv" in parts
+                and "stream" in parts
+        )
 
     def _mediainfo_from_local_nfo(self, video_path: Path) -> Optional[MediaInfo]:
         fallback = None
@@ -1329,8 +1343,12 @@ class ChineseSubtitle(_PluginBase):
         text = re.sub(r"\s+", " ", (text or "").lower()).strip()
         if not query or not text:
             return 0
-        if query in text or text in query:
+        if query == text:
             return 100
+        if query in text or text in query:
+            shorter, longer = sorted((query, text), key=len)
+            containment_score = len(shorter) / len(longer) * 100
+            return min(95, containment_score)
         return SequenceMatcher(None, query, text).ratio() * 100
 
     @staticmethod
