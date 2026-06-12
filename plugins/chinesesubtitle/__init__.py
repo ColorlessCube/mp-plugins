@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.35"
+    plugin_version = "1.2.36"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -119,6 +119,8 @@ class ChineseSubtitle(_PluginBase):
     _subtitle_download_deadline_extra_seconds = 2
     _bilingual_preference_score = 80
     _candidate_download_score_floor = 70
+    _bilingual_plain_fallback_limit = 1
+    _assrt_query_candidate_multiplier = 2
     _non_bilingual_keep_margin = 20
     _release_feature_match_score = 15
     _release_feature_mismatch_penalty = 12
@@ -1053,10 +1055,11 @@ class ChineseSubtitle(_PluginBase):
         target_year = self._target_year(video_path, mediainfo, meta)
         target_resolution = self._target_resolution(video_path)
         target_release_text = video_path.name
+        candidates = []
         for query in self._assrt_queries(video_path, mediainfo, meta):
             if not self._source_search_available("assrt"):
                 break
-            candidates = self._search_assrt_by_query(
+            query_candidates = self._search_assrt_by_query(
                 video_path=video_path,
                 target_title=target_title,
                 target_year=target_year,
@@ -1064,9 +1067,12 @@ class ChineseSubtitle(_PluginBase):
                 target_release_text=target_release_text,
                 query=query,
             )
-            if candidates:
-                return candidates
-        return []
+            if query_candidates:
+                candidates.extend(query_candidates)
+                candidate_limit = self._max_candidates * self._assrt_query_candidate_multiplier
+                if len(self._rank_candidates(candidates)) >= candidate_limit:
+                    break
+        return self._rank_candidates(candidates)
 
     def _download_assrt_season_episode(self, video_path: Path, mediainfo: Any, meta: Any) -> Optional[Path]:
         if not self._is_tv(mediainfo, meta):
@@ -1230,6 +1236,14 @@ class ChineseSubtitle(_PluginBase):
             hash_params = params.copy()
             hash_params["moviehash"] = movie_hash
             search_params_list.insert(0, hash_params)
+        if "query" not in params:
+            query_params = {
+                key: value
+                for key, value in params.items()
+                if key not in {"imdb_id", "tmdb_id"}
+            }
+            query_params["query"] = self._target_title(video_path, mediainfo, meta)
+            search_params_list.append(query_params)
 
         for search_params in search_params_list:
             res = RequestUtils(headers=headers, timeout=self._timeout).get_res(
@@ -1763,18 +1777,24 @@ class ChineseSubtitle(_PluginBase):
         unique_candidates = []
         seen_keys = set()
         for candidate in candidates:
-            key = (
-                candidate.source,
-                candidate.file_id,
-                candidate.download_url,
-                candidate.title,
-                candidate.file_name,
-            )
+            key = self._candidate_identity(candidate)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
             unique_candidates.append(candidate)
         return sorted(unique_candidates, key=self._candidate_sort_score, reverse=True)
+
+    @staticmethod
+    def _candidate_identity(candidate: SubtitleCandidate) -> Tuple[Any, ...]:
+        raw = candidate.raw if isinstance(candidate.raw, dict) else {}
+        return (
+            candidate.source,
+            candidate.file_id,
+            raw.get("id"),
+            candidate.download_url,
+            candidate.title,
+            candidate.file_name,
+        )
 
     def _downloadable_candidates(self, candidates: List[SubtitleCandidate]) -> List[SubtitleCandidate]:
         ranked_candidates = self._rank_candidates(candidates)
@@ -1788,13 +1808,47 @@ class ChineseSubtitle(_PluginBase):
         ]
         best_bilingual_score = max(bilingual_scores) if bilingual_scores else 0
         downloadable = []
+        selected_keys = set()
         for candidate in ranked_candidates:
             if not self._candidate_download_filter(candidate, top_score, best_bilingual_score):
                 continue
             downloadable.append(candidate)
+            selected_keys.add(self._candidate_identity(candidate))
             if len(downloadable) >= self._max_candidates:
                 break
+        has_plain_candidate = any(
+            not self._looks_chinese_english_bilingual(self._candidate_bilingual_text(candidate))
+            for candidate in downloadable
+        )
+        fallback_candidates = [] if has_plain_candidate else self._bilingual_plain_fallback_candidates(
+            ranked_candidates,
+            selected_keys,
+        )
+        for candidate in fallback_candidates:
+            if len(downloadable) >= self._max_candidates:
+                break
+            downloadable.append(candidate)
+            selected_keys.add(self._candidate_identity(candidate))
         return downloadable
+
+    def _bilingual_plain_fallback_candidates(self, ranked_candidates: List[SubtitleCandidate],
+                                             selected_keys: Set[Tuple[Any, ...]]) -> List[SubtitleCandidate]:
+        if not self._prefer_bilingual or not ranked_candidates:
+            return []
+        fallback_candidates = [
+            candidate
+            for candidate in ranked_candidates
+            if (
+                    self._candidate_identity(candidate) not in selected_keys
+                    and not self._looks_chinese_english_bilingual(self._candidate_bilingual_text(candidate))
+                    and candidate.score >= self._candidate_download_score_floor
+            )
+        ]
+        return sorted(
+            fallback_candidates,
+            key=lambda candidate: candidate.score,
+            reverse=True,
+        )[:self._bilingual_plain_fallback_limit]
 
     def _candidate_download_filter(self, candidate: SubtitleCandidate, top_score: float,
                                    best_bilingual_score: float = 0) -> bool:

@@ -187,6 +187,39 @@ def test_process_video_prefers_bilingual_candidate(monkeypatch, tmp_path):
     assert attempted == ["Movie.2024.中英双语"]
 
 
+def test_process_video_falls_back_to_plain_chinese_after_bilingual_failure(monkeypatch, tmp_path):
+    """双语候选失败后应继续尝试强匹配普通中文字幕。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.1080p.WEB-DL-GRP.mkv"
+    video_path.write_bytes(b"video")
+    attempted = []
+
+    def search_source(source, *_args):
+        """返回双语候选和普通中文字幕兜底候选。"""
+        if source == "assrt":
+            return [module.SubtitleCandidate(source="ASSRT", title="Movie.2024.中英双语", score=80)]
+        if source == "subdl":
+            return [module.SubtitleCandidate(source="SubDL", title="Movie.2024.简体中文", score=130)]
+        return []
+
+    def download_candidate(candidate, _video_path, *_args):
+        """模拟双语下载失败后普通中文字幕成功。"""
+        attempted.append(candidate.title)
+        if "简体中文" in candidate.title:
+            return _video_path.with_name(f"{_video_path.stem}.zh-CN.srt")
+        return None
+
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["assrt", "subdl"])
+    monkeypatch.setattr(plugin, "_download_assrt_season_episode", lambda *_args: None)
+    monkeypatch.setattr(plugin, "_search_source", search_source)
+    monkeypatch.setattr(plugin, "_download_candidate", download_candidate)
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+
+    assert plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
+    assert attempted == ["Movie.2024.中英双语", "Movie.2024.简体中文"]
+
+
 def test_process_video_prunes_low_value_download_candidates(monkeypatch, tmp_path):
     """下载阶段应只尝试排序后的高价值候选，避免低分候选拖慢扫描。"""
     module = _load_plugin_module(monkeypatch)
@@ -263,6 +296,66 @@ def test_process_video_reuses_scan_existing_subtitle_check(monkeypatch, tmp_path
         storage="local",
         existing_subtitle_checked=True,
     )
+
+
+def test_opensubtitles_falls_back_to_title_query_after_id_miss(monkeypatch, tmp_path):
+    """OpenSubtitles ID 检索未命中时应回退片名查询。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.1080p.WEB-DL-GRP.mkv"
+    video_path.write_bytes(b"video")
+    requested_params = []
+
+    class FakeResponse:
+        """测试用 OpenSubtitles 搜索响应。"""
+
+        status_code = 200
+
+        def __init__(self, payload):
+            """保存响应内容。"""
+            self._payload = payload
+
+        def json(self):
+            """返回响应 JSON。"""
+            return self._payload
+
+    class FakeRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **_kwargs):
+            """忽略请求参数。"""
+
+        @staticmethod
+        def get_res(_url, params=None):
+            """ID 查询返回空，标题查询返回候选。"""
+            requested_params.append(dict(params or {}))
+            if params and params.get("query"):
+                return FakeResponse({
+                    "data": [{
+                        "id": "title-match",
+                        "attributes": {
+                            "release": "Movie.2024.1080p.WEB-DL-GRP",
+                            "language": "zh-cn",
+                            "download_count": 10,
+                            "ratings": 8,
+                            "files": [{"file_id": 7, "file_name": "Movie.2024.1080p.WEB-DL-GRP.srt"}],
+                        },
+                    }]
+                })
+            return FakeResponse({"data": []})
+
+    monkeypatch.setattr(module, "RequestUtils", FakeRequestUtils)
+    monkeypatch.setattr(plugin, "_opensubtitles_hash", lambda _video_path: "")
+
+    candidates = plugin._search_opensubtitles(
+        video_path,
+        mediainfo=types.SimpleNamespace(imdb_id="tt1234567", title="Movie"),
+        meta=None,
+    )
+
+    assert [params.get("imdb_id") for params in requested_params] == ["1234567", None]
+    assert requested_params[-1]["query"] == "Movie"
+    assert [candidate.file_id for candidate in candidates] == [7]
 
 
 def test_opensubtitles_candidates_prefer_matching_release_features(monkeypatch, tmp_path):
@@ -922,6 +1015,30 @@ def test_assrt_search_stops_after_scan_source_disabled(monkeypatch, tmp_path):
         module.ChineseSubtitle._scan_disabled_sources = set()
 
     assert searched_queries == ["棋士 S01E02"]
+
+
+def test_assrt_search_merges_multiple_query_candidates(monkeypatch, tmp_path):
+    """ASSRT 不应因首个查询有候选就丢失后续高分兜底候选。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.1080p.WEB-DL-GRP.mkv"
+    video_path.write_bytes(b"video")
+    searched_queries = []
+
+    def search_by_query(**kwargs):
+        """按查询返回不同分数候选。"""
+        searched_queries.append(kwargs["query"])
+        if kwargs["query"] == "Movie":
+            return [module.SubtitleCandidate(source="ASSRT", title="low", score=80, raw={"id": 1})]
+        return [module.SubtitleCandidate(source="ASSRT", title="high", score=130, raw={"id": 2})]
+
+    monkeypatch.setattr(plugin, "_assrt_queries", lambda *_args: ["Movie", "Movie 2024"])
+    monkeypatch.setattr(plugin, "_search_assrt_by_query", search_by_query)
+
+    candidates = plugin._search_assrt(video_path, mediainfo=None, meta=None)
+
+    assert searched_queries == ["Movie", "Movie 2024"]
+    assert [candidate.title for candidate in candidates] == ["high", "low"]
 
 
 def test_assrt_interval_wait_rechecks_backoff_before_request(monkeypatch):
