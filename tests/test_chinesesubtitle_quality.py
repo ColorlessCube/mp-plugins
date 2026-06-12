@@ -186,6 +186,30 @@ def test_process_video_prefers_bilingual_candidate(monkeypatch, tmp_path):
     assert attempted == ["Movie.2024.中英双语"]
 
 
+def test_process_video_reuses_scan_existing_subtitle_check(monkeypatch, tmp_path):
+    """扫描阶段已检查已有字幕时处理函数不应重复读取字幕。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.mkv"
+    video_path.write_bytes(b"video")
+
+    def fail_existing_subtitle(_video_path):
+        """重复检查已有字幕时抛错。"""
+        raise AssertionError("existing subtitle should not be checked twice")
+
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", fail_existing_subtitle)
+    monkeypatch.setattr(plugin, "_enabled_sources", lambda: ["subdl"])
+    monkeypatch.setattr(plugin, "_search_source", lambda *_args: [])
+
+    assert not plugin._process_video(
+        video_path=video_path,
+        mediainfo=None,
+        meta=None,
+        storage="local",
+        existing_subtitle_checked=True,
+    )
+
+
 def test_opensubtitles_candidates_prefer_matching_release_features(monkeypatch, tmp_path):
     """候选排序应优先匹配片源、编码、音频和发布组的字幕。"""
     module = _load_plugin_module(monkeypatch)
@@ -419,6 +443,34 @@ def test_nfo_episode_is_used_when_filename_has_no_sxxexx(monkeypatch, tmp_path):
     assert plugin._season_episode_from_meta(mediainfo, meta=None) == "S01E07"
 
 
+def test_shared_tvshow_nfo_is_cached(monkeypatch, tmp_path):
+    """同一目录共享的 tvshow.nfo 应只解析一次。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    module.ChineseSubtitle._nfo_mediainfo_cache = {}
+    nfo_path = tmp_path / "tvshow.nfo"
+    nfo_path.write_text(
+        "<tvshow><title>棋士</title><uniqueid type=\"tmdb\">6062096</uniqueid></tvshow>",
+        encoding="utf-8",
+    )
+    first_video = tmp_path / "棋士 - S01E01.mkv"
+    second_video = tmp_path / "棋士 - S01E02.mkv"
+    first_video.write_bytes(b"video")
+    second_video.write_bytes(b"video")
+    parsed_paths = []
+
+    def parse_nfo(path):
+        """记录 NFO 解析次数。"""
+        parsed_paths.append(path)
+        return types.SimpleNamespace(imdb_id="tt1234567", tmdb_id=6062096)
+
+    monkeypatch.setattr(plugin, "_parse_nfo_mediainfo", parse_nfo)
+
+    assert plugin._mediainfo_from_local_nfo(first_video).imdb_id == "tt1234567"
+    assert plugin._mediainfo_from_local_nfo(second_video).imdb_id == "tt1234567"
+    assert parsed_paths == [nfo_path]
+
+
 def test_short_title_substring_does_not_score_as_exact_match(monkeypatch):
     """短片名只是长标题子串时不应按精确匹配评分。"""
     module = _load_plugin_module(monkeypatch)
@@ -594,6 +646,31 @@ def test_scan_library_skips_duplicate_trigger(monkeypatch):
         plugin.scan_library()
     finally:
         module.ChineseSubtitle._scan_task_lock.release()
+
+
+def test_scan_library_skips_recent_video_miss(monkeypatch, tmp_path):
+    """目录扫描应跳过近期已经完整尝试但未命中的视频。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    plugin._scan_system_library_dirs = False
+    plugin._scan_dirs = str(tmp_path)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    processed = []
+
+    def process_video(**kwargs):
+        """记录实际进入字幕搜索的视频。"""
+        processed.append(kwargs["video_path"].name)
+        return False
+
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+    monkeypatch.setattr(plugin, "_mediainfo_from_local_nfo", lambda _video_path: None)
+    monkeypatch.setattr(plugin, "_process_video", process_video)
+
+    plugin._scan_library_locked()
+    plugin._scan_library_locked()
+
+    assert processed == ["Movie.2026.mkv"]
 
 
 def test_assrt_search_stops_after_scan_source_disabled(monkeypatch, tmp_path):
