@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.37"
+    plugin_version = "1.2.38"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -1322,10 +1322,32 @@ class ChineseSubtitle(_PluginBase):
         if getattr(mediainfo, "year", None):
             params["year"] = getattr(mediainfo, "year")
 
-        res = RequestUtils(timeout=self._timeout).get_res("https://api.subdl.com/api/v1/subtitles", params=params)
-        if not res or res.status_code != 200:
-            return []
-        data = res.json()
+        search_params_list = self._subdl_search_params_list(params, mediainfo, meta)
+        for search_params in search_params_list:
+            res = RequestUtils(timeout=self._timeout).get_res(
+                "https://api.subdl.com/api/v1/subtitles", params=search_params
+            )
+            if not res or res.status_code != 200:
+                continue
+            candidates = self._subdl_candidates(res.json(), video_path)
+            if candidates:
+                return candidates
+            if search_params is params and len(search_params_list) > 1:
+                logger.info(f"SubDL 媒体ID未命中，改用标题/季集重试：{video_path.name}")
+        return []
+
+    def _subdl_search_params_list(self, params: dict, mediainfo: Any, meta: Any) -> List[dict]:
+        search_params_list = [params]
+        if self._is_tv(mediainfo, meta) and ("imdb_id" in params or "tmdb_id" in params):
+            fallback_params = {
+                key: value
+                for key, value in params.items()
+                if key not in {"imdb_id", "tmdb_id"}
+            }
+            search_params_list.append(fallback_params)
+        return search_params_list
+
+    def _subdl_candidates(self, data: dict, video_path: Path) -> List[SubtitleCandidate]:
         if not data.get("status"):
             return []
         candidates = []

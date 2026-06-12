@@ -437,6 +437,66 @@ def test_opensubtitles_candidates_filters_machine_and_hearing_impaired(monkeypat
     assert candidates[0].file_id == 3
 
 
+def test_subdl_falls_back_without_media_ids_for_tv_episode(monkeypatch, tmp_path):
+    """SubDL 剧集媒体 ID 未命中时应去掉 ID 后重试。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "凡人修仙传 - S01E09 - 第9集.mkv"
+    video_path.write_bytes(b"video")
+    requested_params = []
+
+    class FakeResponse:
+        """测试用 SubDL 搜索响应。"""
+
+        status_code = 200
+
+        def __init__(self, payload):
+            """保存响应内容。"""
+            self._payload = payload
+
+        def json(self):
+            """返回响应 JSON。"""
+            return self._payload
+
+    class FakeRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **_kwargs):
+            """忽略请求参数。"""
+
+        @staticmethod
+        def get_res(_url, params=None):
+            """带媒体 ID 返回空，去掉 ID 后返回候选。"""
+            requested_params.append(dict(params or {}))
+            if params and "tmdb_id" not in params and "imdb_id" not in params:
+                return FakeResponse({
+                    "status": True,
+                    "subtitles": [{
+                        "release_name": "凡人修仙传 S01E09 简体中文",
+                        "language": "ZH_CN",
+                        "url": "/subtitle.srt",
+                    }],
+                })
+            return FakeResponse({"status": True, "subtitles": []})
+
+    monkeypatch.setattr(module, "RequestUtils", FakeRequestUtils)
+    mediainfo = types.SimpleNamespace(
+        type=module.MediaType.TV,
+        title="凡人修仙传",
+        season=1,
+        episode=9,
+        tmdb_id=2906561,
+    )
+
+    candidates = plugin._search_subdl(video_path, mediainfo=mediainfo, meta=None)
+
+    assert requested_params[0]["tmdb_id"] == 2906561
+    assert "tmdb_id" not in requested_params[1]
+    assert requested_params[1]["season_number"] == 1
+    assert requested_params[1]["episode_number"] == 9
+    assert [candidate.title for candidate in candidates] == ["凡人修仙传 S01E09 简体中文"]
+
+
 def test_valid_subtitle_content_rejects_html_and_accepts_subtitles(monkeypatch):
     """字幕内容校验应拒绝 HTML 错误页并接受常见字幕格式。"""
     module = _load_plugin_module(monkeypatch)
