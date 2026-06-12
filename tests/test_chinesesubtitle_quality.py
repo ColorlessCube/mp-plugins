@@ -674,6 +674,52 @@ def test_scan_library_skips_recent_video_miss(monkeypatch, tmp_path):
     assert processed == ["Movie.2026.mkv"]
 
 
+def test_scan_library_deduplicates_video_paths(monkeypatch, tmp_path):
+    """目录扫描同一轮遇到重复视频路径时只应处理一次。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    processed = []
+
+    def process_video(**kwargs):
+        """记录实际处理的视频。"""
+        processed.append(kwargs["video_path"].name)
+        return False
+
+    monkeypatch.setattr(plugin, "_scan_directories", lambda: [tmp_path, tmp_path])
+    monkeypatch.setattr(plugin, "_iter_video_files", lambda _scan_dir: [video_path])
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+    monkeypatch.setattr(plugin, "_mediainfo_from_local_nfo", lambda _video_path: None)
+    monkeypatch.setattr(plugin, "_process_video", process_video)
+
+    plugin._scan_library_locked()
+
+    assert processed == ["Movie.2026.mkv"]
+
+
+def test_scan_library_logs_summary_after_limit(monkeypatch, tmp_path):
+    """目录扫描达到尝试上限后仍应输出汇总。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    plugin._scan_limit = 1
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+    logs = []
+
+    monkeypatch.setattr(plugin, "_scan_directories", lambda: [tmp_path])
+    monkeypatch.setattr(plugin, "_iter_video_files", lambda _scan_dir: [video_path, video_path.with_name("Next.mkv")])
+    monkeypatch.setattr(plugin, "_has_existing_subtitle", lambda _video_path: False)
+    monkeypatch.setattr(plugin, "_mediainfo_from_local_nfo", lambda _video_path: None)
+    monkeypatch.setattr(plugin, "_process_video", lambda **_kwargs: False)
+    monkeypatch.setattr(module.logger, "info", lambda message: logs.append(message))
+
+    plugin._scan_library_locked()
+
+    assert any("中文字幕目录扫描达到单次尝试上限" in message for message in logs)
+    assert any("中文字幕目录扫描完成" in message for message in logs)
+
+
 def test_assrt_search_stops_after_scan_source_disabled(monkeypatch, tmp_path):
     """本轮 ASSRT 熔断后应停止后续查询变体。"""
     module = _load_plugin_module(monkeypatch)
@@ -808,6 +854,43 @@ def test_source_miss_cache_skips_repeated_source_search(monkeypatch, tmp_path):
     assert not plugin._process_video(video_path=video_path, mediainfo=None, meta=None, storage="local")
 
     assert searched_sources == ["subdl"]
+
+
+def test_video_scan_miss_key_ignores_scan_disabled_sources(monkeypatch, tmp_path):
+    """视频级未命中缓存不应受本轮源熔断状态影响。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2026.mkv"
+    video_path.write_bytes(b"video")
+
+    before_key = plugin._video_scan_miss_cache_entry_key(video_path)
+    module.ChineseSubtitle._scan_disabled_sources = {"assrt", "opensubtitles"}
+    try:
+        after_key = plugin._video_scan_miss_cache_entry_key(video_path)
+    finally:
+        module.ChineseSubtitle._scan_disabled_sources = set()
+
+    assert before_key == after_key
+
+
+def test_opensubtitles_quota_exhausted_disables_source_for_scan(monkeypatch):
+    """OpenSubtitles 达到下载额度后应在本轮扫描内禁用。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    disabled = []
+    module.ChineseSubtitle._scan_active = True
+    module.ChineseSubtitle._scan_disabled_sources = set()
+
+    monkeypatch.setattr(plugin, "_opensubtitles_download_quota_exhausted", lambda: True)
+    monkeypatch.setattr(plugin, "_disable_source_for_scan", lambda source, reason: disabled.append((source, reason)))
+
+    try:
+        assert not plugin._source_search_available("opensubtitles")
+    finally:
+        module.ChineseSubtitle._scan_active = False
+        module.ChineseSubtitle._scan_disabled_sources = set()
+
+    assert disabled == [("opensubtitles", "今日下载额度已用完")]
 
 
 def test_save_from_zip_skips_invalid_members(monkeypatch, tmp_path):
