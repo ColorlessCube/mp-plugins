@@ -843,6 +843,89 @@ def test_save_from_zip_prefers_bilingual_member(monkeypatch, tmp_path):
     assert saved.read_text() == "1\n00:00:01,000 --> 00:00:02,000\n你好 hello\n"
 
 
+def test_download_url_caches_failed_url(monkeypatch, tmp_path):
+    """下载失败的字幕地址应短期缓存并跳过重复请求。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.mkv"
+    video_path.write_bytes(b"video")
+    calls = []
+
+    class BadResponse:
+        """测试用失败响应。"""
+
+        status_code = 500
+        headers = {}
+
+        @staticmethod
+        def close():
+            """关闭响应。"""
+
+    class FakeRequestUtils:
+        """测试用 HTTP 客户端。"""
+
+        def __init__(self, **kwargs):
+            """记录下载超时配置。"""
+            self.timeout = kwargs.get("timeout")
+
+        def get_res(self, url, **kwargs):
+            """记录请求并返回失败响应。"""
+            calls.append((url, self.timeout, kwargs.get("stream")))
+            return BadResponse()
+
+    monkeypatch.setattr(module, "RequestUtils", FakeRequestUtils)
+
+    assert plugin._download_url("https://example.com/sub.srt", video_path) is None
+    assert plugin._download_url("https://example.com/sub.srt", video_path) is None
+
+    assert calls == [("https://example.com/sub.srt", 15, True)]
+
+
+def test_download_assrt_limits_urls_per_candidate(monkeypatch, tmp_path):
+    """ASSRT 单个候选只应尝试有限数量下载地址。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    video_path = tmp_path / "Movie.2024.mkv"
+    video_path.write_bytes(b"video")
+    attempted_urls = []
+
+    class DetailResponse:
+        """测试用 ASSRT 详情响应。"""
+
+        status_code = 200
+
+        @staticmethod
+        def json():
+            """返回多个可下载地址。"""
+            return {
+                "status": 0,
+                "sub": {
+                    "subs": [{
+                        "filelist": [
+                            {"url": "https://example.com/1.srt"},
+                            {"url": "https://example.com/2.srt"},
+                            {"url": "https://example.com/3.srt"},
+                        ],
+                    }],
+                },
+            }
+
+    monkeypatch.setattr(plugin, "_assrt_get_res", lambda *_args, **_kwargs: DetailResponse())
+
+    def download_url(url, _video_path):
+        """记录实际尝试下载的地址。"""
+        attempted_urls.append(url)
+        return None
+
+    monkeypatch.setattr(plugin, "_download_url", download_url)
+
+    assert plugin._download_assrt(
+        module.SubtitleCandidate(source="ASSRT", title="candidate", raw={"id": 1}),
+        video_path,
+    ) is None
+    assert attempted_urls == ["https://example.com/1.srt", "https://example.com/2.srt"]
+
+
 def test_download_assrt_deduplicates_repeated_file_urls(monkeypatch, tmp_path):
     """ASSRT 详情返回重复下载地址时应只尝试一次。"""
     module = _load_plugin_module(monkeypatch)

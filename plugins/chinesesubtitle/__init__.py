@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import hashlib
 import io
 import re
 import threading
@@ -47,7 +48,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.27"
+    plugin_version = "1.2.28"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -104,6 +105,11 @@ class ChineseSubtitle(_PluginBase):
     _video_scan_miss_cache_key = "video_scan_miss_cache"
     _video_scan_miss_cache_limit = 5000
     _nfo_mediainfo_cache_limit = 1000
+    _download_failed_url_cache_key = "download_failed_url_cache"
+    _download_failed_url_cache_ttl = 24 * 3600
+    _download_failed_url_cache_limit = 5000
+    _assrt_candidate_url_attempt_limit = 2
+    _subtitle_download_max_bytes = 8 * 1024 * 1024
     _bilingual_preference_score = 80
     _release_feature_match_score = 15
     _release_feature_mismatch_penalty = 12
@@ -770,6 +776,53 @@ class ChineseSubtitle(_PluginBase):
     def _scan_miss_ttl_seconds(self) -> int:
         return max(0, int(self._scan_miss_ttl_hours or 0)) * 3600
 
+    def _download_failed_url_cache_hit(self, url: str) -> bool:
+        cache = self._download_failed_url_cache()
+        key = self._download_failed_url_cache_entry_key(url)
+        return bool(key and key in cache and cache[key] > time.time())
+
+    def _record_download_failed_url(self, url: str):
+        key = self._download_failed_url_cache_entry_key(url)
+        if not key:
+            return
+        cache = self._download_failed_url_cache()
+        cache[key] = time.time() + self._download_failed_url_cache_ttl
+        if len(cache) > self._download_failed_url_cache_limit:
+            cache = dict(sorted(cache.items(), key=lambda item: item[1])[-self._download_failed_url_cache_limit:])
+        self.save_data(self._download_failed_url_cache_key, cache)
+
+    def _clear_download_failed_url(self, url: str):
+        key = self._download_failed_url_cache_entry_key(url)
+        if not key:
+            return
+        cache = self._download_failed_url_cache()
+        if key in cache:
+            cache.pop(key, None)
+            self.save_data(self._download_failed_url_cache_key, cache)
+
+    def _download_failed_url_cache(self) -> Dict[str, float]:
+        now = time.time()
+        cache = self.get_data(self._download_failed_url_cache_key) or {}
+        if not isinstance(cache, dict):
+            return {}
+        cleaned = {}
+        for key, expires_at in cache.items():
+            try:
+                expires_value = float(expires_at)
+            except (TypeError, ValueError):
+                continue
+            if expires_value > now:
+                cleaned[str(key)] = expires_value
+        if len(cleaned) != len(cache):
+            self.save_data(self._download_failed_url_cache_key, cleaned)
+        return cleaned
+
+    @staticmethod
+    def _download_failed_url_cache_entry_key(url: str) -> str:
+        if not url:
+            return ""
+        return hashlib.sha1(url.encode("utf-8", "ignore")).hexdigest()
+
     def _search_source(self, source: str, video_path: Path, mediainfo: Any, meta: Any) -> List[SubtitleCandidate]:
         if source == "assrt":
             return self._search_assrt(video_path, mediainfo, meta)
@@ -1112,10 +1165,18 @@ class ChineseSubtitle(_PluginBase):
         if not urls:
             logger.info(f"ASSRT 字幕详情未返回下载地址，ID：{sub_id}")
             return None
+        attempted = 0
         for url in urls:
             if self._unsupported_subtitle_url_suffix(url):
                 logger.info(f"跳过不支持的 ASSRT 字幕文件格式，ID：{sub_id}，地址：{self._safe_url_for_log(url)}")
                 continue
+            if self._download_failed_url_cache_hit(url):
+                logger.info(f"跳过近期下载失败的 ASSRT 字幕地址，ID：{sub_id}，地址：{self._safe_url_for_log(url)}")
+                continue
+            if attempted >= self._assrt_candidate_url_attempt_limit:
+                logger.info(f"ASSRT 候选下载地址达到尝试上限，跳过剩余地址，ID：{sub_id}")
+                break
+            attempted += 1
             logger.info(f"开始下载 ASSRT 字幕文件，ID：{sub_id}，地址：{self._safe_url_for_log(url)}")
             saved = self._download_url(url, video_path)
             if saved:
@@ -1241,24 +1302,72 @@ class ChineseSubtitle(_PluginBase):
         if self._unsupported_subtitle_url_suffix(url):
             logger.info(f"跳过不支持的字幕文件格式，地址：{self._safe_url_for_log(url)}")
             return None
-        res = RequestUtils(timeout=self._timeout).get_res(url)
-        if not res or res.status_code != 200 or not res.content:
+        if self._download_failed_url_cache_hit(url):
+            logger.info(f"跳过近期下载失败的字幕地址：{self._safe_url_for_log(url)}")
+            return None
+        res = RequestUtils(timeout=self._download_timeout()).get_res(url, stream=True)
+        if not res or res.status_code != 200:
             status_code = res.status_code if res is not None else "无响应"
             logger.warn(f"字幕文件下载失败，状态：{status_code}，地址：{self._safe_url_for_log(url)}")
+            self._close_response(res)
+            self._record_download_failed_url(url)
             return None
-        content = res.content
+        content = self._response_content(res)
+        self._close_response(res)
+        if not content:
+            logger.warn(f"字幕文件下载内容为空或超限，地址：{self._safe_url_for_log(url)}")
+            self._record_download_failed_url(url)
+            return None
         content_type = (res.headers.get("Content-Type") or "").lower()
         if zipfile.is_zipfile(io.BytesIO(content)) or "zip" in content_type or url.lower().split("?")[0].endswith(".zip"):
-            return self._save_from_zip(content, video_path)
+            saved = self._save_from_zip(content, video_path)
+            if saved:
+                self._clear_download_failed_url(url)
+            else:
+                self._record_download_failed_url(url)
+            return saved
         suffix = self._guess_subtitle_suffix(url, content)
         if suffix not in settings.RMT_SUBEXT:
+            self._record_download_failed_url(url)
             return None
         if not self._valid_chinese_subtitle_content(content, suffix):
             logger.warn(f"字幕文件内容校验失败，地址：{self._safe_url_for_log(url)}")
+            self._record_download_failed_url(url)
             return None
         target = self._target_subtitle_path(video_path, suffix)
         target.write_bytes(content)
+        self._clear_download_failed_url(url)
         return target
+
+    def _download_timeout(self) -> int:
+        return max(1, min(int(self._timeout or 20), 15))
+
+    def _response_content(self, res) -> bytes:
+        if not hasattr(res, "iter_content"):
+            content = getattr(res, "content", b"") or b""
+            return b"" if len(content) > self._subtitle_download_max_bytes else content
+        chunks = []
+        total_size = 0
+        try:
+            for chunk in res.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                total_size += len(chunk)
+                if total_size > self._subtitle_download_max_bytes:
+                    return b""
+                chunks.append(chunk)
+        except Exception as err:
+            logger.warn(f"读取字幕下载响应失败：{err}")
+            return b""
+        return b"".join(chunks)
+
+    @staticmethod
+    def _close_response(res):
+        try:
+            if res is not None and hasattr(res, "close"):
+                res.close()
+        except Exception as err:
+            logger.debug(f"关闭字幕下载响应失败：{err}")
 
     @staticmethod
     def _safe_url_for_log(url: str) -> str:
