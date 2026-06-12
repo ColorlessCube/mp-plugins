@@ -49,7 +49,7 @@ class ChineseSubtitle(_PluginBase):
     plugin_name = "中文字幕下载"
     plugin_desc = "媒体整理完成后，自动从 ASSRT、OpenSubtitles、SubDL 搜索并下载中文字幕。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.2.36"
+    plugin_version = "1.2.37"
     plugin_author = "Codex"
     plugin_config_prefix = "chinese_subtitle_"
     plugin_order = 30
@@ -120,7 +120,6 @@ class ChineseSubtitle(_PluginBase):
     _bilingual_preference_score = 80
     _candidate_download_score_floor = 70
     _bilingual_plain_fallback_limit = 1
-    _assrt_query_candidate_multiplier = 2
     _non_bilingual_keep_margin = 20
     _release_feature_match_score = 15
     _release_feature_mismatch_penalty = 12
@@ -1069,8 +1068,7 @@ class ChineseSubtitle(_PluginBase):
             )
             if query_candidates:
                 candidates.extend(query_candidates)
-                candidate_limit = self._max_candidates * self._assrt_query_candidate_multiplier
-                if len(self._rank_candidates(candidates)) >= candidate_limit:
+                if len(self._rank_candidates(candidates)) >= self._max_candidates:
                     break
         return self._rank_candidates(candidates)
 

@@ -1041,6 +1041,32 @@ def test_assrt_search_merges_multiple_query_candidates(monkeypatch, tmp_path):
     assert [candidate.title for candidate in candidates] == ["high", "low"]
 
 
+def test_assrt_search_stops_when_candidate_limit_reached(monkeypatch, tmp_path):
+    """ASSRT 候选达到下载尝试数后不应继续请求后续查询。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = _plugin(module)
+    plugin._max_candidates = 2
+    video_path = tmp_path / "Movie.2024.1080p.WEB-DL-GRP.mkv"
+    video_path.write_bytes(b"video")
+    searched_queries = []
+
+    def search_by_query(**kwargs):
+        """首个查询已经返回足够候选。"""
+        searched_queries.append(kwargs["query"])
+        return [
+            module.SubtitleCandidate(source="ASSRT", title="first", score=100, raw={"id": 1}),
+            module.SubtitleCandidate(source="ASSRT", title="second", score=90, raw={"id": 2}),
+        ]
+
+    monkeypatch.setattr(plugin, "_assrt_queries", lambda *_args: ["Movie", "Movie 2024"])
+    monkeypatch.setattr(plugin, "_search_assrt_by_query", search_by_query)
+
+    candidates = plugin._search_assrt(video_path, mediainfo=None, meta=None)
+
+    assert searched_queries == ["Movie"]
+    assert [candidate.title for candidate in candidates] == ["first", "second"]
+
+
 def test_assrt_interval_wait_rechecks_backoff_before_request(monkeypatch):
     """ASSRT 节流等待后应复查冷却状态再决定是否请求。"""
     module = _load_plugin_module(monkeypatch)
