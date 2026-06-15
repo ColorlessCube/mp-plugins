@@ -431,7 +431,6 @@ def test_expired_token_refresh_failure_triggers_auth_required_callback(monkeypat
     """AT 已过期且 RT 无法续期时，应触发重新认证回调。"""
     helper_module = _load_helper_module()
     callbacks = []
-    notifications = []
     helper = helper_module.NeteaseOpenApiHelper(
         app_id="app-id",
         app_secret="app-secret",
@@ -439,7 +438,6 @@ def test_expired_token_refresh_failure_triggers_auth_required_callback(monkeypat
         access_token="expired-access-token",
         refresh_token="refresh-token",
         token_expires_at=1,
-        notify_fn=lambda title, body: notifications.append((title, body)),
         auth_required_fn=lambda: callbacks.append("auth-required"),
     )
 
@@ -447,21 +445,19 @@ def test_expired_token_refresh_failure_triggers_auth_required_callback(monkeypat
 
     assert helper.get_recent_albums(limit=10) == []
     assert callbacks == ["auth-required"]
-    assert notifications[0][0] == "网易云开放平台 Token 已过期"
+    assert "Token 已过期" in helper.get_last_error()
 
 
 def test_missing_access_token_triggers_auth_required_callback(monkeypatch):
     """缺少 AT 且无法用 RT 恢复时，应触发重新认证回调。"""
     helper_module = _load_helper_module()
     callbacks = []
-    notifications = []
     helper = helper_module.NeteaseOpenApiHelper(
         app_id="app-id",
         app_secret="app-secret",
         private_key="test",
         access_token="",
         refresh_token="",
-        notify_fn=lambda title, body: notifications.append((title, body)),
         auth_required_fn=lambda: callbacks.append("auth-required"),
     )
 
@@ -469,7 +465,7 @@ def test_missing_access_token_triggers_auth_required_callback(monkeypatch):
 
     assert helper.get_recent_albums(limit=10) == []
     assert callbacks == ["auth-required"]
-    assert notifications[0][0] == "网易云开放平台未登录"
+    assert "未登录" in helper.get_last_error()
 
 
 def test_auth_response_1406_refresh_failure_triggers_auth_required_callback(monkeypatch):
@@ -498,3 +494,4 @@ def test_auth_response_1406_refresh_failure_triggers_auth_required_callback(monk
 
     assert helper.get_recent_albums(limit=10) == []
     assert callbacks == ["auth-required"]
+    assert "Token 已过期" in helper.get_last_error()

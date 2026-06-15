@@ -327,10 +327,8 @@ class NeteaseOpenApiHelper:
         if not self._access_token:
             if self.refresh_access_token():
                 return True
-            self._notify(
-                "网易云开放平台未登录",
-                "请先通过插件的网易云官方二维码登录接口完成扫码授权。",
-            )
+            self._last_error = self._last_error or "网易云开放平台未登录，请先完成扫码授权"
+            logger.warning(self._last_error)
             self._auth_required()
             return False
 
@@ -341,10 +339,8 @@ class NeteaseOpenApiHelper:
             if self._token_expires_at > now_ts:
                 logger.warning("网易云开放平台 Access Token 预刷新失败，将继续使用尚未过期的现有 Token")
                 return True
-            self._notify(
-                "网易云开放平台 Token 已过期",
-                "Refresh Token 无法续期，请重新生成二维码扫码登录。",
-            )
+            self._last_error = self._last_error or "网易云开放平台 Token 已过期，Refresh Token 无法续期"
+            logger.warning(self._last_error)
             self._auth_required()
             return False
 
@@ -371,10 +367,8 @@ class NeteaseOpenApiHelper:
 
         logger.warning("网易云开放平台接口提示 Access Token 过期，尝试使用 Refresh Token 续期")
         if not self.refresh_access_token():
-            self._notify(
-                "网易云开放平台 Token 已过期",
-                "Refresh Token 无法续期，请重新生成二维码扫码登录。",
-            )
+            self._last_error = self._last_error or "网易云开放平台 Token 已过期，Refresh Token 无法续期"
+            logger.warning(self._last_error)
             self._auth_required()
             return response
 
