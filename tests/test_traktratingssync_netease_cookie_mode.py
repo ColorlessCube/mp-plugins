@@ -57,15 +57,6 @@ class _DoubanHelper:
         """初始化豆瓣 Helper 桩。"""
 
 
-class _NeteaseOpenApiHelper:
-    """测试用网易云开放平台 Helper。"""
-
-    @staticmethod
-    def normalize_device_id(device_id: str, app_id: str = "") -> str:
-        """返回可预测的测试设备 ID。"""
-        return device_id or f"device-{app_id or 'empty'}"
-
-
 def _install_app_stubs(monkeypatch):
     """安装插件导入所需的 MoviePilot 边界桩。"""
     app_pkg = types.ModuleType("app")
@@ -107,11 +98,6 @@ def _install_helper_stubs(monkeypatch):
     )
     monkeypatch.setitem(
         sys.modules,
-        "plugins.traktratingssync.netease_openapi_helper",
-        types.SimpleNamespace(NeteaseOpenApiHelper=_NeteaseOpenApiHelper),
-    )
-    monkeypatch.setitem(
-        sys.modules,
         "plugins.traktratingssync.trakt_helper",
         types.SimpleNamespace(TraktHelper=object),
     )
@@ -148,8 +134,8 @@ def _load_plugin_module(monkeypatch):
     return module
 
 
-def test_run_skips_netease_when_only_openapi_is_configured(monkeypatch):
-    """只有开放平台配置时，定时主同步不应再触发网易云 CLI 授权流程。"""
+def test_run_ignores_legacy_openapi_config_without_cookie(monkeypatch):
+    """遗留开放平台配置不应触发网易云同步或 CLI 授权流程。"""
     module = _load_plugin_module(monkeypatch)
     plugin = module.TraktRatingsSync()
     plugin.init_plugin({
@@ -258,3 +244,38 @@ def test_netease_cookie_auth_notification_uses_persistent_cooldown(monkeypatch):
 
     assert notifications == [("网易云 Cookie 已失效", "需要更新")]
     assert plugin.get_data("netease_cookie_auth_notify_state")["title"] == "网易云 Cookie 已失效"
+
+
+def test_get_form_only_exposes_netease_cookie_config(monkeypatch):
+    """配置页不应再暴露网易云开放平台 CLI 字段。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = module.TraktRatingsSync()
+    form, defaults = plugin.get_form()
+
+    def iter_models(items):
+        """遍历表单组件中的 model 字段。"""
+        for item in items:
+            props = item.get("props") or {}
+            model = props.get("model")
+            if model:
+                yield model
+            yield from iter_models(item.get("content") or [])
+
+    models = set(iter_models(form))
+    removed_models = {
+        "netease_app_id",
+        "netease_app_secret",
+        "netease_private_key",
+        "netease_device_id",
+        "netease_access_token",
+        "netease_refresh_token",
+        "netease_token_expires_at",
+        "netease_anonymous_access_token",
+        "netease_qr_key",
+        "netease_qr_url",
+    }
+
+    assert "netease_cookie" in models
+    assert "netease_limit" in models
+    assert not (models & removed_models)
+    assert not (set(defaults) & removed_models)
