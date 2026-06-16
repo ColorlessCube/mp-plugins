@@ -57,6 +57,24 @@ class _DoubanHelper:
         """初始化豆瓣 Helper 桩。"""
 
 
+class _WereadHelper:
+    """测试用微信读书 Helper。"""
+
+    @staticmethod
+    def format_reading_time(seconds):
+        """格式化测试阅读时长。"""
+        return f"{seconds}s"
+
+
+class _XiaoyuzhouHelper:
+    """测试用小宇宙 Helper。"""
+
+    @staticmethod
+    def format_duration(seconds):
+        """格式化测试单集时长。"""
+        return f"{seconds}s"
+
+
 def _install_app_stubs(monkeypatch):
     """安装插件导入所需的 MoviePilot 边界桩。"""
     app_pkg = types.ModuleType("app")
@@ -104,12 +122,12 @@ def _install_helper_stubs(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "plugins.traktratingssync.weread_helper",
-        types.SimpleNamespace(WereadHelper=object),
+        types.SimpleNamespace(WereadHelper=_WereadHelper),
     )
     monkeypatch.setitem(
         sys.modules,
         "plugins.traktratingssync.xiaoyuzhou_helper",
-        types.SimpleNamespace(XiaoyuzhouHelper=object),
+        types.SimpleNamespace(XiaoyuzhouHelper=_XiaoyuzhouHelper),
     )
 
 
@@ -247,7 +265,7 @@ def test_netease_cookie_auth_notification_uses_persistent_cooldown(monkeypatch):
 
 
 def test_get_form_only_exposes_netease_cookie_config(monkeypatch):
-    """配置页不应再暴露网易云开放平台 CLI 字段。"""
+    """配置页仅暴露需要用户维护的网易云与授权字段。"""
     module = _load_plugin_module(monkeypatch)
     plugin = module.TraktRatingsSync()
     form, defaults = plugin.get_form()
@@ -261,8 +279,39 @@ def test_get_form_only_exposes_netease_cookie_config(monkeypatch):
                 yield model
             yield from iter_models(item.get("content") or [])
 
+    def iter_texts(items):
+        """遍历表单组件中的文本。"""
+        for item in items:
+            text = item.get("text")
+            if text:
+                yield text
+            yield from iter_texts(item.get("content") or [])
+
     models = set(iter_models(form))
+    section_titles = set(iter_texts(form))
+    editable_models = {
+        "enable",
+        "private",
+        "sync_type",
+        "cron",
+        "max_sync_count",
+        "douban_cookie",
+        "bark_webhook_url",
+        "trakt_username",
+        "trakt_client_id",
+        "trakt_client_secret",
+        "trakt_manual_mappings",
+        "trakt_history_limit",
+        "trakt_history_days",
+        "weread_api_key",
+        "weread_limit",
+        "netease_cookie",
+        "netease_limit",
+        "xiaoyuzhou_cookie",
+        "xiaoyuzhou_limit",
+    }
     removed_models = {
+        "trakt_access_token",
         "netease_app_id",
         "netease_app_secret",
         "netease_private_key",
@@ -275,7 +324,120 @@ def test_get_form_only_exposes_netease_cookie_config(monkeypatch):
         "netease_qr_url",
     }
 
-    assert "netease_cookie" in models
-    assert "netease_limit" in models
+    assert {
+        "基础设置",
+        "通知",
+        "豆瓣",
+        "Trakt",
+        "微信读书",
+        "网易云音乐",
+        "小宇宙",
+    } <= section_titles
+    assert "豆瓣与通知" not in section_titles
+    assert "阅读与音乐" not in section_titles
+    assert editable_models <= models
     assert not (models & removed_models)
-    assert not (set(defaults) & removed_models)
+    assert "trakt_access_token" in defaults
+    assert not (set(defaults) & (removed_models - {"trakt_access_token"}))
+
+
+def test_get_page_shows_overview_and_platform_sections(monkeypatch):
+    """详情页应展示概览和有数据的平台分区。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = module.TraktRatingsSync()
+    plugin.save_data("finished", {
+        "movie": {
+            "douban_id": "1292052",
+            "title": "电影 A",
+            "year": 1994,
+            "media_type": "电影",
+            "status": "看完",
+            "trakt_rating": 9,
+            "douban_rating": 9,
+            "sync_time": 1710000000,
+        }
+    })
+    plugin.save_data("watching", {
+        "show": {
+            "douban_id": "27000000",
+            "title": "剧集 B",
+            "year": 2024,
+            "media_type": "电视剧",
+            "status": "在看",
+            "sync_time": 1710000100,
+        }
+    })
+    plugin.save_data("weread_books", [{
+        "title": "书籍 C",
+        "author": "作者",
+        "status": "在读",
+        "reading_progress": 42,
+        "reading_time": 3600,
+        "weread_url": "https://weread.qq.com",
+    }])
+    plugin.save_data("netease_albums", {
+        "album": {
+            "douban_id": "35000000",
+            "douban_title": "专辑 D",
+            "artist": "音乐人",
+            "song_count": 10,
+            "total_play_count": 20,
+            "sync_time": 1710000200,
+        }
+    })
+    plugin.save_data("xiaoyuzhou_episodes", [{
+        "title": "单集 E",
+        "podcast_name": "播客",
+        "duration": 120,
+        "listen_pct": 0.5,
+        "is_finished": False,
+    }])
+
+    page = plugin.get_page()
+
+    def iter_items(items):
+        """遍历详情页组件。"""
+        for item in items:
+            yield item
+            yield from iter_items(item.get("content") or [])
+
+    texts = {
+        item.get("text") or (item.get("props") or {}).get("text")
+        for item in iter_items(page)
+        if item.get("text") or (item.get("props") or {}).get("text")
+    }
+    tables = [item for item in iter_items(page) if item.get("component") == "VTable"]
+
+    assert "同步概览" in texts
+    assert "Trakt 看过 1" in texts
+    assert "Trakt 在看 1" in texts
+    assert {"Trakt 视频", "微信读书", "网易云音乐", "小宇宙"} <= texts
+    assert "暂无 Trakt 同步历史记录" not in texts
+    assert "暂无同步记录，执行一次同步后会在这里显示最近结果。" not in texts
+    assert len(tables) == 4
+
+
+def test_get_page_shows_single_empty_state(monkeypatch):
+    """详情页无任何同步记录时只展示统一空态。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = module.TraktRatingsSync()
+
+    page = plugin.get_page()
+
+    def iter_items(items):
+        """遍历详情页组件。"""
+        for item in items:
+            yield item
+            yield from iter_items(item.get("content") or [])
+
+    texts = {
+        item.get("text") or (item.get("props") or {}).get("text")
+        for item in iter_items(page)
+        if item.get("text") or (item.get("props") or {}).get("text")
+    }
+    tables = [item for item in iter_items(page) if item.get("component") == "VTable"]
+
+    assert "同步概览" in texts
+    assert "暂无同步记录，执行一次同步后会在这里显示最近结果。" in texts
+    assert "暂无 Trakt 同步历史记录" not in texts
+    assert tables == []

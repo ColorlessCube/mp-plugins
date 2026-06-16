@@ -33,7 +33,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.29"
+    plugin_version = "3.14.31"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -1121,350 +1121,146 @@ class TraktRatingsSync(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """返回插件配置页表单结构和默认配置。"""
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "netease_cookie",
-                                            "label": "网易云 Cookie（主同步方式）",
-                                            "placeholder": "可直接填网易云 Cookie，或粘贴包含 Cookie 的完整网易云 cURL",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "netease_limit",
-                                            "label": "网易云同步专辑数",
-                                            "placeholder": "20",
-                                            "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {"component": "VSwitch", "props": {"model": "enable", "label": "启用插件"}}
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {"component": "VSwitch", "props": {"model": "private", "label": "豆瓣仅自己可见"}}
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "sync_type",
-                                            "label": "同步类型",
-                                            "items": [
-                                                {"title": "全部(电影 + 电视剧)", "value": "all"},
-                                                {"title": "仅电影", "value": "movies"},
-                                                {"title": "仅电视剧", "value": "shows"},
-                                            ],
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "trakt_manual_mappings",
-                                            "label": "Trakt → 豆瓣手动映射（可选）",
-                                            "placeholder": "每行一条，例如：imdb:tt1234567=12345678 或 movie:294048=12345678",
-                                            "rows": 2,
-                                            "auto-grow": True,
-                                        },
-                                    }
-                                ],
-                            },
+        def field(model: str, label: str, **props) -> dict:
+            return {"component": "VTextField", "props": {"model": model, "label": label, **props}}
+
+        def switch(model: str, label: str) -> dict:
+            return {"component": "VSwitch", "props": {"model": model, "label": label}}
+
+        def select(model: str, label: str, items: List[dict]) -> dict:
+            return {"component": "VSelect", "props": {"model": model, "label": label, "items": items}}
+
+        def textarea(model: str, label: str, **props) -> dict:
+            return {"component": "VTextarea", "props": {"model": model, "label": label, **props}}
+
+        def col(component: dict, cols: int = 12, md: Optional[int] = None) -> dict:
+            props = {"cols": cols}
+            if md:
+                props["md"] = md
+            return {"component": "VCol", "props": props, "content": [component]}
+
+        def row(*cols: dict) -> dict:
+            return {"component": "VRow", "content": list(cols)}
+
+        def section(title: str) -> dict:
+            return row(col({
+                "component": "div",
+                "props": {"class": "text-subtitle-1 font-weight-medium mt-4 mb-1"},
+                "text": title,
+            }))
+
+        form = [{
+            "component": "VForm",
+            "content": [
+                section("基础设置"),
+                row(
+                    col(switch("enable", "启用插件"), md=2),
+                    col(select(
+                        "sync_type",
+                        "同步类型",
+                        [
+                            {"title": "全部(电影 + 电视剧)", "value": "all"},
+                            {"title": "仅电影", "value": "movies"},
+                            {"title": "仅电视剧", "value": "shows"},
                         ],
+                    ), md=4),
+                    col(field("cron", "定时执行 cron", placeholder="0 2 * * *"), md=3),
+                    col(field("max_sync_count", "最大同步数量", placeholder="0 表示不限制", type="number"), md=3),
+                ),
+                section("通知"),
+                row(
+                    col(field(
+                        "bark_webhook_url",
+                        "Bark Webhook URL",
+                        placeholder="https://api.day.app/your_key/your_message",
+                    )),
+                ),
+                section("豆瓣"),
+                row(
+                    col(field(
+                        "douban_cookie",
+                        "豆瓣 Cookie",
+                        placeholder="可直接填豆瓣 Cookie，或粘贴包含 Cookie 的完整豆瓣 cURL",
+                    ), md=9),
+                    col(switch("private", "仅自己可见"), md=3),
+                ),
+                section("Trakt"),
+                row(
+                    col(field("trakt_username", "Trakt 用户名", placeholder="例如 ialex-cube"), md=4),
+                    col(field(
+                        "trakt_client_id",
+                        "Trakt Client ID",
+                        placeholder="在 trakt.tv/oauth/applications 创建应用获取",
+                    ), md=4),
+                    col(field(
+                        "trakt_client_secret",
+                        "Trakt Client Secret(可选)",
+                        placeholder="用于设备码授权自动获取 Access Token",
+                    ), md=4),
+                ),
+                row(
+                    col(field(
+                        "trakt_history_limit",
+                        "剧集观看历史数量",
+                        placeholder="20",
+                        type="number",
+                        hint="用于将最近看过单集的剧集同步为豆瓣在看",
+                        **{"persistent-hint": True},
+                    ), md=3),
+                    col(field(
+                        "trakt_history_days",
+                        "剧集观看历史天数",
+                        placeholder="30",
+                        type="number",
+                        hint="只处理最近 N 天观看过单集的剧集，0 表示不限制",
+                        **{"persistent-hint": True},
+                    ), md=3),
+                    col(textarea(
+                        "trakt_manual_mappings",
+                        "Trakt → 豆瓣手动映射（可选）",
+                        placeholder="每行一条，例如：imdb:tt1234567=12345678 或 movie:294048=12345678",
+                        rows=2,
+                        **{"auto-grow": True},
+                    ), md=6),
+                ),
+                section("微信读书"),
+                row(
+                    col(field("weread_api_key", "微信读书 Skill API Key", placeholder="wrk-..."), md=9),
+                    col(field("weread_limit", "微信读书同步数量", placeholder="20", type="number"), md=3),
+                ),
+                section("网易云音乐"),
+                row(
+                    col(field(
+                        "netease_cookie",
+                        "网易云 Cookie",
+                        placeholder="可直接填网易云 Cookie，或粘贴包含 Cookie 的完整网易云 cURL",
+                    ), md=9),
+                    col(field("netease_limit", "网易云同步专辑数", placeholder="20", type="number"), md=3),
+                ),
+                section("小宇宙"),
+                row(
+                    col(field(
+                        "xiaoyuzhou_cookie",
+                        "小宇宙 FM Token（可选）",
+                        placeholder="可直接填 x-jike-access-token，或粘贴包含该字段的完整小宇宙 cURL",
+                    ), md=9),
+                    col(field("xiaoyuzhou_limit", "小宇宙同步播客数", placeholder="20", type="number"), md=3),
+                ),
+                row(col({
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "class": "mt-2",
+                        "text": (
+                            "配置提示：Trakt Access Token 授权后自动保存，不在本页展示。"
+                            "网易云音乐仅使用 Cookie/完整 cURL；Cookie 失效时会按冷却策略通过 Bark 提醒。"
+                        ),
                     },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "trakt_history_limit",
-                                            "label": "Trakt 剧集观看历史数量",
-                                            "placeholder": "20",
-                                            "type": "number",
-                                            "hint": "用于将最近看过单集的剧集同步为豆瓣在看",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "trakt_history_days",
-                                            "label": "Trakt 剧集观看历史天数",
-                                            "placeholder": "30",
-                                            "type": "number",
-                                            "hint": "只处理最近 N 天观看过单集的剧集，0 表示不限制",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "trakt_username",
-                                            "label": "Trakt 用户名",
-                                            "placeholder": "例如 ialex-cube",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "trakt_client_id",
-                                            "label": "Trakt Client ID",
-                                            "placeholder": "在 trakt.tv/oauth/applications 创建应用获取(公开评分)",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "trakt_client_secret",
-                                            "label": "Trakt Client Secret(可选)",
-                                            "placeholder": "用于设备码授权自动获取 Access Token,请勿泄露",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "trakt_access_token",
-                                            "label": "Trakt Access Token（可选，自动获取后会自动填充）",
-                                            "placeholder": "留空将自动通过设备码授权获取（阻塞等待10分钟）",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "cron",
-                                            "label": "定时执行 cron",
-                                            "placeholder": "默认 0 2 * * *(每天凌晨 2 点)",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "max_sync_count",
-                                            "label": "最大同步数量",
-                                            "placeholder": "0 表示不限制,单次最多同步条数",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "douban_cookie",
-                                            "label": "豆瓣 Cookie",
-                                            "placeholder": "可直接填豆瓣 Cookie，或粘贴包含 Cookie 的完整豆瓣 cURL",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "bark_webhook_url",
-                                            "label": "Bark Webhook URL",
-                                            "placeholder": "https://api.day.app/your_key/your_message",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 10},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "weread_api_key",
-                                            "label": "微信读书 Skill API Key",
-                                            "placeholder": "wrk-...",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "weread_limit",
-                                            "label": "微信读书同步数量",
-                                            "placeholder": "20",
-                                            "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 10},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "xiaoyuzhou_cookie",
-                                            "label": "小宇宙 FM Token（可选）",
-                                            "placeholder": "可直接填 x-jike-access-token，或粘贴包含该字段的完整小宇宙 cURL",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "xiaoyuzhou_limit",
-                                            "label": "小宇宙同步播客数",
-                                            "placeholder": "20",
-                                            "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": (
-                                                "📌 使用说明：\n"
-                                                "1. 在 https://trakt.tv/oauth/applications 创建应用获取 Client ID\n"
-                                                "2. 填写 Client Secret 启用自动授权（首次同步时会通过 Bark 发送授权链接，系统阻塞等待10分钟）\n"
-                                                "3. 授权成功后，Access Token 会自动回填到配置中\n"
-                                                "4. Trakt 自动匹配失败的条目可在手动映射中填写 imdb/tmdb/trakt 与豆瓣 subject_id\n"
-                                                "5. 豆瓣支持两种填写方式：直接填 Cookie，或粘贴包含 Cookie 的完整 cURL；失效时会通过 Bark 推送通知提醒更新\n"
-                                                "6. 微信读书填写 Skill API Key（wrk-...），不再支持旧版阅读页 cURL\n"
-                                                "7. 支持同步电影和电视剧评分，以及未看完列表为「在看」\n"
-                                                "8. 网易云仅使用浏览器 Cookie/完整 cURL 同步最近播放专辑，不再使用开放平台 CLI 授权\n"
-                                                "9. 网易云会将最近播放专辑同步到豆瓣音乐「听过」；Cookie 失效时会按冷却策略推送提醒\n"
-                                                "10. 小宇宙支持两种填写方式：直接填 x-jike-access-token，或粘贴包含该字段的完整小宇宙 cURL"
-                                            ),
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                ],
-            }
-        ], {
+                })),
+            ],
+        }]
+        return form, {
             "enable": False,
             "trakt_username": "",
             "trakt_client_id": "",
@@ -1489,10 +1285,110 @@ class TraktRatingsSync(_PluginBase):
 
     def get_page(self) -> Optional[List[dict]]:
         """插件详情页：展示 Trakt 同步历史（看完/在看）、微信读书最近阅读、网易云音乐同步记录、小宇宙播客同步记录。"""
+        def format_sync_time(value: Any) -> str:
+            if not value:
+                return "-"
+            return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+
+        def cell(text: Any = "-", **props) -> dict:
+            return {
+                "component": "td",
+                "props": {"class": "text-start ps-4", **props},
+                "text": str(text) if text is not None else "-",
+            }
+
+        def chip_cell(text: str, color: str) -> dict:
+            return {
+                "component": "td",
+                "props": {"class": "text-start ps-4"},
+                "content": [{
+                    "component": "VChip",
+                    "props": {"size": "small", "color": color, "variant": "flat"},
+                    "text": text,
+                }],
+            }
+
+        def link_cell(text: str, href: str) -> dict:
+            if not href:
+                return cell()
+            return {
+                "component": "td",
+                "props": {"class": "text-start ps-4"},
+                "content": [{
+                    "component": "VBtn",
+                    "props": {
+                        "variant": "text",
+                        "color": "primary",
+                        "size": "small",
+                        "href": href,
+                        "target": "_blank",
+                    },
+                    "text": text,
+                }],
+            }
+
+        def section(title: str, count: int) -> dict:
+            return {
+                "component": "VRow",
+                "props": {"class": "mt-4"},
+                "content": [{
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [{
+                        "component": "div",
+                        "props": {"class": "d-flex align-center ga-2 mb-2"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "text-h6"},
+                                "text": title,
+                            },
+                            {
+                                "component": "VChip",
+                                "props": {"size": "small", "variant": "tonal"},
+                                "text": str(count),
+                            },
+                        ],
+                    }],
+                }],
+            }
+
+        def table(headers: List[str], rows: List[List[dict]]) -> dict:
+            return {
+                "component": "VTable",
+                "props": {"hover": True, "fixedHeader": True, "density": "comfortable"},
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [
+                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": header}
+                            for header in headers
+                        ],
+                    },
+                    {
+                        "component": "tbody",
+                        "content": [
+                            {
+                                "component": "tr",
+                                "props": {"key": f"row_{idx}"},
+                                "content": row,
+                            }
+                            for idx, row in enumerate(rows)
+                        ],
+                    },
+                ],
+            }
+
+        def overview_chip(label: str, count: int, color: str) -> dict:
+            return {
+                "component": "VChip",
+                "props": {"color": color, "variant": "tonal", "class": "ma-1"},
+                "text": f"{label} {count}",
+            }
+
         finished = self.get_data("finished") or {}
         watching = self.get_data("watching") or {}
 
-        # 兼容旧数据：synced → finished
         if not finished:
             synced = self.get_data("synced") or {}
             if synced:
@@ -1500,7 +1396,6 @@ class TraktRatingsSync(_PluginBase):
                 finished = synced
                 self.save_data("finished", finished)
 
-        # 合并看完和在看（同一 douban_id 优先显示看完）
         all_items: Dict[str, Any] = {}
         for item in finished.values():
             douban_id = item.get("douban_id")
@@ -1512,440 +1407,158 @@ class TraktRatingsSync(_PluginBase):
                 all_items[douban_id] = item
 
         history_list = sorted(all_items.values(), key=lambda x: x.get("sync_time", 0), reverse=True)[:100]
-
-        # 微信读书区块
         weread_books: List[Dict[str, Any]] = self.get_data("weread_books") or []
-        weread_section: List[dict] = []
-        if weread_books:
-            weread_section = [
-                {
-                    "component": "VRow",
-                    "props": {"class": "mt-4"},
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "div",
-                                    "props": {"class": "text-h6 mb-2"},
-                                    "text": "📚 微信读书 · 书籍",
-                                }
-                            ],
-                        }
-                    ],
-                },
-                {
-                    "component": "VTable",
-                    "props": {"hover": True, "fixedHeader": True},
-                    "content": [
-                        {
-                            "component": "thead",
-                            "content": [
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "书名"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "作者"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "状态"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "进度"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "累计阅读"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "读完时间"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "链接"},
-                            ],
-                        },
-                        {
-                            "component": "tbody",
-                            "content": [
-                                {
-                                    "component": "tr",
-                                    "props": {"key": f"weread_{idx}"},
-                                    "content": [
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": book.get("title", ""),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": book.get("author", "-"),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "content": [
-                                                {
-                                                    "component": "VChip",
-                                                    "props": {
-                                                        "size": "small",
-                                                        "color": (
-                                                            "success" if book.get("status") == "读完"
-                                                            else "primary" if book.get("status") == "在读"
-                                                            else "default"
-                                                        ),
-                                                        "variant": "flat",
-                                                    },
-                                                    "text": book.get("status", "在读"),
-                                                }
-                                            ],
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": f"{book.get('reading_progress', 0)}%",
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": WereadHelper.format_reading_time(book.get("reading_time", 0)),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": book.get("finished_date") or "-",
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "content": [
-                                                {
-                                                    "component": "VBtn",
-                                                    "props": {
-                                                        "variant": "text",
-                                                        "color": "primary",
-                                                        "size": "small",
-                                                        "href": book.get("weread_url", ""),
-                                                        "target": "_blank",
-                                                    },
-                                                    "text": "🔗 阅读",
-                                                }
-                                            ] if book.get("weread_url") else [],
-                                        },
-                                    ],
-                                }
-                                for idx, book in enumerate(weread_books)
-                            ],
-                        },
-                    ],
-                },
-            ]
-
-        # 网易云音乐同步记录区块
         netease_synced: Dict[str, Any] = self.get_data("netease_albums") or {}
         netease_list = sorted(
             netease_synced.values(), key=lambda x: x.get("sync_time", 0), reverse=True
         )[:100]
-        netease_section: List[dict] = []
-        if netease_list:
-            netease_section = [
-                {
-                    "component": "VRow",
-                    "props": {"class": "mt-4"},
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "div",
-                                    "props": {"class": "text-h6 mb-2"},
-                                    "text": "🎵 网易云音乐 · 音乐",
-                                }
-                            ],
-                        }
-                    ],
-                },
-                {
-                    "component": "VTable",
-                    "props": {"hover": True, "fixedHeader": True},
-                    "content": [
-                        {
-                            "component": "thead",
-                            "content": [
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "专辑"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "艺术家"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "曲目数"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "累计播放"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "同步时间"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "豆瓣"},
-                            ],
-                        },
-                        {
-                            "component": "tbody",
-                            "content": [
-                                {
-                                    "component": "tr",
-                                    "props": {"key": f"netease_{idx}"},
-                                    "content": [
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": rec.get("douban_title") or rec.get("album", "-"),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": rec.get("artist", "-"),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": str(rec.get("song_count", "-")),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": str(rec.get("total_play_count", "-")),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": (
-                                                datetime.fromtimestamp(rec["sync_time"]).strftime("%Y-%m-%d %H:%M")
-                                                if rec.get("sync_time") else "-"
-                                            ),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "content": [
-                                                {
-                                                    "component": "VBtn",
-                                                    "props": {
-                                                        "variant": "text",
-                                                        "color": "primary",
-                                                        "size": "small",
-                                                        "href": f"https://music.douban.com/subject/{rec.get('douban_id', '')}/",
-                                                        "target": "_blank",
-                                                    },
-                                                    "text": f"🔗 {rec.get('douban_id', '')}",
-                                                }
-                                            ] if rec.get("douban_id") else [],
-                                            "text": "-" if not rec.get("douban_id") else None,
-                                        },
-                                    ],
-                                }
-                                for idx, rec in enumerate(netease_list)
-                            ],
-                        },
-                    ],
-                },
-            ]
-
-        # 小宇宙播客同步记录区块
         xiaoyuzhou_episodes: List[Dict[str, Any]] = self.get_data("xiaoyuzhou_episodes") or []
-        xiaoyuzhou_section: List[dict] = []
-        if xiaoyuzhou_episodes:
-            xiaoyuzhou_section = [
-                {
-                    "component": "VRow",
-                    "props": {"class": "mt-4"},
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "div",
-                                    "props": {"class": "text-h6 mb-2"},
-                                    "text": "🎙️ 小宇宙 FM · 播客",
-                                }
-                            ],
-                        }
-                    ],
-                },
-                {
-                    "component": "VTable",
-                    "props": {"hover": True, "fixedHeader": True},
-                    "content": [
-                        {
-                            "component": "thead",
-                            "content": [
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "单集"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "播客"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "时长"},
-                                {"component": "th", "props": {"class": "text-start ps-4"}, "text": "播放状态"},
-                            ],
-                        },
-                        {
-                            "component": "tbody",
-                            "content": [
-                                {
-                                    "component": "tr",
-                                    "props": {"key": f"xiaoyuzhou_{idx}"},
-                                    "content": [
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": ep.get("title", ""),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": ep.get("podcast_name", "-"),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "text": XiaoyuzhouHelper.format_duration(ep.get("duration", 0)),
-                                        },
-                                        {
-                                            "component": "td",
-                                            "props": {"class": "text-start ps-4"},
-                                            "content": [
-                                                {
-                                                    "component": "VChip",
-                                                    "props": {
-                                                        "size": "small",
-                                                        "color": (
-                                                            "success" if ep.get("is_finished")
-                                                            else "primary" if ep.get("listen_pct", 0) > 0
-                                                            else "default"
-                                                        ),
-                                                        "variant": "flat",
-                                                    },
-                                                    "text": (
-                                                        "已听完" if ep.get("is_finished")
-                                                        else f"听了 {ep.get('listen_pct', 0)*100:.0f}%" if ep.get("listen_pct", 0) > 0
-                                                        else "无记录"
-                                                    ),
-                                                }
-                                            ],
-                                        },
-                                    ],
-                                }
-                                for idx, ep in enumerate(xiaoyuzhou_episodes)
-                            ],
-                        },
-                    ],
-                },
-            ]
 
-        if not history_list:
-            return [
-                {
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "text": "暂无 Trakt 同步历史记录",
-                    },
-                }
-            ] + weread_section + netease_section + xiaoyuzhou_section
-
-        # Trakt 同步历史区块（含标题）
-        trakt_section = [
+        page: List[dict] = [
             {
                 "component": "VRow",
-                "props": {"class": "mt-4"},
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {"class": "text-h6 mb-2"},
-                                "text": "🎬 Trakt · 视频",
-                            }
-                        ],
-                    }
-                ],
-            },
-            {
-                "component": "VTable",
-                "props": {"hover": True, "fixedHeader": True},
-                "content": [
-                    {
-                        "component": "thead",
-                        "content": [
-                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "标题"},
-                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "年份"},
-                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "类型"},
-                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "状态"},
-                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "Trakt 评分"},
-                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "豆瓣评分"},
-                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "同步时间"},
-                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": "豆瓣 ID"},
-                        ],
-                    },
-                    {
-                        "component": "tbody",
-                        "content": [
-                            {
-                                "component": "tr",
-                                "props": {"key": f"history_{idx}"},
-                                "content": [
-                                    {
-                                        "component": "td",
-                                        "props": {"class": "text-start ps-4"},
-                                        "text": item.get("title", "未知"),
-                                    },
-                                    {
-                                        "component": "td",
-                                        "props": {"class": "text-start ps-4"},
-                                        "text": str(item.get("year", "-")),
-                                    },
-                                    {
-                                        "component": "td",
-                                        "props": {"class": "text-start ps-4"},
-                                        "text": item.get("media_type") or "-",
-                                    },
-                                    {
-                                        "component": "td",
-                                        "props": {"class": "text-start ps-4"},
-                                        "content": [
-                                            {
-                                                "component": "VChip",
-                                                "props": {
-                                                    "size": "small",
-                                                    "color": "success" if item.get("status") == "看完" else "primary",
-                                                    "variant": "flat",
-                                                },
-                                                "text": item.get("status", "在看"),
-                                            }
-                                        ],
-                                    },
-                                    {
-                                        "component": "td",
-                                        "props": {"class": "text-start ps-4"},
-                                        "text": str(item.get("trakt_rating", "-")) if item.get("status") == "看完" else "-",
-                                    },
-                                    {
-                                        "component": "td",
-                                        "props": {"class": "text-start ps-4"},
-                                        "text": str(item.get("douban_rating", "-")) if item.get("status") == "看完" else "-",
-                                    },
-                                    {
-                                        "component": "td",
-                                        "props": {"class": "text-start ps-4"},
-                                        "text": (
-                                            datetime.fromtimestamp(item["sync_time"]).strftime("%Y-%m-%d %H:%M")
-                                            if item.get("sync_time") else "-"
-                                        ),
-                                    },
-                                    {
-                                        "component": "td",
-                                        "props": {"class": "text-start ps-4"},
-                                        "content": [
-                                            {
-                                                "component": "VBtn",
-                                                "props": {
-                                                    "variant": "text",
-                                                    "color": "primary",
-                                                    "size": "small",
-                                                    "href": f"https://movie.douban.com/subject/{item.get('douban_id', '')}/",
-                                                    "target": "_blank",
-                                                },
-                                                "text": f"🔗 {item.get('douban_id', '')}",
-                                            }
-                                        ] if item.get("douban_id") else [],
-                                        "text": "-" if not item.get("douban_id") else None,
-                                    },
-                                ],
-                            }
-                            for idx, item in enumerate(history_list)
-                        ],
-                    },
-                ],
+                "content": [{
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "text-h6 mb-2"},
+                            "text": "同步概览",
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap"},
+                            "content": [
+                                overview_chip("Trakt 看过", len(finished), "success"),
+                                overview_chip("Trakt 在看", len(watching), "primary"),
+                                overview_chip("微信读书", len(weread_books), "info"),
+                                overview_chip("网易云音乐", len(netease_list), "warning"),
+                                overview_chip("小宇宙", len(xiaoyuzhou_episodes), "secondary"),
+                            ],
+                        },
+                    ],
+                }],
             }
         ]
-        return trakt_section + weread_section + netease_section + xiaoyuzhou_section
+
+        if not any((history_list, weread_books, netease_list, xiaoyuzhou_episodes)):
+            page.append({
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "class": "mt-4",
+                    "text": "暂无同步记录，执行一次同步后会在这里显示最近结果。",
+                },
+            })
+            return page
+
+        if history_list:
+            page.extend([
+                section("Trakt 视频", len(history_list)),
+                table(
+                    ["标题", "年份", "类型", "状态", "Trakt", "豆瓣", "同步时间", "链接"],
+                    [
+                        [
+                            cell(item.get("title", "未知")),
+                            cell(item.get("year", "-")),
+                            cell(item.get("media_type") or "-"),
+                            chip_cell(
+                                item.get("status", "在看"),
+                                "success" if item.get("status") == "看完" else "primary",
+                            ),
+                            cell(item.get("trakt_rating", "-") if item.get("status") == "看完" else "-"),
+                            cell(item.get("douban_rating", "-") if item.get("status") == "看完" else "-"),
+                            cell(format_sync_time(item.get("sync_time"))),
+                            link_cell(
+                                str(item.get("douban_id", "")),
+                                f"https://movie.douban.com/subject/{item.get('douban_id', '')}/"
+                                if item.get("douban_id") else "",
+                            ),
+                        ]
+                        for item in history_list
+                    ],
+                ),
+            ])
+
+        if weread_books:
+            page.extend([
+                section("微信读书", len(weread_books)),
+                table(
+                    ["书名", "作者", "状态", "进度", "阅读时长", "完成日", "链接"],
+                    [
+                        [
+                            cell(book.get("title", "")),
+                            cell(book.get("author", "-")),
+                            chip_cell(
+                                book.get("status", "在读"),
+                                (
+                                    "success" if book.get("status") == "读完"
+                                    else "primary" if book.get("status") == "在读"
+                                    else "default"
+                                ),
+                            ),
+                            cell(f"{book.get('reading_progress', 0)}%"),
+                            cell(WereadHelper.format_reading_time(book.get("reading_time", 0))),
+                            cell(book.get("finished_date") or "-"),
+                            link_cell("打开", book.get("weread_url", "")),
+                        ]
+                        for book in weread_books
+                    ],
+                ),
+            ])
+
+        if netease_list:
+            page.extend([
+                section("网易云音乐", len(netease_list)),
+                table(
+                    ["专辑", "艺术家", "曲目", "播放", "同步时间", "豆瓣"],
+                    [
+                        [
+                            cell(rec.get("douban_title") or rec.get("album", "-")),
+                            cell(rec.get("artist", "-")),
+                            cell(rec.get("song_count", "-")),
+                            cell(rec.get("total_play_count", "-")),
+                            cell(format_sync_time(rec.get("sync_time"))),
+                            link_cell(
+                                str(rec.get("douban_id", "")),
+                                f"https://music.douban.com/subject/{rec.get('douban_id', '')}/"
+                                if rec.get("douban_id") else "",
+                            ),
+                        ]
+                        for rec in netease_list
+                    ],
+                ),
+            ])
+
+        if xiaoyuzhou_episodes:
+            page.extend([
+                section("小宇宙", len(xiaoyuzhou_episodes)),
+                table(
+                    ["单集", "播客", "时长", "状态"],
+                    [
+                        [
+                            cell(ep.get("title", "")),
+                            cell(ep.get("podcast_name", "-")),
+                            cell(XiaoyuzhouHelper.format_duration(ep.get("duration", 0))),
+                            chip_cell(
+                                (
+                                    "已听完" if ep.get("is_finished")
+                                    else f"听了 {ep.get('listen_pct', 0) * 100:.0f}%"
+                                    if ep.get("listen_pct", 0) > 0
+                                    else "无记录"
+                                ),
+                                (
+                                    "success" if ep.get("is_finished")
+                                    else "primary" if ep.get("listen_pct", 0) > 0
+                                    else "default"
+                                ),
+                            ),
+                        ]
+                        for ep in xiaoyuzhou_episodes
+                    ],
+                ),
+            ])
+
+        return page
