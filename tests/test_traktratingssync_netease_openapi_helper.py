@@ -262,6 +262,42 @@ def test_refresh_access_token_uses_official_endpoint_and_persists_tokens(monkeyp
     assert state["access_token"] == "new-access-token"
     assert state["refresh_token"] == "new-refresh-token"
     assert state["token_expires_at"] > 0
+    token_state = helper.get_token_state()
+    assert token_state["refresh_attempts"] == 1
+    assert token_state["refresh_successes"] == 1
+    assert token_state["refresh_failures"] == 0
+    assert token_state["last_refresh_code"] == 200
+    assert token_state["last_refresh_message"] == ""
+
+
+def test_refresh_access_token_records_failure_diagnostics(monkeypatch):
+    """刷新接口失败时应记录不含敏感值的失败诊断。"""
+    helper_module = _load_helper_module()
+    helper = helper_module.NeteaseOpenApiHelper(
+        app_id="app-id",
+        app_secret="app-secret",
+        private_key="test",
+        access_token="old-access-token",
+        refresh_token="old-refresh-token",
+    )
+
+    def fake_request(endpoint, biz_content, access_token="", method="GET"):
+        """模拟开放平台刷新接口返回服务端异常。"""
+        return {
+            "code": 500,
+            "message": "请求获取app数据失败",
+            "data": None,
+        }
+
+    monkeypatch.setattr(helper, "_request", fake_request)
+
+    assert helper.refresh_access_token() is False
+    token_state = helper.get_token_state()
+    assert token_state["refresh_attempts"] == 1
+    assert token_state["refresh_successes"] == 0
+    assert token_state["refresh_failures"] == 1
+    assert token_state["last_refresh_code"] == 500
+    assert token_state["last_refresh_message"] == "请求获取app数据失败"
 
 
 def test_refresh_access_token_requires_refresh_token_and_app_secret():
@@ -446,6 +482,41 @@ def test_expired_token_refresh_failure_triggers_auth_required_callback(monkeypat
     assert helper.get_recent_albums(limit=10) == []
     assert callbacks == ["auth-required"]
     assert "Token 已过期" in helper.get_last_error()
+
+
+def test_expired_token_refresh_failure_records_auth_required_diagnostics(monkeypatch):
+    """AT 已过期且刷新接口失败时，应记录重新授权诊断。"""
+    helper_module = _load_helper_module()
+    callbacks = []
+    helper = helper_module.NeteaseOpenApiHelper(
+        app_id="app-id",
+        app_secret="app-secret",
+        private_key="test",
+        access_token="expired-access-token",
+        refresh_token="refresh-token",
+        token_expires_at=1,
+        auth_required_fn=lambda: callbacks.append("auth-required"),
+    )
+
+    def fake_request(endpoint, biz_content, access_token="", method="GET"):
+        """模拟 RefreshToken 续期接口失败。"""
+        return {
+            "code": 500,
+            "message": "请求获取app数据失败",
+            "data": None,
+        }
+
+    monkeypatch.setattr(helper, "_request", fake_request)
+
+    assert helper.get_recent_albums(limit=10) == []
+    token_state = helper.get_token_state()
+    assert callbacks == ["auth-required"]
+    assert token_state["refresh_attempts"] == 1
+    assert token_state["refresh_successes"] == 0
+    assert token_state["refresh_failures"] == 1
+    assert token_state["auth_required_count"] == 1
+    assert token_state["last_refresh_code"] == 500
+    assert token_state["last_refresh_message"] == "请求获取app数据失败"
 
 
 def test_missing_access_token_triggers_auth_required_callback(monkeypatch):

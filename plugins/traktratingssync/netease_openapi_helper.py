@@ -69,6 +69,12 @@ class NeteaseOpenApiHelper:
             "Accept": "application/json",
         }
         self._last_error = ""
+        self._refresh_attempts = 0
+        self._refresh_successes = 0
+        self._refresh_failures = 0
+        self._auth_required_count = 0
+        self._last_refresh_code: Any = None
+        self._last_refresh_message = ""
         self._manifest: Dict[str, Any] = {}
 
     @staticmethod
@@ -282,15 +288,24 @@ class NeteaseOpenApiHelper:
 
     def refresh_access_token(self) -> bool:
         """使用 Refresh Token 刷新网易云开放平台 Access Token。"""
+        self._refresh_attempts += 1
         if not self._refresh_token:
             self._last_error = "网易云开放平台缺少 Refresh Token，请重新扫码登录"
+            self._mark_refresh_failure("missing_refresh_token", self._last_error)
             logger.warning(self._last_error)
             return False
         if not self._app_secret:
             self._last_error = "网易云开放平台缺少 AppSecret，无法刷新 Access Token"
+            self._mark_refresh_failure("missing_app_secret", self._last_error)
             logger.warning(self._last_error)
             return False
 
+        logger.info(
+            f"网易云开放平台开始刷新 Access Token: "
+            f"has_access_token={bool(self._access_token)}, "
+            f"has_refresh_token={bool(self._refresh_token)}, "
+            f"has_app_secret={bool(self._app_secret)}"
+        )
         response = self._request(
             endpoint="/openapi/music/basic/user/oauth2/token/refresh/v2",
             biz_content={
@@ -310,6 +325,7 @@ class NeteaseOpenApiHelper:
                 self._last_error = "网易云开放平台授权已失效，请重新扫码登录"
             else:
                 self._last_error = (response or {}).get("message") or "网易云开放平台刷新 Access Token 失败"
+            self._mark_refresh_failure(code, self._last_error)
             logger.warning("网易云开放平台刷新 Access Token 失败: code=%s, message=%s", code, self._last_error)
             return False
 
@@ -319,8 +335,28 @@ class NeteaseOpenApiHelper:
             data.get("expiresTime") or data.get("expireIn") or data.get("expireTime")
         )
         self._last_error = ""
+        self._refresh_successes += 1
+        self._last_refresh_code = 200
+        self._last_refresh_message = ""
         logger.info("网易云开放平台 Access Token 刷新成功，expires_at=%s", self._token_expires_at)
         return True
+
+    def _mark_refresh_failure(self, code: Any, message: str) -> None:
+        self._refresh_failures += 1
+        self._last_refresh_code = code
+        self._last_refresh_message = message or ""
+
+    def _trigger_auth_required(self, reason: str) -> None:
+        self._auth_required_count += 1
+        logger.warning(
+            f"网易云开放平台触发重新授权: reason={reason}, "
+            f"refresh_attempts={self._refresh_attempts}, "
+            f"refresh_successes={self._refresh_successes}, "
+            f"refresh_failures={self._refresh_failures}, "
+            f"last_refresh_code={self._last_refresh_code}, "
+            f"last_refresh_message={self._last_refresh_message}"
+        )
+        self._auth_required()
 
     def _ensure_access_token(self) -> bool:
         """在调用实名接口前确保 Access Token 存在且未临近过期。"""
@@ -329,7 +365,7 @@ class NeteaseOpenApiHelper:
                 return True
             self._last_error = self._last_error or "网易云开放平台未登录，请先完成扫码授权"
             logger.warning(self._last_error)
-            self._auth_required()
+            self._trigger_auth_required("missing_access_token")
             return False
 
         now_ts = int(time.time())
@@ -341,7 +377,7 @@ class NeteaseOpenApiHelper:
                 return True
             self._last_error = self._last_error or "网易云开放平台 Token 已过期，Refresh Token 无法续期"
             logger.warning(self._last_error)
-            self._auth_required()
+            self._trigger_auth_required("expired_access_token")
             return False
 
         return True
@@ -369,7 +405,7 @@ class NeteaseOpenApiHelper:
         if not self.refresh_access_token():
             self._last_error = self._last_error or "网易云开放平台 Token 已过期，Refresh Token 无法续期"
             logger.warning(self._last_error)
-            self._auth_required()
+            self._trigger_auth_required("auth_response_1406")
             return response
 
         return self._request(
@@ -438,6 +474,12 @@ class NeteaseOpenApiHelper:
             "token_expires_at": self._token_expires_at,
             "device_id": self._device_id,
             "manifest_count": len(self._manifest),
+            "refresh_attempts": self._refresh_attempts,
+            "refresh_successes": self._refresh_successes,
+            "refresh_failures": self._refresh_failures,
+            "auth_required_count": self._auth_required_count,
+            "last_refresh_code": self._last_refresh_code,
+            "last_refresh_message": self._last_refresh_message,
         }
 
     def get_last_error(self) -> str:

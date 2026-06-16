@@ -33,7 +33,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.26"
+    plugin_version = "3.14.27"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -593,6 +593,16 @@ class TraktRatingsSync(_PluginBase):
 
         albums = netease_helper.get_recent_albums(limit=self._netease_limit)
         self._persist_netease_openapi_state(netease_helper)
+        token_state = netease_helper.get_token_state()
+        logger.info(
+            f"网易云开放平台 Token 诊断: "
+            f"refresh_attempts={token_state.get('refresh_attempts')}, "
+            f"refresh_successes={token_state.get('refresh_successes')}, "
+            f"refresh_failures={token_state.get('refresh_failures')}, "
+            f"auth_required_count={token_state.get('auth_required_count')}, "
+            f"last_refresh_code={token_state.get('last_refresh_code')}, "
+            f"last_refresh_message={token_state.get('last_refresh_message')}"
+        )
         if not albums:
             logger.info("网易云音乐未获取到最近专辑记录（凭据可能失效或暂无听歌记录）")
             return
