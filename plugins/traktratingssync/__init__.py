@@ -33,7 +33,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.31"
+    plugin_version = "3.14.32"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -261,6 +261,10 @@ class TraktRatingsSync(_PluginBase):
             self._trakt_helper.reset_oauth_unauthorized()
             episodes, recent_shows = self._fetch_trakt_progress_sources(access_token)
 
+        if episodes is None or recent_shows is None:
+            logger.warning("Trakt 播放进度或观看历史拉取失败，保留已有在看记录，跳过本次剧集同步")
+            return
+
         # 豆瓣无法将电影设置为在看，仅同步剧集
         logger.info("获取到 %d 条 Trakt 剧集播放进度", len(episodes))
 
@@ -313,8 +317,8 @@ class TraktRatingsSync(_PluginBase):
     def _fetch_trakt_progress_sources(
         self,
         access_token: str,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """拉取 Trakt 剧集播放进度和观看历史来源。"""
+    ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]]]:
+        """拉取 Trakt 剧集来源，使用 None 区分请求失败与成功空列表。"""
         self._trakt_helper.reset_oauth_unauthorized()
         episodes = self._trakt_helper.fetch_playback("/sync/playback/episodes", access_token)
         history_items = self._trakt_helper.fetch_history(
@@ -322,12 +326,10 @@ class TraktRatingsSync(_PluginBase):
             access_token=access_token,
             limit=self._trakt_history_limit,
         )
+        if history_items is None:
+            return episodes, None
         recent_shows = self._extract_recent_history_shows(history_items)
-        logger.info(
-            "获取到 %d 条 Trakt 剧集观看历史，提取 %d 个最近在看剧集",
-            len(history_items),
-            len(recent_shows),
-        )
+        logger.info(f"获取到 {len(history_items)} 条 Trakt 剧集观看历史，提取 {len(recent_shows)} 个最近在看剧集")
         return episodes, recent_shows
 
     def _extract_recent_history_shows(self, history_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

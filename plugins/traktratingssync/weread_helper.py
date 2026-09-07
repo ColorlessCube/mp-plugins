@@ -37,7 +37,7 @@ class WereadHelper:
     }
     _REQUEST_JITTER_RANGE = (0.8, 2.0)
     _AUTH_FAILURE_NOTIFY_COOLDOWN = 6 * 60 * 60
-    _SKILL_VERSION = "1.0.3"
+    _SKILL_VERSION = "1.0.4"
 
     def __init__(
         self,
@@ -145,7 +145,10 @@ class WereadHelper:
 
         upgrade_info = data.get("upgrade_info")
         if upgrade_info:
-            logger.error("微信读书 Skill 需要升级: %s", upgrade_info.get("message") or upgrade_info)
+            logger.error(
+                f"微信读书要求升级 Skill 协议，当前版本 {self._SKILL_VERSION}；"
+                "本次读取已停止，请更新插件的微信读书接口适配"
+            )
             return None
 
         errcode = data.get("errcode")

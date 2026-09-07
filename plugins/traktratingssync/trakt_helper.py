@@ -12,7 +12,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from app.chain.media import MediaChain
-from app.core.config import global_vars
+from app.core.config import global_vars, settings
 from app.log import logger
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
@@ -67,6 +67,7 @@ class TraktHelper:
 
         # 实例级基础请求头（含 api-key，避免每处重复构建）
         self._headers = {
+            "User-Agent": f"{settings.USER_AGENT} Plugin/TraktRatingsSync",
             "Content-Type": "application/json",
             "Accept": "application/json",
             "trakt-api-version": self._API_VERSION,
@@ -96,6 +97,28 @@ class TraktHelper:
         delay = random.uniform(*self._REQUEST_JITTER_RANGE)
         logger.debug("Trakt %s 前随机等待 %.2f 秒", action, delay)
         time.sleep(delay)
+
+    @staticmethod
+    def _log_response_failure(action: str, response: Any, oauth: bool = False) -> None:
+        """仅记录响应分类，避免错误正文或请求地址泄露认证信息。"""
+        status = getattr(response, "status_code", None)
+        headers = getattr(response, "headers", {}) or {}
+        content_type = str(headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+        body_prefix = str(getattr(response, "text", "") or "")[:256].lstrip().lower()
+        is_html = content_type == "text/html" or body_prefix.startswith(("<!doctype html", "<html"))
+        if content_type not in ("application/json", "text/html", "text/plain"):
+            content_type = "其他" if content_type else "未知"
+        detail = f"status={status}, content_type={content_type}, html={is_html}"
+        if status == 403:
+            if is_html:
+                advice = "响应疑似边缘或上游拦截页面，请检查网络出口及上游访问限制"
+            else:
+                advice = "请检查 Trakt API 应用的 Client ID、启用状态和访问权限"
+            if oauth:
+                advice += "；403 不等同于 Access Token 过期"
+            logger.warning(f"Trakt {action}拒绝访问（403）：{advice}（{detail}）")
+        else:
+            logger.warning(f"Trakt {action}请求失败（{detail}）")
 
     @staticmethod
     def _trakt_rating_to_douban(trakt_rating: int) -> int:
@@ -138,7 +161,7 @@ class TraktHelper:
 
         try:
             self._sleep_before_request(f"fetch_ratings/{media_type}")
-            resp = RequestUtils(timeout=30, headers=self._headers).get_res(url=url)
+            resp = RequestUtils(timeout=30, headers=self._headers, proxies=settings.PROXY).get_res(url=url)
             if resp is None:
                 logger.warning("Trakt API 请求失败（网络或超时）")
                 return []
@@ -151,21 +174,20 @@ class TraktHelper:
             if resp.status_code == 429:
                 logger.warning("Trakt API 触发频率限制（429），请稍后再试")
             elif resp.status_code == 403:
-                logger.warning("Trakt API 拒绝访问（403），请检查 Client ID 或该用户评分是否设为私有")
+                self._log_response_failure("公开评分接口", resp)
             elif resp.status_code == 404:
                 logger.warning("Trakt 用户不存在或未公开评分: %s", self._username)
             else:
-                logger.warning("Trakt API 返回异常: status=%s body=%s",
-                               resp.status_code, (resp.text or "")[:200])
+                self._log_response_failure("公开评分接口", resp)
         except Exception as e:
-            logger.error("拉取 Trakt 评分失败: %s", e, exc_info=True)
+            logger.error(f"拉取 Trakt 评分失败：{type(e).__name__}")
         return []
 
     # ------------------------------------------------------------------
     # 播放进度接口（需要 OAuth Access Token）
     # ------------------------------------------------------------------
 
-    def fetch_playback(self, path: str, access_token: str) -> List[Dict[str, Any]]:
+    def fetch_playback(self, path: str, access_token: str) -> Optional[List[Dict[str, Any]]]:
         """拉取 Trakt 播放进度列表。
 
         Args:
@@ -173,33 +195,35 @@ class TraktHelper:
             access_token: 有效的 Trakt Access Token
 
         Returns:
-            播放进度列表，失败时返回空列表。
+            播放进度列表，成功无记录时返回空列表，失败时返回 None。
         """
         headers = self._build_headers({"Authorization": f"Bearer {access_token}"})
         url = f"{self._API_BASE}{path}"
         try:
             self._sleep_before_request(f"fetch_playback/{path}")
-            resp = RequestUtils(timeout=20, headers=headers).get_res(url=url)
+            resp = RequestUtils(timeout=20, headers=headers, proxies=settings.PROXY).get_res(url=url)
             if resp is None:
-                logger.debug("Trakt 播放进度请求失败: %s", path)
-                return []
+                self._log_response_failure("播放进度", resp, oauth=True)
+                return None
             if resp.status_code == 204:
                 return []
             if resp.status_code != 200:
                 if resp.status_code == 401:
                     self._last_oauth_unauthorized = True
-                    logger.warning("Trakt Access Token 无效或已过期，无法拉取播放进度: %s", path)
+                    logger.warning("Trakt Access Token 无效或已过期，无法拉取播放进度（401）")
                 else:
-                    logger.warning("Trakt 播放进度返回异常 %s: %s %s",
-                                   path, resp.status_code, (resp.text or "")[:200])
-                return []
+                    self._log_response_failure("播放进度", resp, oauth=True)
+                return None
             data = resp.json()
-            return data if isinstance(data, list) else []
+            if not isinstance(data, list):
+                logger.warning("Trakt 播放进度返回格式异常，期望数组")
+                return None
+            return data
         except Exception as e:
-            logger.error("拉取 Trakt 播放进度失败 %s: %s", path, e, exc_info=True)
-            return []
+            logger.error(f"拉取 Trakt 播放进度失败：{type(e).__name__}")
+            return None
 
-    def fetch_history(self, media_type: str, access_token: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def fetch_history(self, media_type: str, access_token: str, limit: int = 20) -> Optional[List[Dict[str, Any]]]:
         """拉取 Trakt 最近观看历史。
 
         Args:
@@ -208,38 +232,36 @@ class TraktHelper:
             limit: 返回条数上限。
 
         Returns:
-            最近观看历史列表，失败时返回空列表。
+            最近观看历史列表，成功无记录时返回空列表，失败时返回 None。
         """
         headers = self._build_headers({"Authorization": f"Bearer {access_token}"})
         url = f"{self._API_BASE}/sync/history/{media_type}"
         try:
             self._sleep_before_request(f"fetch_history/{media_type}")
-            resp = RequestUtils(timeout=20, headers=headers).get_res(
+            resp = RequestUtils(timeout=20, headers=headers, proxies=settings.PROXY).get_res(
                 url=url,
                 params={"limit": max(1, int(limit or 20))},
             )
             if resp is None:
-                logger.debug("Trakt 观看历史请求失败: %s", media_type)
-                return []
+                self._log_response_failure("观看历史", resp, oauth=True)
+                return None
             if resp.status_code == 204:
                 return []
             if resp.status_code != 200:
                 if resp.status_code == 401:
                     self._last_oauth_unauthorized = True
-                    logger.warning("Trakt Access Token 无效或已过期，无法拉取观看历史: %s", media_type)
+                    logger.warning("Trakt Access Token 无效或已过期，无法拉取观看历史（401）")
                 else:
-                    logger.warning(
-                        "Trakt 观看历史返回异常 %s: %s %s",
-                        media_type,
-                        resp.status_code,
-                        (resp.text or "")[:200],
-                    )
-                return []
+                    self._log_response_failure("观看历史", resp, oauth=True)
+                return None
             data = resp.json()
-            return data if isinstance(data, list) else []
+            if not isinstance(data, list):
+                logger.warning("Trakt 观看历史返回格式异常，期望数组")
+                return None
+            return data
         except Exception as e:
-            logger.error("拉取 Trakt 观看历史失败 %s: %s", media_type, e, exc_info=True)
-            return []
+            logger.error(f"拉取 Trakt 观看历史失败：{type(e).__name__}")
+            return None
 
     # ------------------------------------------------------------------
     # 豆瓣信息匹配（MoviePilot 映射桥接）
@@ -587,7 +609,7 @@ class TraktHelper:
             return False
         url = f"{self._API_BASE}/oauth/token"
         try:
-            resp = RequestUtils(timeout=10, headers=self._headers).post_res(
+            resp = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
                 url=url,
                 json={
                     "refresh_token": refresh_token,
@@ -598,16 +620,12 @@ class TraktHelper:
                 },
             )
             if resp is None or resp.status_code != 200:
-                logger.warning(
-                    "Trakt Refresh Token 续期失败: %s %s",
-                    getattr(resp, "status_code", None),
-                    getattr(resp, "text", "")[:200],
-                )
+                self._log_response_failure("Refresh Token 续期", resp, oauth=True)
                 return False
             data = resp.json()
             return self._persist_token_response(data)
         except Exception as e:
-            logger.warning("Trakt Refresh Token 续期异常: %s", e)
+            logger.warning(f"Trakt Refresh Token 续期异常：{type(e).__name__}")
             return False
 
     def _persist_token_response(self, data: Dict[str, Any]) -> bool:
@@ -638,16 +656,12 @@ class TraktHelper:
         """
         url = f"{self._API_BASE}/oauth/device/code"
         try:
-            resp = RequestUtils(timeout=10, headers=self._headers).post_res(
+            resp = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
                 url=url,
                 json={"client_id": self._client_id},
             )
             if resp is None or resp.status_code != 200:
-                logger.warning(
-                    "获取 Trakt 设备码失败: %s %s",
-                    getattr(resp, "status_code", None),
-                    getattr(resp, "text", "")[:200],
-                )
+                self._log_response_failure("设备码授权", resp, oauth=True)
                 return None
 
             data = resp.json()
@@ -657,7 +671,7 @@ class TraktHelper:
             interval = int(data.get("interval") or 5)
 
             if not device_code or not user_code or not verification_url:
-                logger.warning("Trakt 设备码返回内容不完整: %s", data)
+                logger.warning("Trakt 设备码返回内容不完整")
                 return None
 
             msg = (
@@ -699,7 +713,7 @@ class TraktHelper:
             return None
 
         except Exception as e:
-            logger.error("Trakt 设备码授权流程异常: %s", e, exc_info=True)
+            logger.error(f"Trakt 设备码授权流程异常：{type(e).__name__}")
             return None
 
     def _exchange_device_token(self, device_code: str) -> Optional[str]:
@@ -713,7 +727,7 @@ class TraktHelper:
         """
         url = f"{self._API_BASE}/oauth/device/token"
         try:
-            resp = RequestUtils(timeout=10, headers=self._headers).post_res(
+            resp = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
                 url=url,
                 json={
                     "code": device_code,
@@ -728,7 +742,7 @@ class TraktHelper:
                 try:
                     data = resp.json()
                 except Exception as e:
-                    logger.debug("解析 Trakt Access Token 响应失败: %s", e)
+                    logger.debug(f"解析 Trakt Access Token 响应失败：{type(e).__name__}")
                     return None
 
                 if self._persist_token_response(data):
@@ -741,11 +755,12 @@ class TraktHelper:
                 except Exception:
                     err = ""
                 if err not in ("authorization_pending", "slow_down"):
-                    logger.debug("Trakt 授权错误: %s", err)
+                    self._log_response_failure("设备码交换 Token", resp, oauth=True)
                 return None
 
+            self._log_response_failure("设备码交换 Token", resp, oauth=True)
             return None
 
         except Exception as e:
-            logger.debug("交换 token 异常: %s", e)
+            logger.debug(f"交换 Trakt Token 异常：{type(e).__name__}")
             return None
