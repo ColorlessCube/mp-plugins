@@ -131,7 +131,9 @@ class DoubanHelper:
         self._persist_sync_state()
         if not already_paused:
             logger.warning("%s；已暂停豆瓣请求，待同步记录已保留", reason)
-            self._notify("豆瓣同步已暂停", reason + "；请在浏览器完成验证后更新 Cookie，或保存“恢复豆瓣同步”开关。")
+            recovery = ("请在浏览器完成验证后更新 Cookie，或保存“恢复豆瓣同步”开关。" if seconds is None
+                        else "请等待冷却结束，之后由定时同步继续处理；无需重新授权。")
+            self._notify("豆瓣同步已暂停", reason + "；" + recovery)
 
     def _check_access_response(self, response: Any, writing: bool = False) -> bool:
         """识别验证码内容、验证跳转和限流，普通条目 404 不触发暂停。"""

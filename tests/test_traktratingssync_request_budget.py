@@ -132,11 +132,27 @@ def test_rate_limit_uses_retry_after_and_blocks_search(monkeypatch):
     module = _load_douban_helper_module(monkeypatch)
     helper = _build_helper(module, monkeypatch)
     monkeypatch.setattr(module.time, "time", lambda: 100)
+    notices = []
+    helper._notify = lambda _title, body: notices.append(body)
     calls = _requests(monkeypatch, module, _Response(429, headers={"Retry-After": "7200"}))
     assert not _submit(helper)
     assert helper._state["blocked_until"] == 7300
     assert helper._search_subject("test", "1001") == (None, None)
     assert len(calls) == 1
+    assert "冷却结束" in notices[0]
+    assert "在浏览器完成验证" not in notices[0]
+
+
+@pytest.mark.parametrize("requires_verification", [True, False])
+def test_pause_page_distinguishes_verification_from_automatic_cooldown(monkeypatch, requires_verification):
+    """人工验证和自动冷却显示不同的恢复提示。"""
+    module = _load_plugin_module(monkeypatch)
+    plugin = module.TraktRatingsSync()
+    plugin.save_data("douban_sync_state", {"requires_verification": requires_verification,
+        "blocked_until": 9999999999, "reason": "test", "pending": {}})
+    text = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert ("请先完成浏览器验证" in text) is requires_verification
+    assert ("冷却结束后按定时任务继续处理" in text) is not requires_verification
 
 
 @pytest.mark.parametrize("payload", [{"r": False}, {"r": 1}, {}, {"r": "0"}])
