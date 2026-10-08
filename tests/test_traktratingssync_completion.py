@@ -114,7 +114,7 @@ def test_failed_post_keeps_existing_watching_cache(monkeypatch):
     helper, _saved, _updates = _build_helper(module)
     douban, _posts, _skips = _douban()
     douban.set_watching_status = lambda **_kwargs: False
-    watching = {"电视剧_1_s2": {"douban_id": "456", "status": "在看", "private": False}}
+    watching = {"电视剧_1_s2": {"douban_id": "456", "status": "在看", "private": False, "match_verified": True}}
     before = copy.deepcopy(watching)
     assert not helper.sync_one_progress(_state(), "show", module.MediaType.TV, watching, douban, False)
     assert watching == before
@@ -140,11 +140,12 @@ def test_season_matching_passes_correct_season_and_year_to_core(monkeypatch):
     async def match(**kwargs):
         """记录匹配条件。"""
         calls.append(kwargs)
-        return {"id": "456"}
+        return {"id": "456", "title": "测试剧 第二季", "year": "2026"}
     monkeypatch.setattr(module, "MediaChain", lambda: types.SimpleNamespace(async_tmdb_info=metadata, async_match_doubaninfo=match))
     helper, _saved, _updates = _build_helper(module)
     assert asyncio.run(helper._get_douban_info_by_tmdb(2, "tt2", "Test", 2020, module.MediaType.TV, season=2, season_year="2026"))["id"] == "456"
     assert calls[0]["season"] == 2 and calls[0]["year"] == "2026" and calls[0]["name"] == "测试剧"
+    assert calls[0]["imdbid"] is None
 
 
 @pytest.mark.parametrize("status", [401, 403, 429, 500])
@@ -249,3 +250,29 @@ def test_legacy_show_metadata_is_cached_without_credentials(monkeypatch):
     assert helper.fetch_show_details("1") == _state()["show"]
     assert len(calls) == 1
     assert "token" not in str(saved) and "Authorization" not in str(saved)
+
+
+@pytest.mark.parametrize("title,year,season,expected", [("The Capture", "2019", 3, False),
+    ("真相捕捉 第一季", "2019", 3, False), ("真相捕捉 第三季", "2026", 3, True),
+    ("The Capture Season 3", "2026", 3, True), ("测试剧 第二十二季", "2026", 22, True)])
+def test_returned_douban_item_must_match_season(monkeypatch, title, year, season, expected):
+    """防止核心忽略季号直返整剧IMDb映射，支持中英文季号。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    assert module.TraktHelper._matches_douban_season({"title": title, "year": year}, season, "2026") is expected
+
+
+def test_wrong_season_post_is_restored_before_rematching_even_if_new_match_fails(monkeypatch):
+    """完整成功写入证据和旧在看缓存共同证明上一轮误写时，先恢复旧目标。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    url = "https://movie.douban.com/j/subject/123/interest"
+    old = {"douban_id": "123", "status": "在看", "private": False, "season_tracking": True}
+    wrong = {"douban_id": "123", "title": "Test", "status": "看完", "private": False,
+             "season": 2, "show": _state()["show"], "sync_time": 100, "checked_at": 100}
+    helper, _saved, _updates = _build_helper(module, data={"douban_sync_state": {
+        "synced": {url: {"interest": "collect", "rating": ""}}, "target_success_at": {url: 100}}})
+    monkeypatch.setattr(helper, "_resolve_douban_info", lambda *_args, **_kwargs: {})
+    douban, posts, _skips = _douban()
+    watching = {"电视剧_1": old, "电视剧_1_s2": wrong}
+    assert not helper.sync_one_progress(_state(), "show", module.MediaType.TV, watching, douban, False)
+    assert posts == [{"subject_id": "123", "status": "do", "private": False, "rating": None}]
+    assert "电视剧_1_s2" not in watching and not old["season_tracking"]

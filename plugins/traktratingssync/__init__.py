@@ -39,7 +39,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影评分、剧集逐季在看/看过，微信读书阅读记录，网易云音乐专辑，小宇宙播客。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.18.0"
+    plugin_version = "3.18.1"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
