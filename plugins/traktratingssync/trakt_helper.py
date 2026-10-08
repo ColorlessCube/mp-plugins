@@ -6,10 +6,15 @@ Trakt API 封装模块
 __init__.py 只需实例化 TraktHelper 并调用其方法即可，不包含任何 Trakt 业务细节。
 """
 import asyncio
+import base64
+import hashlib
+import ipaddress
 import math
 import random
+import secrets
 import time
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from app.chain.media import MediaChain
 from app.core.config import global_vars, settings
@@ -31,12 +36,17 @@ class TraktHelper:
         update_config_fn: 更新插件配置回调，签名 ``(config: dict) -> None``
         send_notification_fn: 发送通知回调（可选），签名 ``(title: str, body: str) -> None``
         manual_mappings: Trakt 条目到豆瓣 subject_id 的手动映射
+        auth_mode: 授权方式，自动识别、新版 PKCE 或旧版设备码
+        redirect_uri: 与 Trakt 应用登记值一致的 HTTPS 回跳地址
     """
 
     # 协议固定常量，保持类级
     _API_BASE = "https://api.trakt.tv"
+    _AUTH_BASE = "https://auth.trakt.tv"
     _API_VERSION = "2"
     _REQUEST_JITTER_RANGE = (0.5, 1.5)
+    _PKCE_AUTH_URL = "https://auth.trakt.tv/oauth/authorize"
+    _PKCE_LIFETIME_SECONDS = 600
 
     def __init__(
         self,
@@ -49,11 +59,16 @@ class TraktHelper:
         update_config_fn: Callable[[Dict[str, Any]], None],
         send_notification_fn: Optional[Callable[[str, str], None]] = None,
         manual_mappings: Optional[Dict[str, str]] = None,
+        auth_mode: str = "auto",
+        redirect_uri: str = "",
     ):
+        """初始化 Trakt 凭据、授权方式及插件持久化回调。"""
         self._client_id = client_id
         self._client_secret = client_secret
         self._access_token = access_token
         self._username = username
+        self._auth_mode = auth_mode
+        self._redirect_uri = redirect_uri
         self._save_data = save_data_fn
         self._get_data = get_data_fn
         self._update_config = update_config_fn
@@ -560,33 +575,145 @@ class TraktHelper:
     # OAuth 授权相关
     # ------------------------------------------------------------------
 
+    def reset_authorization(self) -> None:
+        """清除 Trakt 授权凭据和待完成请求，保留所有书影音同步记录。"""
+        self._access_token = ""
+        self._save_data("trakt_token", {})
+        self._save_data("trakt_pkce_pending", {})
+        self._update_config({"trakt_access_token": "", "trakt_authorization_url": ""})
+
+    def _uses_pkce(self) -> bool:
+        """根据显式选择或 Secret 是否存在选择授权流程。"""
+        return self._auth_mode == "pkce" or (self._auth_mode == "auto" and not self._client_secret)
+
+    @staticmethod
+    def _validate_redirect_uri(redirect_uri: str) -> None:
+        """要求无查询参数的 HTTPS 回跳地址，避免使用本地或旧版 OOB 地址。"""
+        parsed = urlsplit(redirect_uri)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or parsed.query or parsed.fragment
+                or parsed.hostname.lower() == "localhost"):
+            raise ValueError("请填写自己域名下的 HTTPS 回跳地址，不含查询参数，并与 Trakt 应用设置完全一致")
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            return
+        if not address.is_global:
+            raise ValueError("Trakt 回跳地址不能使用本地或私有 IP")
+
+    def begin_pkce_authorization(self) -> str:
+        """生成短期 PKCE 授权链接，并在插件私有数据中保存随机校验信息。"""
+        if not self._client_id:
+            raise ValueError("请先填写 Trakt Client ID")
+        self._validate_redirect_uri(self._redirect_uri)
+        verifier = secrets.token_urlsafe(64)
+        state = secrets.token_urlsafe(32)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+        self.reset_authorization()
+        self._save_data("trakt_pkce_pending", {
+            "client_id": self._client_id,
+            "redirect_uri": self._redirect_uri,
+            "code_verifier": verifier,
+            "state": state,
+            "expires_at": int(time.time()) + self._PKCE_LIFETIME_SECONDS,
+        })
+        authorization_url = self._PKCE_AUTH_URL + "?" + urlencode({
+            "response_type": "code",
+            "client_id": self._client_id,
+            "redirect_uri": self._redirect_uri,
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        })
+        self._update_config({"trakt_authorization_url": authorization_url})
+        logger.info("Trakt PKCE 授权链接已生成，有效期 10 分钟，请在插件配置页完成授权")
+        return authorization_url
+
+    def complete_pkce_authorization(self, callback_url: str) -> bool:
+        """校验完整回跳地址和 state，使用一次性 verifier 交换并保存授权凭据。"""
+        pending = self._get_data("trakt_pkce_pending") or {}
+        if (not pending or pending.get("client_id") != self._client_id
+                or pending.get("redirect_uri") != self._redirect_uri
+                or int(pending.get("expires_at") or 0) <= int(time.time())):
+            self._save_data("trakt_pkce_pending", {})
+            self._update_config({"trakt_authorization_url": ""})
+            raise ValueError("Trakt 授权请求已过期或应用配置已变化，请重新生成授权链接")
+        callback = urlsplit(callback_url)
+        expected = urlsplit(self._redirect_uri)
+        if ((callback.scheme, callback.netloc, callback.path) != (expected.scheme, expected.netloc, expected.path)
+                or callback.fragment):
+            raise ValueError("授权回跳地址不匹配，请粘贴完成 Trakt 授权后浏览器地址栏中的完整地址")
+        params = parse_qs(callback.query, keep_blank_values=True)
+        states = params.get("state", [])
+        codes = params.get("code", [])
+        if len(states) != 1 or not secrets.compare_digest(states[0], pending.get("state", "")):
+            raise ValueError("Trakt 授权 state 校验失败，请使用本次授权链接对应的回跳地址")
+        if "error" in params:
+            self._save_data("trakt_pkce_pending", {})
+            self._update_config({"trakt_authorization_url": ""})
+            raise ValueError("Trakt 授权已取消，请重新生成授权链接")
+        if len(codes) != 1 or not codes[0]:
+            raise ValueError("回跳地址缺少授权码，请完成授权后复制完整地址")
+        # 授权码只能使用一次；网络异常也要求重新开始，避免重放已消费的请求。
+        self._save_data("trakt_pkce_pending", {})
+        self._update_config({"trakt_authorization_url": ""})
+        try:
+            response = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
+                url=f"{self._AUTH_BASE}/oauth/token",
+                json={
+                    "grant_type": "authorization_code",
+                    "client_id": self._client_id,
+                    "redirect_uri": self._redirect_uri,
+                    "code": codes[0],
+                    "code_verifier": pending["code_verifier"],
+                },
+            )
+            if response is None or response.status_code != 200:
+                self._log_response_failure("PKCE 授权", response, oauth=True)
+                return False
+            return self._persist_token_response(response.json(), auth_mode="pkce", redirect_uri=self._redirect_uri)
+        except Exception as error:
+            logger.warning("Trakt PKCE 授权失败：%s，请重新生成授权链接", type(error).__name__)
+            return False
+
     def get_access_token(self, force_reauthorize: bool = False) -> Optional[str]:
         """获取有效的 Trakt Access Token。
 
         优先顺序：
-        1. 构造时传入的 ``access_token``（由用户在配置中填写）
+        1. 配置中未过期的 ``access_token``
         2. 持久化缓存中未过期的 token
-        3. 启动设备码授权流程（阻塞等待最多 10 分钟）
+        3. 使用 Refresh Token 自动续期
+        4. 旧应用启动设备码授权；PKCE 应用提示在配置页完成授权
 
         Returns:
             有效的 access_token 字符串，无法获取时返回 None。
         """
+        token_data = self._get_data("trakt_token") or {}
+        if token_data.get("client_id") and token_data["client_id"] != self._client_id:
+            self.reset_authorization()
         if not force_reauthorize and self._access_token:
             logger.info("使用配置的 Access Token")
-            return self._access_token
+            if not token_data.get("expires_at") or int(token_data["expires_at"]) > int(time.time()):
+                return self._access_token
 
         cached = None if force_reauthorize else self._get_cached_token()
         if cached:
             logger.info("使用缓存的 Access Token")
             return cached
 
-        if not self._client_id or not self._client_secret:
-            logger.debug("未配置 Trakt Client Secret，无法自动获取 Access Token")
+        if not self._client_id:
             return None
 
-        if force_reauthorize and self._refresh_access_token():
+        if self._refresh_access_token():
             logger.info("Trakt Refresh Token 续期成功")
             return self._access_token
+
+        if self._uses_pkce():
+            logger.warning("Trakt 尚未授权或需要重新授权，请在插件配置页生成 PKCE 授权链接并完成授权")
+            return None
+        if not self._client_secret:
+            logger.warning("旧版设备码授权需要 Client Secret，新应用请切换到 PKCE 授权")
+            return None
 
         logger.info("开始 Trakt 设备码授权流程...")
         return self._create_device_code_and_wait()
@@ -595,6 +722,8 @@ class TraktHelper:
         """读取持久化缓存中未过期的 Access Token。"""
         now_ts = int(time.time())
         token_data = self._get_data("trakt_token") or {}
+        if token_data.get("client_id") and token_data["client_id"] != self._client_id:
+            return None
         access_token = token_data.get("access_token")
         expires_at = int(token_data.get("expires_at") or 0)
         if access_token and expires_at > now_ts:
@@ -604,32 +733,43 @@ class TraktHelper:
     def _refresh_access_token(self) -> bool:
         """使用已保存的 Refresh Token 续期 Trakt Access Token。"""
         token_data = self._get_data("trakt_token") or {}
+        if token_data.get("client_id") and token_data["client_id"] != self._client_id:
+            return False
         refresh_token = token_data.get("refresh_token")
         if not refresh_token:
             return False
-        url = f"{self._API_BASE}/oauth/token"
+        url = f"{self._AUTH_BASE}/oauth/token"
+        uses_pkce = self._uses_pkce() or token_data.get("auth_mode") == "pkce"
+        payload = {
+            "refresh_token": refresh_token,
+            "client_id": self._client_id,
+            "grant_type": "refresh_token",
+        }
+        if not uses_pkce:
+            payload.update({"client_secret": self._client_secret, "redirect_uri": "urn:ietf:wg:oauth:2.0:oob"})
+        else:
+            redirect_uri = token_data.get("redirect_uri") or self._redirect_uri
+            if redirect_uri:
+                payload["redirect_uri"] = redirect_uri
         try:
             resp = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
                 url=url,
-                json={
-                    "refresh_token": refresh_token,
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                    "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
-                    "grant_type": "refresh_token",
-                },
+                json=payload,
             )
             if resp is None or resp.status_code != 200:
                 self._log_response_failure("Refresh Token 续期", resp, oauth=True)
                 return False
             data = resp.json()
-            return self._persist_token_response(data)
+            return self._persist_token_response(data, auth_mode="pkce" if uses_pkce else "device",
+                                                redirect_uri=payload.get("redirect_uri", ""))
         except Exception as e:
             logger.warning(f"Trakt Refresh Token 续期异常：{type(e).__name__}")
             return False
 
-    def _persist_token_response(self, data: Dict[str, Any]) -> bool:
+    def _persist_token_response(self, data: Dict[str, Any], auth_mode: str = "device", redirect_uri: str = "") -> bool:
         """持久化 Trakt OAuth token 响应。"""
+        if not isinstance(data, dict):
+            return False
         access_token = data.get("access_token")
         refresh_token = data.get("refresh_token")
         expires_in = int(data.get("expires_in") or 0)
@@ -637,6 +777,9 @@ class TraktHelper:
             return False
         expires_at = int(time.time()) + expires_in - 60
         token_data = {
+            "client_id": self._client_id,
+            "auth_mode": auth_mode,
+            "redirect_uri": redirect_uri,
             "access_token": access_token,
             "expires_at": expires_at,
         }
@@ -654,7 +797,7 @@ class TraktHelper:
         Returns:
             授权成功后的 access_token，失败返回 None。
         """
-        url = f"{self._API_BASE}/oauth/device/code"
+        url = f"{self._AUTH_BASE}/oauth/device/code"
         try:
             resp = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
                 url=url,
@@ -725,7 +868,7 @@ class TraktHelper:
         Returns:
             成功时返回 access_token，等待中或失败时返回 None。
         """
-        url = f"{self._API_BASE}/oauth/device/token"
+        url = f"{self._AUTH_BASE}/oauth/device/token"
         try:
             resp = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
                 url=url,

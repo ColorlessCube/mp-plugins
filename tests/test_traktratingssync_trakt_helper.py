@@ -5,6 +5,7 @@ import sys
 import types
 from enum import Enum
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
@@ -90,16 +91,25 @@ def _build_helper(module, **kwargs):
     """构造 TraktHelper 测试实例。"""
     saved = {}
     updated = {}
+    data = dict(kwargs.get("data", {}))
+
+    def save_data(key, value):
+        """同时更新持久化状态与本次写入记录。"""
+        data[key] = value
+        saved[key] = value
+
     helper = module.TraktHelper(
-        client_id="client-id",
-        client_secret="client-secret",
+        client_id=kwargs.get("client_id", "client-id"),
+        client_secret=kwargs.get("client_secret", "client-secret"),
         access_token=kwargs.get("access_token", ""),
         username="user",
-        save_data_fn=lambda key, value: saved.update({key: value}),
-        get_data_fn=lambda key: kwargs.get("data", {}).get(key),
+        save_data_fn=save_data,
+        get_data_fn=data.get,
         update_config_fn=lambda patch: updated.update(patch),
         send_notification_fn=lambda _title, _body: None,
         manual_mappings=kwargs.get("manual_mappings"),
+        auth_mode=kwargs.get("auth_mode", "auto"),
+        redirect_uri=kwargs.get("redirect_uri", "https://owned.example/callback"),
     )
     return helper, saved, updated
 
@@ -308,9 +318,15 @@ def test_all_trakt_requests_use_configured_proxy_and_identify_plugin(monkeypatch
     def request_factory(**kwargs):
         """记录请求构造参数并阻止调用真实 HTTP。"""
         calls.append(kwargs)
+
+        def request(**request_kwargs):
+            """同时记录实际请求地址和参数。"""
+            kwargs.update(request_kwargs)
+            return _Response(403)
+
         return types.SimpleNamespace(
-            get_res=lambda **_kwargs: _Response(403),
-            post_res=lambda **_kwargs: _Response(403),
+            get_res=request,
+            post_res=request,
         )
 
     monkeypatch.setattr(module, "RequestUtils", request_factory)
@@ -326,6 +342,10 @@ def test_all_trakt_requests_use_configured_proxy_and_identify_plugin(monkeypatch
     assert calls[0]["headers"]["trakt-api-version"] == "2"
     if method in ("fetch_playback", "fetch_history"):
         assert calls[0]["headers"]["Authorization"] == "Bearer access-token"
+    if method in ("_create_device_code_and_wait", "_exchange_device_token", "_refresh_access_token"):
+        assert calls[0]["url"].startswith("https://auth.trakt.tv/oauth/")
+    else:
+        assert calls[0]["url"].startswith("https://api.trakt.tv/")
 
 
 @pytest.mark.parametrize("method,source", [
@@ -438,3 +458,181 @@ def test_progress_sync_preserves_watching_until_both_sources_succeed(monkeypatch
     assert saved == ([("watching", {})] if should_clear else [])
     assert watching == {"existing": {"title": "保留记录"}}
     assert len(refreshes) == refresh_count
+
+
+def _pkce_callback(helper, code="one-time-code", **params):
+    """用当前授权请求生成测试回跳地址。"""
+    pending = helper._get_data("trakt_pkce_pending")
+    return helper._redirect_uri + "?" + urlencode({"code": code, "state": pending["state"], **params})
+
+
+def test_pkce_challenge_matches_rfc7636_and_keeps_verifier_private(monkeypatch):
+    """使用公开 RFC 向量校验 S256，配置中不能出现 verifier。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    random_values = iter([verifier, "random-state"])
+    monkeypatch.setattr(module.secrets, "token_urlsafe", lambda _size: next(random_values))
+    monkeypatch.setattr(module.time, "time", lambda: 1000)
+    helper, saved, updated = _build_helper(module, client_secret="")
+
+    authorization_url = helper.begin_pkce_authorization()
+
+    params = parse_qs(urlsplit(authorization_url).query)
+    assert authorization_url.startswith("https://auth.trakt.tv/oauth/authorize?")
+    assert params["code_challenge"] == ["E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"]
+    assert params["code_challenge_method"] == ["S256"]
+    assert params["redirect_uri"] == [helper._redirect_uri]
+    assert saved["trakt_pkce_pending"]["expires_at"] == 1600
+    assert saved["trakt_pkce_pending"]["code_verifier"] == verifier
+    assert verifier not in str(updated)
+    assert "client_secret" not in params
+
+
+@pytest.mark.parametrize("uri", [
+    "http://owned.example/callback", "https://localhost/callback", "https://127.0.0.1/callback",
+    "https://192.168.1.1/callback", "https://[::1]/callback", "urn:ietf:wg:oauth:2.0:oob",
+    "https://user:password@owned.example/callback", "https://owned.example/callback?state=old",
+])
+def test_pkce_rejects_invalid_redirect_before_resetting_tokens(monkeypatch, uri):
+    """无效回跳配置不能启动授权或清除现有凭据。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, saved, updated = _build_helper(module, redirect_uri=uri, access_token="existing-token")
+    with pytest.raises(ValueError):
+        helper.begin_pkce_authorization()
+    assert not saved and not updated
+    assert helper._access_token == "existing-token"
+
+
+def test_pkce_exchange_omits_secret_saves_tokens_and_rejects_replay(monkeypatch):
+    """交换请求必须带原始 verifier，无 Secret，成功后不能重放。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, saved, updated = _build_helper(module, client_secret="", auth_mode="pkce")
+    helper.begin_pkce_authorization()
+    verifier = saved["trakt_pkce_pending"]["code_verifier"]
+    callback = _pkce_callback(helper)
+    calls = []
+
+    def request_factory(**kwargs):
+        """记录请求头、代理及授权交换参数。"""
+        def post(**request):
+            """返回固定 OAuth 响应。"""
+            calls.append({**kwargs, **request})
+            return _Response(200, {"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 604800})
+        return types.SimpleNamespace(post_res=post)
+
+    monkeypatch.setattr(module, "RequestUtils", request_factory)
+    assert helper.complete_pkce_authorization(callback) is True
+    assert calls[0]["json"]["code_verifier"] == verifier
+    assert calls[0]["json"]["code"] == "one-time-code"
+    assert calls[0]["url"] == "https://auth.trakt.tv/oauth/token"
+    assert "client_secret" not in calls[0]["json"]
+    assert calls[0]["proxies"] == module.settings.PROXY
+    assert calls[0]["headers"]["trakt-api-version"] == "2"
+    assert saved["trakt_token"]["client_id"] == "client-id"
+    assert saved["trakt_token"]["refresh_token"] == "new-refresh"
+    assert saved["trakt_token"]["auth_mode"] == "pkce"
+    assert updated["trakt_access_token"] == "new-access"
+    assert updated["trakt_authorization_url"] == ""
+    assert saved["trakt_pkce_pending"] == {}
+    with pytest.raises(ValueError):
+        helper.complete_pkce_authorization(callback)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("failure", ["state", "duplicate_state", "duplicate_code", "redirect", "expired", "client", "cancelled"])
+def test_pkce_invalid_callbacks_never_contact_trakt(monkeypatch, failure):
+    """state、地址、时效或应用校验失败时，不能发起令牌交换。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, saved, _updated = _build_helper(module, client_secret="")
+    helper.begin_pkce_authorization()
+    callback = _pkce_callback(helper)
+    if failure == "state":
+        callback = _pkce_callback(helper, state="wrong-state")
+    elif failure == "duplicate_state":
+        callback += "&state=another"
+    elif failure == "duplicate_code":
+        callback += "&code=another"
+    elif failure == "redirect":
+        callback = callback.replace("owned.example", "attacker.example")
+    elif failure == "expired":
+        saved["trakt_pkce_pending"]["expires_at"] = 0
+    elif failure == "client":
+        helper._client_id = "different-client"
+    else:
+        callback = _pkce_callback(helper, error="access_denied")
+    monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: pytest.fail("不合法的回跳不能请求 Trakt"))
+    with pytest.raises(ValueError):
+        helper.complete_pkce_authorization(callback)
+
+
+@pytest.mark.parametrize("response", [None, _Response(403), _Response(200, []), _Response(200, ValueError("private-code"))])
+def test_pkce_failed_exchange_consumes_pending_request_without_saving_token(monkeypatch, response):
+    """网络、访问权限或响应异常均消费请求，避免重放授权码。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, saved, updated = _build_helper(module, client_secret="")
+    helper.begin_pkce_authorization()
+    callback = _pkce_callback(helper)
+    monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: types.SimpleNamespace(post_res=lambda **_kwargs: response))
+    assert helper.complete_pkce_authorization(callback) is False
+    assert saved["trakt_pkce_pending"] == {}
+    assert not saved["trakt_token"]
+    assert updated["trakt_access_token"] == ""
+
+
+def test_expired_config_token_refreshes_without_secret_and_rotates_refresh_token(monkeypatch):
+    """配置中的过期令牌不能短路续期，PKCE 刷新不需要 Secret。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, saved, updated = _build_helper(module, client_secret="", access_token="expired-access", data={
+        "trakt_token": {"client_id": "client-id", "access_token": "expired-access", "refresh_token": "old-refresh", "expires_at": 1},
+    })
+    calls = []
+
+    def post(**request):
+        """记录刷新请求并返回轮换后的凭据。"""
+        calls.append(request)
+        return _Response(200, {"access_token": "fresh-access", "refresh_token": "rotated-refresh", "expires_in": 604800})
+
+    monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: types.SimpleNamespace(post_res=post))
+    assert helper.get_access_token() == "fresh-access"
+    assert calls[0]["json"] == {"grant_type": "refresh_token", "client_id": "client-id", "refresh_token": "old-refresh", "redirect_uri": helper._redirect_uri}
+    assert saved["trakt_token"]["refresh_token"] == "rotated-refresh"
+    assert updated["trakt_access_token"] == "fresh-access"
+
+
+def test_pkce_refresh_keeps_original_flow_even_if_secret_is_added(monkeypatch):
+    """续期后的令牌继续标记为 PKCE，避免下次错误携带 Secret。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, saved, _updated = _build_helper(module, data={
+        "trakt_token": {"client_id": "client-id", "auth_mode": "pkce", "refresh_token": "old-refresh"},
+    })
+    calls = []
+
+    def post(**request):
+        """记录 PKCE 续期请求。"""
+        calls.append(request)
+        return _Response(200, {"access_token": "access", "refresh_token": "refresh", "expires_in": 604800})
+
+    monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: types.SimpleNamespace(post_res=post))
+    assert helper._refresh_access_token() is True
+    assert "client_secret" not in calls[0]["json"]
+    assert saved["trakt_token"]["auth_mode"] == "pkce"
+
+
+def test_pkce_without_token_does_not_start_blocking_device_flow(monkeypatch):
+    """定时任务遇到尚未授权的新应用，只提示手动授权。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, _saved, _updated = _build_helper(module, client_secret="")
+    monkeypatch.setattr(helper, "_create_device_code_and_wait", lambda: pytest.fail("PKCE 不应启动设备码等待"))
+    assert helper.get_access_token() is None
+
+
+def test_changed_client_id_cannot_reuse_or_refresh_old_credentials(monkeypatch):
+    """旧应用令牌不允许发送到新应用的刷新请求。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    helper, saved, updated = _build_helper(module, client_secret="", access_token="old-access", data={
+        "trakt_token": {"client_id": "deleted-client", "refresh_token": "old-refresh", "expires_at": 9999999999},
+    })
+    monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: pytest.fail("不能发送旧应用凭据"))
+    assert helper.get_access_token() is None
+    assert saved["trakt_token"] == {}
+    assert updated["trakt_access_token"] == ""

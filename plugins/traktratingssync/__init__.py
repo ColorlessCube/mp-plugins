@@ -33,7 +33,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.14.32"
+    plugin_version = "3.15.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -45,6 +45,10 @@ class TraktRatingsSync(_PluginBase):
     _trakt_client_id: str = ""
     _trakt_client_secret: str = ""
     _trakt_access_token: str = ""
+    _trakt_auth_mode: str = "auto"
+    _trakt_redirect_uri: str = ""
+    _trakt_authorization_url: str = ""
+    _trakt_auth_message: str = ""
     _trakt_manual_mappings: str = ""
     _douban_cookie: str = ""
     _weread_api_key: str = ""
@@ -82,6 +86,10 @@ class TraktRatingsSync(_PluginBase):
         self._trakt_client_id = (config.get("trakt_client_id") or "").strip()
         self._trakt_client_secret = (config.get("trakt_client_secret") or "").strip()
         self._trakt_access_token = (config.get("trakt_access_token") or "").strip()
+        self._trakt_auth_mode = config.get("trakt_auth_mode") or "auto"
+        self._trakt_redirect_uri = (config.get("trakt_redirect_uri") or "").strip()
+        self._trakt_authorization_url = config.get("trakt_authorization_url") or ""
+        self._trakt_auth_message = config.get("trakt_auth_message") or ""
         self._trakt_manual_mappings = (config.get("trakt_manual_mappings") or "").strip()
         self._douban_cookie = (config.get("douban_cookie") or "").strip()
         self._weread_api_key = (config.get("weread_api_key") or "").strip()
@@ -104,6 +112,63 @@ class TraktRatingsSync(_PluginBase):
         self._weread_helper = None
         self._netease_helper = None
         self._xiaoyuzhou_helper = None
+
+        self._init_trakt_authorization(config)
+
+    def _create_trakt_helper(self) -> TraktHelper:
+        """以当前配置创建 Trakt Helper，统一授权和同步入口的凭据来源。"""
+        return TraktHelper(
+            client_id=self._trakt_client_id,
+            client_secret=self._trakt_client_secret,
+            access_token=self._trakt_access_token,
+            username=self._trakt_username,
+            save_data_fn=self.save_data,
+            get_data_fn=self.get_data,
+            update_config_fn=self._merge_update_config,
+            send_notification_fn=self._send_bark_notification,
+            manual_mappings=self._parse_trakt_manual_mappings(),
+            auth_mode=self._trakt_auth_mode,
+            redirect_uri=self._trakt_redirect_uri,
+        )
+
+    def _init_trakt_authorization(self, config: Dict[str, Any]) -> None:
+        """处理配置页的一次性授权操作，更换应用时仅重置 Trakt 凭据。"""
+        bound_client = self.get_data("trakt_auth_client_id")
+        token_client = (self.get_data("trakt_token") or {}).get("client_id")
+        previous_client = bound_client if bound_client is not None else token_client
+        changed = previous_client is not None and previous_client != self._trakt_client_id
+        start = bool(config.get("trakt_authorize"))
+        callback_url = (config.get("trakt_authorization_response") or "").strip()
+        if changed or start or callback_url:
+            helper = self._create_trakt_helper()
+            if changed:
+                helper.reset_authorization()
+                self._trakt_auth_message = "Trakt 应用已更换，请重新授权；同步记录已保留"
+            # 在任何网络请求前清除一次性输入，重载插件不会重复交换授权码。
+            self._merge_update_config({
+                "trakt_authorize": False,
+                "trakt_authorization_response": "",
+                "trakt_auth_message": self._trakt_auth_message,
+            })
+            try:
+                if start and callback_url:
+                    raise ValueError("请先生成授权链接并完成授权，再单独粘贴回跳地址保存")
+                if start:
+                    self._merge_update_config({"trakt_auth_mode": "pkce"})
+                    helper.begin_pkce_authorization()
+                    message = "授权链接已生成，请重新打开配置页，打开链接授权后粘贴完整回跳地址（10 分钟内）"
+                elif callback_url:
+                    authorized = helper.complete_pkce_authorization(callback_url)
+                    message = "Trakt 授权成功，令牌已自动保存" if authorized else "Trakt 授权未完成，请重新生成链接；若仍返回 403，请检查应用访问权限"
+                else:
+                    message = self._trakt_auth_message
+            except ValueError as error:
+                message = str(error)
+            except Exception as error:
+                logger.warning("Trakt 授权操作失败：%s", type(error).__name__)
+                message = "Trakt 授权操作失败，请检查配置并重新生成链接"
+            self._merge_update_config({"trakt_auth_message": message})
+        self.save_data("trakt_auth_client_id", self._trakt_client_id)
 
     def run(self):
         """定时/手动触发入口：依次执行 Trakt 同步、微信读书同步、网易云音乐同步、小宇宙播客同步。"""
@@ -162,17 +227,7 @@ class TraktRatingsSync(_PluginBase):
             return
 
         # 初始化 Trakt helper
-        self._trakt_helper = TraktHelper(
-            client_id=self._trakt_client_id,
-            client_secret=self._trakt_client_secret,
-            access_token=self._trakt_access_token,
-            username=self._trakt_username,
-            save_data_fn=self.save_data,
-            get_data_fn=self.get_data,
-            update_config_fn=self._merge_update_config,
-            send_notification_fn=self._send_bark_notification,
-            manual_mappings=self._parse_trakt_manual_mappings(),
-        )
+        self._trakt_helper = self._create_trakt_helper()
 
         # 同步 Trakt 评分 → 豆瓣看过
         try:
@@ -888,6 +943,12 @@ class TraktRatingsSync(_PluginBase):
             "trakt_client_id": self._trakt_client_id,
             "trakt_client_secret": self._trakt_client_secret,
             "trakt_access_token": self._trakt_access_token,
+            "trakt_auth_mode": self._trakt_auth_mode,
+            "trakt_redirect_uri": self._trakt_redirect_uri,
+            "trakt_authorization_url": self._trakt_authorization_url,
+            "trakt_auth_message": self._trakt_auth_message,
+            "trakt_authorize": False,
+            "trakt_authorization_response": "",
             "trakt_manual_mappings": self._trakt_manual_mappings,
             "douban_cookie": self._douban_cookie,
             "weread_api_key": self._weread_api_key,
@@ -906,6 +967,9 @@ class TraktRatingsSync(_PluginBase):
         }
         current.update(patch)
         self._trakt_access_token = current.get("trakt_access_token") or ""
+        self._trakt_auth_mode = current.get("trakt_auth_mode") or "auto"
+        self._trakt_authorization_url = current.get("trakt_authorization_url") or ""
+        self._trakt_auth_message = current.get("trakt_auth_message") or ""
         self._trakt_manual_mappings = current.get("trakt_manual_mappings") or ""
         self._netease_cookie = current.get("netease_cookie") or ""
         self.update_config(current)
@@ -1192,14 +1256,34 @@ class TraktRatingsSync(_PluginBase):
                     col(field(
                         "trakt_client_id",
                         "Trakt Client ID",
-                        placeholder="在 trakt.tv/oauth/applications 创建应用获取",
+                        placeholder="在 developer.trakt.tv/apps 创建应用获取",
                     ), md=4),
                     col(field(
                         "trakt_client_secret",
                         "Trakt Client Secret(可选)",
-                        placeholder="用于设备码授权自动获取 Access Token",
+                        placeholder="仅旧应用使用，新 PKCE 应用留空",
                     ), md=4),
                 ),
+                row(
+                    col(select("trakt_auth_mode", "Trakt 授权方式", [
+                        {"title": "自动（无 Secret 使用 PKCE）", "value": "auto"},
+                        {"title": "PKCE（新应用，仅需 Client ID）", "value": "pkce"},
+                        {"title": "设备码（旧应用，需要 Secret）", "value": "device"},
+                    ]), md=4),
+                    col(field("trakt_redirect_uri", "Trakt HTTPS 回跳地址",
+                              hint="填写自己域名下的 HTTPS 地址，与 Trakt 应用登记值完全一致；地址应保留 code 和 state 参数",
+                              **{"persistent-hint": True}), md=8),
+                ),
+                row(col(switch("trakt_authorize", "生成新的 PKCE 授权链接（保存后生效）"))),
+                row(col(textarea("trakt_authorization_url", "Trakt 授权链接（保存后重新打开配置页查看）",
+                                 readonly=True, rows=2, **{"auto-grow": True}))),
+                row(col(textarea("trakt_authorization_response", "授权后的完整回跳地址（粘贴后保存）",
+                                 hint="打开上方链接完成授权后，复制浏览器地址栏中的完整地址；保存后自动清除",
+                                 rows=2, **{"persistent-hint": True, "auto-grow": True}))),
+                row(col({"component": "VAlert", "props": {
+                    "type": "info", "variant": "tonal",
+                    "text": self._trakt_auth_message or "新应用不需要 Client Secret。填写 Client ID 和回跳地址后生成链接，再完成浏览器授权。",
+                }})),
                 row(
                     col(field(
                         "trakt_history_limit",
@@ -1268,6 +1352,12 @@ class TraktRatingsSync(_PluginBase):
             "trakt_client_id": "",
             "trakt_client_secret": "",
             "trakt_access_token": "",
+            "trakt_auth_mode": "auto",
+            "trakt_redirect_uri": "",
+            "trakt_authorization_url": "",
+            "trakt_auth_message": "",
+            "trakt_authorize": False,
+            "trakt_authorization_response": "",
             "trakt_manual_mappings": "",
             "douban_cookie": "",
             "weread_api_key": "",
