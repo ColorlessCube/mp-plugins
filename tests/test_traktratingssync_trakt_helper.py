@@ -433,7 +433,7 @@ def _load_progress_plugin(monkeypatch, helper_module):
     ([_Response(401), _Response(200, []), _Response(200, []), _Response(200, [])], True, 1),
 ])
 def test_progress_sync_preserves_watching_until_both_sources_succeed(monkeypatch, responses, should_clear, refresh_count):
-    """任一路失败及刷新后仍失败均保留在看，只有完整成功空结果才清空。"""
+    """任一路失败均不覆盖缓存；完整成功空结果也保留历史，供后续完成核对。"""
     module = _load_trakt_helper_module(monkeypatch)
     pending = iter(responses)
     monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: types.SimpleNamespace(
@@ -453,7 +453,7 @@ def test_progress_sync_preserves_watching_until_both_sources_succeed(monkeypatch
 
     plugin._sync_progress()
 
-    assert [item for item in saved if item[0] == "watching"] == ([("watching", {})] if should_clear else [])
+    assert [item for item in saved if item[0] == "watching"] == ([("watching", watching)] if should_clear else [])
     assert watching == {"existing": {"title": "保留记录"}}
     assert len(refreshes) == refresh_count
 

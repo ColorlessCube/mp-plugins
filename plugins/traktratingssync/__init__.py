@@ -37,9 +37,9 @@ class TraktRatingsSync(_PluginBase):
     """豆瓣书影音同步插件入口，负责配置、调度和多平台同步编排。"""
 
     plugin_name = "豆瓣书影音同步"
-    plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
+    plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影评分、剧集逐季在看/看过，微信读书阅读记录，网易云音乐专辑，小宇宙播客。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.17.0"
+    plugin_version = "3.18.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -330,7 +330,7 @@ class TraktRatingsSync(_PluginBase):
         logger.info("Trakt 评分同步完成: 已处理 %d，未完成 %d（包括延期；实际写入见豆瓣汇总）", success_count, fail_count)
 
     def _sync_progress(self) -> None:
-        """从 Trakt 播放进度（未看完列表）同步豆瓣「在看」。"""
+        """从播放进度、观看历史和已跟踪季核对完整季度状态，无需评分。"""
         if self._sync_type == "movies":
             logger.info("同步类型为仅电影，跳过 Trakt 剧集在看同步")
             return
@@ -380,30 +380,86 @@ class TraktRatingsSync(_PluginBase):
             key = ids.get("trakt") or ids.get("tmdb") or ids.get("imdb") or ids.get("slug")
             if key:
                 candidates.setdefault(str(key), {"progress": "history", "show": show})
-        logger.info("Trakt 在看记录去重后共 %d 个剧集", len(candidates))
+        # 已跟踪季不依赖最近历史窗口，避免完结后离开窗口便一直留在“在看”。
+        for cache_key, record in watching.items():
+            show = record.get("show") or {}
+            legacy_id = cache_key.removeprefix(f"{MediaType.TV.value}_")
+            if not show and legacy_id.isdigit():
+                show = {"title": record.get("en_title") or record.get("title"), "year": record.get("year"),
+                        "ids": {"trakt": int(legacy_id)}}
+            ids = show.get("ids") or {}
+            key = ids.get("trakt") or ids.get("slug") or ids.get("imdb")
+            if key and record.get("status") == "在看" and not record.get("season_tracking"):
+                candidates.setdefault(str(key), {"progress": "tracked", "show": show})
+        logger.info(f"Trakt 观看记录去重后共 {len(candidates)} 个剧集，逐季核对完成状态")
         for item in candidates.values():
             if self._douban_helper.requests_paused:
                 break
             try:
-                if self._trakt_helper.sync_one_progress(
-                    item,
-                    "show",
-                    MediaType.TV,
-                    watching,
-                    self._douban_helper,
-                    self._private,
-                ):
-                    success_count += 1
+                show = item["show"]
+                ids = show.get("ids") or {}
+                show_id = ids.get("trakt") or ids.get("slug") or ids.get("imdb")
+                if not show_id:
+                    continue
+                if not ids.get("tmdb") and not ids.get("imdb"):
+                    show = self._trakt_helper.fetch_show_details(str(show_id))
+                    if not show:
+                        self._notify_issue("Trakt", "Trakt季度信息读取未完成", "本轮保留该剧原有状态，稍后继续核对。")
+                        continue
+                    ids = show["ids"]
+                progress = self._trakt_helper.fetch_show_progress(str(show_id), access_token)
+                seasons = self._trakt_helper.fetch_show_seasons(str(show_id))
+                if self._trakt_helper.has_oauth_unauthorized():
+                    refreshed = self._trakt_helper.get_access_token(force_reauthorize=True)
+                    if refreshed:
+                        access_token = refreshed
+                        self._trakt_helper.reset_oauth_unauthorized()
+                        progress = self._trakt_helper.fetch_show_progress(str(show_id), access_token)
+                if progress is None or seasons is None:
+                    self._notify_issue("Trakt", "Trakt季度进度读取未完成", "本轮保留该剧原有状态，其他剧集继续处理。")
+                    continue
+                states = self._trakt_helper.build_season_states(progress, seasons)
+                processed = False
+                active_seasons = {entry.get("episode", {}).get("season") for entry in [*episodes, *recent_shows]
+                                  if str((entry.get("show") or {}).get("ids", {}).get("trakt")
+                                         or (entry.get("show") or {}).get("ids", {}).get("slug")
+                                         or (entry.get("show") or {}).get("ids", {}).get("imdb")) == str(show_id)}
+                tracked_seasons = {record.get("season") for record in watching.values()
+                                   if str((record.get("show") or {}).get("ids", {}).get("trakt")
+                                          or (record.get("show") or {}).get("ids", {}).get("slug")
+                                          or (record.get("show") or {}).get("ids", {}).get("imdb")) == str(show_id)}
+                wanted_seasons = active_seasons | tracked_seasons
+                wanted_seasons.discard(None)
+                legacy_key = f"{MediaType.TV.value}_{show_id}"
+                if legacy_key in watching and not watching[legacy_key].get("season_tracking"):
+                    # 旧版自动桥接默认匹配第一季，核对其完成状态后保留旧历史并切换逐季跟踪。
+                    wanted_seasons.add(1)
+                if not wanted_seasons:
+                    last_season = (progress.get("last_episode") or {}).get("season")
+                    if type(last_season) is int and last_season > 0:
+                        wanted_seasons.add(last_season)
+                for state in states:
+                    if self._douban_helper.requests_paused:
+                        break
+                    if state["season"] not in wanted_seasons:
+                        continue
+                    if not state["watched_episodes"] and state["season"] not in active_seasons | tracked_seasons:
+                        continue
+                    # 同一部剧按季处理，单集的百分比不能代表全季完成。
+                    if self._trakt_helper.sync_one_progress(
+                        {**state, "show": show}, "show", MediaType.TV, watching, self._douban_helper, self._private,
+                    ):
+                        success_count += 1
+                        processed = True
+                if processed:
+                    if legacy_key in watching and watching[legacy_key].get("season") is None:
+                        watching[legacy_key]["season_tracking"] = True
             except Exception as ex:
-                logger.error("同步播放进度失败: %s", ex, exc_info=True)
-
-        if not episodes and not recent_shows:
-            logger.info("Trakt 剧集播放进度和最近观看历史均为空，无需同步在看")
-            self.save_data("watching", {})
-            return
+                logger.error(f"同步季度状态失败：{type(ex).__name__}", exc_info=True)
+                self._notify_issue("Trakt", "Trakt季度同步异常", "本轮未能完成部分剧集，已同步记录保留。")
 
         self.save_data("watching", watching)
-        logger.info("Trakt 剧集在看同步完成: 已处理 %d 个剧集（实际写入见豆瓣汇总）", success_count)
+        logger.info(f"Trakt 季度观看状态同步完成: 已处理 {success_count} 季（实际写入见豆瓣汇总）")
 
     def _fetch_trakt_progress_sources(
         self,
@@ -1410,6 +1466,7 @@ class TraktRatingsSync(_PluginBase):
             auth_text = "上次授权链接已过期，请重新生成并在10分钟内完成授权"
         trakt = [
             row(field("trakt_username", "Trakt 用户名", hint="用于读取公开评分，仍需保留"), field("trakt_client_id", "Trakt Client ID")),
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "剧集无需评分：按季核对总集数与逐集观看记录；全季已播完且全部看过才标记看过，否则保持在看。"},
             field("trakt_redirect_uri", "Trakt HTTPS 回跳地址", hint=f"填写 MoviePilot 的 HTTPS 域名 + {self._trakt_callback_path}，并与 Trakt 后台一致", **{"persistent-hint": True}),
             {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "{{ _ui_trakt_message }}"}},
             {"component": "div", "props": {"class": "d-flex flex-wrap ga-3 my-3"}, "content": [self._config_action_button("重新授权" if authorized else "生成授权链接", "oauth/start", "_ui_trakt_message")]},
@@ -1429,7 +1486,7 @@ class TraktRatingsSync(_PluginBase):
             heading("Trakt 读取范围"), row(select("sync_type", "Trakt 影视同步范围", [("电影和剧集", "all"), ("仅电影", "movies"), ("仅剧集", "shows")]),
                                          field("max_sync_count", "Trakt 最近评分读取上限", type="number", min=0, hint="0表示不限制；不影响其他平台及豆瓣写入额度")),
             row(field("trakt_history_limit", "剧集观看历史读取条数", type="number", min=1), field("trakt_history_days", "剧集历史范围（天）", type="number", min=0, hint="0表示不限天数")),
-            {"component": "VTextarea", "props": {"model": "trakt_manual_mappings", "label": "Trakt → 豆瓣手动映射", "rows": 2, "placeholder": "imdb:tt1234567=12345678", "auto-grow": True}},
+            {"component": "VTextarea", "props": {"model": "trakt_manual_mappings", "label": "Trakt → 豆瓣手动映射", "rows": 2, "placeholder": "show:123:s2=12345678", "hint": "逐季映射使用show:TraktID:s季号=豆瓣ID；旧通用映射仅用于第1季", "persistent-hint": True, "auto-grow": True}},
             heading("各平台读取数量"), row(field("weread_limit", "微信读书读取本数", type="number", min=1), field("netease_limit", "网易云读取专辑数", type="number", min=1)),
             field("xiaoyuzhou_limit", "小宇宙读取单集数", type="number", min=1),
         ]
@@ -1543,11 +1600,13 @@ class TraktRatingsSync(_PluginBase):
 
         finished = self.get_data("finished") or self.get_data("synced") or {}
         watching = self.get_data("watching") or {}
-        video = {str(item.get("douban_id")): item for item in [*watching.values(), *finished.values()] if item.get("douban_id")}
-        video_rows = [[item.get("title", "未知"), item.get("status", "在看"), sync_status(str(item.get("douban_id")), "movie.douban.com", legacy=True), timestamp(item.get("sync_time")), link(str(item.get("douban_id")), "movie.douban.com")]
+        video = {str(item.get("douban_id")): item for item in sorted([*watching.values(), *finished.values()], key=lambda record: record.get("sync_time", 0)) if item.get("douban_id")}
+        video_rows = [[item.get("title", "未知"), item.get("status", "在看"),
+                       f"{item.get('watched_episodes', 0)} / {item.get('total_episodes') or '未知'}" if item.get("season") else "—",
+                       sync_status(str(item.get("douban_id")), "movie.douban.com", legacy=True), timestamp(item.get("sync_time")), link(str(item.get("douban_id")), "movie.douban.com")]
                       for item in sorted(video.values(), key=lambda item: item.get("sync_time", 0), reverse=True)[:20]]
         if video:
-            page.append(self._fold(f"Trakt · {len(video)} 条历史记录", [table(["标题", "豆瓣目标状态", "同步结果", "同步时间", "链接"], video_rows)]))
+            page.append(self._fold(f"Trakt · {len(video)} 条历史记录", [table(["标题", "豆瓣目标状态", "已看 / 全季集数", "同步结果", "同步时间", "链接"], video_rows)]))
 
         books = self.get_data("weread_books") or []
         book_maps = self.get_data("weread_book_id_map") or {}

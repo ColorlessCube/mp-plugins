@@ -219,19 +219,24 @@ def test_write_interval_is_shared_across_platforms(monkeypatch):
 
 
 def test_progress_deduplicates_playback_and_history(monkeypatch):
-    """同剧多集和观看历史合并后只提交一次，保留最高播放进度。"""
+    """同剧多集和观看历史合并后只核对一次季度完成记录。"""
     plugin_module = _load_plugin_module(monkeypatch)
     plugin = plugin_module.TraktRatingsSync()
     show = {"title": "Test", "ids": {"trakt": 1, "tmdb": 2}}
     calls = []
+    checks = []
     plugin._trakt_helper = types.SimpleNamespace(get_access_token=lambda: "token", has_oauth_unauthorized=lambda: False,
-        sync_one_progress=lambda item, *_args: calls.append(item) or True)
+        sync_one_progress=lambda item, *_args: calls.append(item) or True,
+        fetch_show_progress=lambda *_args: checks.append(True) or {}, fetch_show_seasons=lambda *_args: [],
+        build_season_states=lambda *_args: [{"season": 1, "completed": False, "watched_episodes": 1}])
     plugin._douban_helper = types.SimpleNamespace(requests_paused=False)
     monkeypatch.setattr(plugin, "_fetch_trakt_progress_sources", lambda _token: (
-        [{"show": show, "progress": 20}, {"show": show, "progress": 60}], [{"show": show}]))
+        [{"show": show, "progress": 20, "episode": {"season": 1}}, {"show": show, "progress": 60, "episode": {"season": 1}}],
+        [{"show": show, "episode": {"season": 1}}]))
     plugin._sync_progress()
     assert len(calls) == 1
-    assert calls[0]["progress"] == 60
+    assert checks == [True]
+    assert calls[0]["season"] == 1 and calls[0]["completed"] is False
 
 
 def test_watching_state_skips_mapping_and_post_but_updates_local_progress(monkeypatch):
