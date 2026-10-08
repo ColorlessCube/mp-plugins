@@ -425,6 +425,7 @@ class TraktHelper:
         if key in finished:
             prev = finished[key]
             if prev.get("trakt_rating") == trakt_rating and prev.get("douban_id"):
+                douban_helper.record_unchanged()
                 logger.debug("已同步过且评分未变，跳过: %s", title)
                 return True
 
@@ -532,6 +533,14 @@ class TraktHelper:
         key = f"{media_type.value}_{str(trakt_id) if trakt_id else slug or f'{title}_{year}'}"
 
         subject_id = self._lookup_manual_douban_id(media, media_type, key)
+        previous = watching.get(key) or {}
+        if (previous.get("status") == "在看" and previous.get("douban_id")
+                and previous.get("private") == private
+                and (not subject_id or subject_id == previous["douban_id"])):
+            previous["progress"] = progress
+            douban_helper.record_unchanged()
+            logger.info("剧集已同步为在看，跳过重复提交: %s", title)
+            return True
         douban_info: Dict[str, Any] = {}
         if not subject_id:
             douban_info = self._resolve_douban_info(
@@ -563,6 +572,7 @@ class TraktHelper:
                 "media_type": media_type.value,
                 "progress": progress,
                 "status": "在看",
+                "private": private,
                 "sync_time": int(time.time()),
             }
             logger.info("同步未看完到豆瓣在看: %s (%s) -> 在看(progress=%s)", display_title, year, progress)

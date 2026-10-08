@@ -4,12 +4,14 @@
 用于提交「看过/在看」「读过/在读」「听过」状态及评分到豆瓣。
 Cookie 需在插件配置中手动填写，失效时通过注入的 notify_fn 通知用户。
 """
+import hashlib
 import random
 import re
 import shlex
 import time
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -46,8 +48,30 @@ class DoubanHelper:
         self,
         user_cookie: Optional[str] = None,
         notify_fn: Optional[Callable[[str, str], None]] = None,
+        save_data_fn: Optional[Callable[[str, Any], None]] = None,
+        get_data_fn: Optional[Callable[[str], Any]] = None,
+        write_limit: int = 10,
+        write_interval: int = 10,
     ):
+        """初始化豆瓣登录、共享写入额度和不含凭据的持久化待同步队列。"""
         self._notify = notify_fn or (lambda title, body: None)
+        self._save_data = save_data_fn or (lambda _key, _value: None)
+        state = (get_data_fn("douban_sync_state") if get_data_fn else None) or {}
+        self._state = dict(state)
+        self._state["pending"] = dict(state.get("pending") or {})
+        self._state["synced"] = dict(state.get("synced") or {})
+        self._write_limit = max(1, write_limit)
+        self._write_interval = max(5, write_interval)
+        self._next_write_at = 0.0
+        self._attempted = set()
+        self._transient_failures = 0
+        self._stats = {"written": 0, "skipped": 0, "failed": 0}
+        fingerprint = hashlib.sha256((user_cookie or "").encode()).hexdigest()
+        if self._state.get("cookie_fingerprint") != fingerprint:
+            self._state.pop("requires_verification", None)
+            self._state.pop("reason", None)
+        self._state["cookie_fingerprint"] = fingerprint
+        self._persist_sync_state()
 
         if user_cookie:
             self.cookies = self._parse_cookie_input(user_cookie)
@@ -69,21 +93,96 @@ class DoubanHelper:
         self.cookies.pop("ck", None)
         self._authenticated = False
 
-        if self.cookies:
+        if self.cookies and not self.requests_paused:
             self._refresh_ck()
             self.ck = self.cookies.get("ck")
             if self.ck:
                 self._authenticated = True
-                logger.debug("豆瓣认证成功 ck:%s", self.ck)
+                logger.debug("豆瓣认证检查通过")
             else:
-                msg = "豆瓣 Cookie 已失效或填写错误，请重新从浏览器复制 Cookie 或完整 cURL 并更新配置。"
-                self._notify_auth_failure("豆瓣 Cookie 已失效", msg, self._auth_context())
+                if not self.requests_paused:
+                    self._pause_requests("豆瓣登录检查未通过，请检查 Cookie 或完成浏览器验证")
         else:
             self.ck = None
+            if not self.cookies and not self.requests_paused:
+                self._pause_requests("未配置有效的豆瓣 Cookie")
 
         self._last_search_ts = 0.0
         self._search_forbidden_until = 0.0
         self._search_forbidden_count = 0
+
+    @property
+    def requests_paused(self) -> bool:
+        """返回是否因验证或服务端冷却暂停所有豆瓣请求。"""
+        return bool(self._state.get("requires_verification") or self._state.get("blocked_until", 0) > time.time())
+
+    def _persist_sync_state(self) -> None:
+        """持久化目标状态和暂停信息，不保存 Cookie、ck 或响应正文。"""
+        self._save_data("douban_sync_state", self._state)
+
+    def _pause_requests(self, reason: str, seconds: Optional[int] = None) -> None:
+        """遇到访问限制时停止后续请求，验证状态跨重载保存。"""
+        already_paused = self.requests_paused
+        if seconds is None:
+            self._state["requires_verification"] = True
+        else:
+            self._state["blocked_until"] = max(self._state.get("blocked_until", 0), time.time() + seconds)
+        self._state["reason"] = reason
+        self._persist_sync_state()
+        if not already_paused:
+            logger.warning("%s；已暂停豆瓣请求，待同步记录已保留", reason)
+            self._notify("豆瓣同步已暂停", reason + "；请在浏览器完成验证后更新 Cookie，或保存“恢复豆瓣同步”开关。")
+
+    def _check_access_response(self, response: Any, writing: bool = False) -> bool:
+        """识别验证码内容、验证跳转和限流，普通条目 404 不触发暂停。"""
+        if response is None:
+            return False
+        text = getattr(response, "text", "") or ""
+        urls = [getattr(response, "url", ""), response.headers.get("Location", "")]
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            payload = {}
+        error = payload.get("error", "") if isinstance(payload, dict) else ""
+        verification = any(urlsplit(str(url)).hostname == "sec.douban.com" for url in urls if url)
+        verification = verification or any(marker in text or marker in str(error) for marker in (
+            "检测到有异常请求", "TCaptcha.js", "<title>禁止访问</title>", "sec.douban.com/", "/misc/sorry",
+        ))
+        if verification:
+            self._pause_requests("豆瓣要求人机验证")
+            return True
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "")
+            seconds = 3600
+            if str(retry_after).isdigit():
+                seconds = int(retry_after)
+            elif retry_after:
+                try:
+                    seconds = int(parsedate_to_datetime(retry_after).timestamp() - time.time())
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            self._pause_requests("豆瓣请求频率受限", seconds=max(60, seconds))
+            return True
+        if writing and (response.status_code == 403 or self._is_need_login_response(response)):
+            self._pause_requests("豆瓣拒绝写入，请检查登录状态或完成浏览器验证")
+            return True
+        return False
+
+    def flush_pending(self) -> None:
+        """在当前额度内处理持久化队列，每个目标每轮最多尝试一次。"""
+        for url in list(self._state["pending"]):
+            if self.requests_paused or len(self._attempted) >= self._write_limit:
+                break
+            if url not in self._attempted:
+                self._submit_pending(url)
+
+    def get_sync_summary(self) -> Dict[str, Any]:
+        """返回实际写入、状态跳过、失败及待处理数量。"""
+        return {**self._stats, "pending": len(self._state["pending"]), "paused": self.requests_paused}
+
+    def record_unchanged(self) -> None:
+        """累计来源缓存确认无需再次写入的条目。"""
+        self._stats["skipped"] += 1
 
     @property
     def is_authenticated(self) -> bool:
@@ -110,9 +209,11 @@ class DoubanHelper:
             logger.warning("刷新豆瓣 ck 未返回响应；%s", self._auth_context())
             self.cookies["ck"] = ""
             return
+        if self._check_access_response(response):
+            self.cookies["ck"] = ""
+            return
         ck = getattr(response, "cookies", {}).get("ck") if getattr(response, "cookies", None) else ""
         ck_str = response.headers.get("Set-Cookie", "")
-        logger.debug("豆瓣 Set-Cookie: %s", ck_str)
         if not ck:
             match = re.search(r"(?:^|,\s*)ck=([^;]+)", ck_str or "")
             ck = match.group(1).strip() if match else ""
@@ -245,6 +346,8 @@ class DoubanHelper:
 
     def _is_search_blocked(self) -> bool:
         """搜索被 403 熔断后，在冷却窗口内直接跳过，避免继续触发风控。"""
+        if self.requests_paused:
+            return True
         if self._search_forbidden_until <= time.time():
             return False
         logger.warning(
@@ -274,50 +377,71 @@ class DoubanHelper:
             data = response.json()
         except Exception:
             return False
-        return data.get("code") == 103 or data.get("msg") == "need_login"
+        return isinstance(data, dict) and (data.get("code") == 103 or data.get("msg") == "need_login")
 
     def _post_interest(self, url: str, referer: str, host: str, data: dict) -> bool:
-        """向豆瓣提交 interest 请求，统一处理响应和 Cookie 失效检测"""
-        headers = self._build_headers(referer, host)
-        response = None
-        for attempt in range(2):
-            try:
-                self._sleep_before_request("提交状态")
-                response = RequestUtils(headers=headers, cookies=self.cookies, timeout=10).post_res(
-                    url=url,
-                    data=data,
-                )
-            except Exception as e:
-                logger.error("请求豆瓣失败: %s", e)
-                return False
-            if response is None:
-                logger.warning("豆瓣未返回内容，attempt=%d", attempt + 1)
-                if attempt == 0:
-                    continue
-                return False
-            if response.status_code in self._TRANSIENT_STATUS_CODES and attempt == 0:
-                logger.warning(
-                    "豆瓣返回临时异常 %s，准备重试一次: %s",
-                    response.status_code,
-                    (response.text or "")[:200],
-                )
-                continue
-            break
-        if response.status_code == 403:
-            msg = "豆瓣返回 403，Cookie 可能已失效、填写错误，或当前请求被风控。请重新复制 Cookie 或完整 cURL 后重试。"
-            detail = (
-                f"url={url}, host={host}, status=403, body={(response.text or '')[:200]}, "
-                f"{self._auth_context()}"
-            )
-            self._notify_auth_failure("豆瓣 Cookie 已失效", msg, detail)
-            return False
-        if response.status_code == 200:
-            ret = response.json().get("r")
-            if isinstance(ret, bool) and ret is False:
-                logger.error("豆瓣提交失败（条目未开播或不存在）: url=%s", url)
-                return False
+        """合并最新目标状态，成功缓存命中时跳过写入，延期条目跨运行保留。"""
+        desired = {key: value for key, value in data.items() if key != "ck"}
+        if self._state["synced"].get(url) == desired:
+            self._state["pending"].pop(url, None)
+            self._stats["skipped"] += 1
+            self._persist_sync_state()
             return True
-        logger.error("豆瓣返回异常 %s: %s", response.status_code, response.text[:200])
+        self._state["pending"][url] = {"data": desired, "referer": referer, "host": host}
+        self._persist_sync_state()
+        # 旧待处理条目优先，避免每日新记录持续挤占重试额度。
+        if next(iter(self._state["pending"])) != url:
+            return False
+        return self._submit_pending(url)
+
+    def _submit_pending(self, url: str) -> bool:
+        """限速提交一个目标，不立即重试不确定结果或访问受限响应。"""
+        if self.requests_paused or not self.ck or url in self._attempted or len(self._attempted) >= self._write_limit:
+            return False
+        entry = self._state["pending"].get(url)
+        if not entry:
+            return False
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.hostname not in (
+            "movie.douban.com", "book.douban.com", "music.douban.com", "www.douban.com",
+        ) or not re.fullmatch(r"/j/(?:subject|ilmen/thing)/\d+/interest", parts.path):
+            logger.error("待同步条目地址无效，未执行请求")
+            return False
+        wait = max(0.0, self._next_write_at - time.monotonic())
+        if wait:
+            time.sleep(wait)
+        self._attempted.add(url)
+        try:
+            response = RequestUtils(
+                headers=self._build_headers(entry["referer"], entry["host"]), cookies=self.cookies, timeout=10,
+            ).post_res(url=url, data={**entry["data"], "ck": self.ck})
+        except Exception as error:
+            logger.warning("豆瓣提交请求异常（%s），保留队列等待下次处理", type(error).__name__)
+            response = None
+        self._next_write_at = time.monotonic() + random.uniform(self._write_interval, self._write_interval * 2)
+        if response is None or response.status_code in self._TRANSIENT_STATUS_CODES:
+            self._transient_failures += 1
+            if self._transient_failures >= 3:
+                self._pause_requests("豆瓣连续出现网络或网关异常", seconds=3600)
+        else:
+            self._transient_failures = 0
+        if self._check_access_response(response, writing=True):
+            self._stats["failed"] += 1
+            return False
+        if response is not None and response.status_code == 200:
+            try:
+                payload = response.json()
+            except (ValueError, TypeError):
+                payload = {}
+            ret = payload.get("r") if isinstance(payload, dict) else None
+            if ret is True or (type(ret) is int and ret == 0):
+                self._state["synced"][url] = dict(entry["data"])
+                self._state["pending"].pop(url, None)
+                self._stats["written"] += 1
+                self._persist_sync_state()
+                return True
+        self._stats["failed"] += 1
+        logger.warning("豆瓣写入未确认成功（status=%s），保留队列等待下次处理", getattr(response, "status_code", None))
         return False
 
     def _search_subject(self, keyword: str, cat: str) -> Tuple[Optional[str], Optional[str]]:
@@ -334,6 +458,8 @@ class DoubanHelper:
         ).get_res(
             url=url, params={"cat": cat, "q": keyword}
         )
+        if self._check_access_response(response):
+            return None, None
         self._mark_search_response(getattr(response, "status_code", None), keyword)
         if not response or response.status_code != 200:
             logger.error(
@@ -371,6 +497,8 @@ class DoubanHelper:
             url=self._URL_REXXAR_SEARCH,
             params=self._build_rexxar_params(keyword, "podcast"),
         )
+        if self._check_access_response(response):
+            return None, None
         status_code = getattr(response, "status_code", None)
         need_login = bool(response is not None and self._is_need_login_response(response))
         if need_login:
@@ -396,6 +524,8 @@ class DoubanHelper:
             )
             return None, None
 
+        if self.requests_paused:
+            return None, None
         # 豆瓣播客顶部搜索表单当前指向 subject_search；保留 HTML 解析兜底。
         response = RequestUtils(
             headers=self._build_public_search_headers(referer=self._URL_SUBJECT_SEARCH),
@@ -404,6 +534,8 @@ class DoubanHelper:
             url=self._URL_SUBJECT_SEARCH,
             params={"search_text": keyword},
         )
+        if self._check_access_response(response):
+            return None, None
         status_code = getattr(response, "status_code", None)
         if status_code == 403 and self._is_need_login_response(response):
             logger.warning("豆瓣播客 HTML 搜索 [%s] 返回 need_login，跳过该候选词", keyword)

@@ -13,6 +13,7 @@
 import hashlib
 import time
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode, urlparse, urlunparse
 
@@ -38,7 +39,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.15.1"
+    plugin_version = "3.16.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -56,6 +57,9 @@ class TraktRatingsSync(_PluginBase):
     _trakt_auth_message: str = ""
     _trakt_manual_mappings: str = ""
     _douban_cookie: str = ""
+    _douban_write_limit: int = 10
+    _douban_write_interval: int = 10
+    _run_lock = Lock()
     _weread_api_key: str = ""
     _weread_limit: int = 20
     _netease_cookie: str = ""
@@ -98,6 +102,8 @@ class TraktRatingsSync(_PluginBase):
         self._trakt_auth_message = config.get("trakt_auth_message") or ""
         self._trakt_manual_mappings = (config.get("trakt_manual_mappings") or "").strip()
         self._douban_cookie = (config.get("douban_cookie") or "").strip()
+        self._douban_write_limit = max(1, int(config.get("douban_write_limit") or 10))
+        self._douban_write_interval = max(5, int(config.get("douban_write_interval") or 10))
         self._weread_api_key = (config.get("weread_api_key") or "").strip()
         self._weread_limit = int(config.get("weread_limit") or 20)
         self._netease_cookie = (config.get("netease_cookie") or "").strip()
@@ -120,6 +126,12 @@ class TraktRatingsSync(_PluginBase):
         self._xiaoyuzhou_helper = None
 
         self._init_trakt_authorization(config)
+        if config.get("douban_resume"):
+            state = dict(self.get_data("douban_sync_state") or {})
+            state.pop("requires_verification", None)
+            state.pop("reason", None)
+            self.save_data("douban_sync_state", state)
+            self._merge_update_config({"douban_resume": False})
 
     def _create_trakt_helper(self) -> TraktHelper:
         """以当前配置创建 Trakt Helper，统一授权和同步入口的凭据来源。"""
@@ -187,50 +199,57 @@ class TraktRatingsSync(_PluginBase):
             self._merge_update_config({"trakt_auth_message": message})
         self.save_data("trakt_auth_client_id", self._trakt_client_id)
 
-    def run(self):
+    def run(self) -> None:
+        """串行执行同步，阻止定时与手动入口同时写入豆瓣。"""
+        if not self._run_lock.acquire(blocking=False):
+            logger.warning("豆瓣同步任务正在运行，跳过本次重复触发")
+            return
+        try:
+            self._run_sync()
+        finally:
+            self._run_lock.release()
+
+    def _run_sync(self) -> None:
         """定时/手动触发入口：依次执行 Trakt 同步、微信读书同步、网易云音乐同步、小宇宙播客同步。"""
         if not self._enable:
             logger.debug("豆瓣书影音同步插件未启用，跳过")
             return
 
-        # 初始化豆瓣 helper（注入通知回调）
+        logger.info("开始豆瓣书影音同步（统一写入上限 %d，间隔 %d–%d 秒）", self._douban_write_limit,
+                    self._douban_write_interval, self._douban_write_interval * 2)
+        # 各来源共享请求预算与待处理队列，验证后不再进入下一个平台。
         try:
             self._douban_helper = DoubanHelper(
                 user_cookie=self._douban_cookie or None,
                 notify_fn=self._send_bark_notification,
+                save_data_fn=self.save_data,
+                get_data_fn=self.get_data,
+                write_limit=self._douban_write_limit,
+                write_interval=self._douban_write_interval,
             )
         except Exception as e:
             logger.error("初始化豆瓣 Helper 失败: %s", e)
             return
 
-        # 同步 Trakt 最近观看记录（有 client_id 就尝试，token 可在内部通过设备码获取）
-        if self._trakt_client_id:
+        sources = (
+            (self._trakt_client_id, self._sync_trakt),
+            (self._weread_api_key, self._sync_weread),
+            (self._has_netease_source(), self._sync_netease),
+            (self._xiaoyuzhou_cookie, self._sync_xiaoyuzhou),
+        )
+        for enabled, sync in sources:
+            if self._douban_helper.requests_paused:
+                break
+            if not enabled:
+                continue
             try:
-                self._sync_trakt()
+                sync()
             except Exception as e:
-                logger.error("同步 Trakt 评分失败: %s", e, exc_info=True)
-
-        # 同步微信读书最近阅读记录
-        if self._weread_api_key:
-            try:
-                self._sync_weread()
-            except Exception as e:
-                logger.error("同步微信读书记录失败: %s", e, exc_info=True)
-
-        # 同步网易云音乐最近听歌专辑到豆瓣「听过」
-        if self._has_netease_source():
-            try:
-                self._sync_netease()
-            except Exception as e:
-                logger.error("同步网易云音乐记录失败: %s", e, exc_info=True)
-
-        # 同步小宇宙播客最近听取记录到豆瓣「听过」
-        if self._xiaoyuzhou_cookie:
-            try:
-                self._sync_xiaoyuzhou()
-            except Exception as e:
-                logger.error("同步小宇宙播客记录失败: %s", e, exc_info=True)
-
+                logger.error("平台同步失败: %s", e, exc_info=True)
+        self._douban_helper.flush_pending()
+        summary = self._douban_helper.get_sync_summary()
+        logger.info("豆瓣写入汇总: 新增成功 %d，状态未变跳过 %d，提交失败 %d，待处理 %d，暂停 %s",
+                    summary["written"], summary["skipped"], summary["failed"], summary["pending"], summary["paused"])
         logger.info("豆瓣书影音同步完成")
 
     # ------------------------------------------------------------------
@@ -252,6 +271,8 @@ class TraktRatingsSync(_PluginBase):
         except Exception as e:
             logger.error("同步 Trakt 评分到豆瓣失败: %s", e, exc_info=True)
 
+        if self._douban_helper.requests_paused:
+            return
         # 同步 Trakt 播放进度 → 豆瓣在看
         try:
             self._sync_progress()
@@ -294,6 +315,8 @@ class TraktRatingsSync(_PluginBase):
         success_count = 0
         fail_count = 0
         for item in all_items:
+            if self._douban_helper.requests_paused:
+                break
             media_type = item.pop("_media_type", MediaType.MOVIE)
             try:
                 if self._trakt_helper.sync_one_rate(
@@ -309,7 +332,7 @@ class TraktRatingsSync(_PluginBase):
 
         self.save_data("finished", finished)
         self.save_data("wait", wait_retry)
-        logger.info("Trakt 评分同步完成: 成功 %d，失败 %d", success_count, fail_count)
+        logger.info("Trakt 评分同步完成: 已处理 %d，未完成 %d（包括延期；实际写入见豆瓣汇总）", success_count, fail_count)
 
     def _sync_progress(self) -> None:
         """从 Trakt 播放进度（未看完列表）同步豆瓣「在看」。"""
@@ -343,12 +366,30 @@ class TraktRatingsSync(_PluginBase):
         watching: Dict[str, Any] = self.get_data("watching") or {}
         success_count = 0
 
+        candidates: Dict[str, dict] = {}
         for e in episodes:
-            if not e.get("show"):
+            show = e.get("show") or {}
+            ids = show.get("ids") or {}
+            key = ids.get("trakt") or ids.get("tmdb") or ids.get("imdb") or ids.get("slug")
+            progress = e.get("progress")
+            if not key or not isinstance(progress, (int, float)) or not 10 <= progress < 100:
                 continue
+            key = str(key)
+            if key not in candidates or progress > candidates[key]["progress"]:
+                candidates[key] = {"progress": progress, "show": show}
+        for history_item in recent_shows:
+            show = history_item.get("show") or {}
+            ids = show.get("ids") or {}
+            key = ids.get("trakt") or ids.get("tmdb") or ids.get("imdb") or ids.get("slug")
+            if key:
+                candidates.setdefault(str(key), {"progress": "history", "show": show})
+        logger.info("Trakt 在看记录去重后共 %d 个剧集", len(candidates))
+        for item in candidates.values():
+            if self._douban_helper.requests_paused:
+                break
             try:
                 if self._trakt_helper.sync_one_progress(
-                    {"progress": e.get("progress"), "show": e.get("show")},
+                    item,
                     "show",
                     MediaType.TV,
                     watching,
@@ -359,32 +400,13 @@ class TraktRatingsSync(_PluginBase):
             except Exception as ex:
                 logger.error("同步播放进度失败: %s", ex, exc_info=True)
 
-        logger.info("获取到 %d 个最近在看剧集", len(recent_shows))
-
-        for history_item in recent_shows:
-            show = history_item.get("show")
-            if not show:
-                continue
-            try:
-                if self._trakt_helper.sync_one_progress(
-                    {"progress": "history", "show": show},
-                    "show",
-                    MediaType.TV,
-                    watching,
-                    self._douban_helper,
-                    self._private,
-                ):
-                    success_count += 1
-            except Exception as ex:
-                logger.error("同步观看历史失败: %s", ex, exc_info=True)
-
         if not episodes and not recent_shows:
             logger.info("Trakt 剧集播放进度和最近观看历史均为空，无需同步在看")
             self.save_data("watching", {})
             return
 
         self.save_data("watching", watching)
-        logger.info("Trakt 剧集在看同步完成: 成功 %d 条", success_count)
+        logger.info("Trakt 剧集在看同步完成: 已处理 %d 个剧集（实际写入见豆瓣汇总）", success_count)
 
     def _fetch_trakt_progress_sources(
         self,
@@ -512,6 +534,8 @@ class TraktRatingsSync(_PluginBase):
         fail_count = 0
 
         for book in books:
+            if self._douban_helper.requests_paused:
+                break
             title = (book.get("title") or "").strip()
             author = (book.get("author") or "").strip()
             weread_book_id = (book.get("book_id") or "").strip()
@@ -579,6 +603,7 @@ class TraktRatingsSync(_PluginBase):
                     douban_title or title, subject_id, douban_status,
                 )
                 skip_count += 1
+                self._douban_helper.record_unchanged()
                 continue
 
             # ── 提交到豆瓣 ────────────────────────────────────────────────
@@ -659,6 +684,8 @@ class TraktRatingsSync(_PluginBase):
         fail_count = 0
 
         for album_info in albums:
+            if self._douban_helper.requests_paused:
+                break
             album_name = album_info.get("album") or ""
             artist = album_info.get("artist") or ""
             if not album_name:
@@ -711,6 +738,7 @@ class TraktRatingsSync(_PluginBase):
             if subject_id in synced:
                 logger.debug("豆瓣音乐已同步过，跳过: %s (id=%s)", douban_title or album_name, subject_id)
                 skip_count += 1
+                self._douban_helper.record_unchanged()
                 continue
 
             # ── 提交「听过」状态 ──────────────────────────────────────────
@@ -822,6 +850,8 @@ class TraktRatingsSync(_PluginBase):
         )
 
         for podcast_id, ep_info in seen_podcasts.items():
+            if self._douban_helper.requests_paused:
+                break
             podcast_name = ep_info.get("podcast_name", "")
             if not podcast_name:
                 continue
@@ -891,6 +921,7 @@ class TraktRatingsSync(_PluginBase):
                         target_status, douban_title or podcast_name, subject_id,
                     )
                     skip_count += 1
+                    self._douban_helper.record_unchanged()
                     continue
                 # 状态有变化（例如从「在听」升级为「听过」），继续提交
                 logger.info(
@@ -968,6 +999,9 @@ class TraktRatingsSync(_PluginBase):
             "trakt_authorization_response": "",
             "trakt_manual_mappings": self._trakt_manual_mappings,
             "douban_cookie": self._douban_cookie,
+            "douban_write_limit": self._douban_write_limit,
+            "douban_write_interval": self._douban_write_interval,
+            "douban_resume": False,
             "weread_api_key": self._weread_api_key,
             "weread_limit": self._weread_limit,
             "netease_cookie": self._netease_cookie,
@@ -1303,6 +1337,13 @@ class TraktRatingsSync(_PluginBase):
                 ),
                 section("豆瓣"),
                 row(
+                    col(field("douban_write_limit", "各平台合计每轮最多写入", type="number", min=1,
+                              hint="默认10次，包含失败请求；超额条目保留到后续同步", **{"persistent-hint": True}), md=6),
+                    col(field("douban_write_interval", "豆瓣写入最小间隔（秒）", type="number", min=5,
+                              hint="默认10秒，实际等待10–20秒；不保证不会触发验证", **{"persistent-hint": True}), md=6),
+                ),
+                row(col(switch("douban_resume", "已完成豆瓣验证，恢复同步（保存后生效）"))),
+                row(
                     col(field(
                         "douban_cookie",
                         "豆瓣 Cookie",
@@ -1424,6 +1465,9 @@ class TraktRatingsSync(_PluginBase):
             "trakt_authorization_response": "",
             "trakt_manual_mappings": "",
             "douban_cookie": "",
+            "douban_write_limit": 10,
+            "douban_write_interval": 10,
+            "douban_resume": False,
             "weread_api_key": "",
             "weread_limit": 20,
             "netease_cookie": "",
@@ -1598,6 +1642,16 @@ class TraktRatingsSync(_PluginBase):
             }
         ]
 
+        sync_state = self.get_data("douban_sync_state") or {}
+        pending_count = len(sync_state.get("pending") or {})
+        paused = bool(sync_state.get("requires_verification") or sync_state.get("blocked_until", 0) > time.time())
+        if pending_count or paused:
+            reason = sync_state.get("reason") or "等待后续同步"
+            page.insert(0, {"component": "VAlert", "props": {
+                "type": "warning" if paused else "info", "variant": "tonal",
+                "text": f"豆瓣待同步 {pending_count} 条；{'已暂停：' + reason if paused else '下次按额度继续处理'}。"
+                        + ("请先完成浏览器验证，再更新 Cookie 或保存恢复同步开关。" if paused else ""),
+            }})
         if not any((history_list, weread_books, netease_list, xiaoyuzhou_episodes)):
             page.append({
                 "component": "VAlert",

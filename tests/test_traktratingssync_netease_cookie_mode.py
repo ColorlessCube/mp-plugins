@@ -81,6 +81,15 @@ class _DoubanHelper:
     def __init__(self, *_args, **_kwargs):
         """初始化豆瓣 Helper 桩。"""
 
+    requests_paused = False
+
+    def flush_pending(self):
+        """模拟无待处理写入。"""
+
+    def get_sync_summary(self):
+        """返回空汇总。"""
+        return {"written": 0, "skipped": 0, "failed": 0, "pending": 0, "paused": False}
+
 
 class _WereadHelper:
     """测试用微信读书 Helper。"""
@@ -228,6 +237,8 @@ def test_sync_netease_uses_cookie_helper(monkeypatch):
 
     class FakeDoubanHelper:
         """测试用豆瓣音乐提交 Helper。"""
+
+        requests_paused = False
 
         def __init__(self):
             """初始化提交记录。"""

@@ -1,7 +1,20 @@
 import importlib.util
 import sys
+import socket
 import types
 from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def block_network(monkeypatch):
+    """禁止测试通过 DNS 或 socket 访问真实网络。"""
+    def deny_network(*_args, **_kwargs):
+        """所有真实请求必须在边界替换。"""
+        raise AssertionError("测试禁止真实网络访问")
+    monkeypatch.setattr(socket, "getaddrinfo", deny_network)
+    monkeypatch.setattr(socket.socket, "connect", deny_network)
 
 
 class _Logger:
@@ -75,6 +88,15 @@ def _build_helper(module, monkeypatch):
     helper._last_search_ts = 0.0
     helper._search_forbidden_until = 0.0
     helper._search_forbidden_count = 0
+    helper._state = {"pending": {}, "synced": {}}
+    helper._save_data = lambda *_args: None
+    helper._write_limit = 10
+    helper._write_interval = 10
+    helper._next_write_at = 0.0
+    helper._attempted = set()
+    helper._transient_failures = 0
+    helper._stats = {"written": 0, "skipped": 0, "failed": 0}
+    monkeypatch.setattr(module.time, "sleep", lambda *_args: None)
     monkeypatch.setattr(helper, "_sleep_before_request", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(helper, "_throttle_search", lambda *_args, **_kwargs: None)
     return helper
@@ -214,8 +236,8 @@ def test_post_interest_uses_requestutils(monkeypatch):
     assert calls[0]["request"]["data"] == {"ck": "mIHe"}
 
 
-def test_post_interest_retries_transient_status(monkeypatch):
-    """豆瓣状态提交遇到临时 5xx 时应重试一次。"""
+def test_post_interest_defers_transient_status(monkeypatch):
+    """临时 5xx 保留队列，下次处理，不立即重复写入。"""
     module = _load_douban_helper_module(monkeypatch)
     helper = _build_helper(module, monkeypatch)
     calls = []
@@ -236,10 +258,13 @@ def test_post_interest_retries_transient_status(monkeypatch):
 
     monkeypatch.setattr(module, "RequestUtils", RequestUtilsStub)
 
-    assert helper._post_interest(
+    assert not helper._post_interest(
         url="https://movie.douban.com/j/subject/123/interest",
         referer="https://movie.douban.com/subject/123/",
         host="movie.douban.com",
         data={"ck": "mIHe"},
     )
-    assert len(calls) == 2
+    assert len(calls) == 1
+    helper.flush_pending()
+    assert len(calls) == 1
+    assert len(helper._state["pending"]) == 1
