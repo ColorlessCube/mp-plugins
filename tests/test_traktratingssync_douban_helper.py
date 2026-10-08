@@ -99,6 +99,7 @@ def _build_helper(module, monkeypatch):
     monkeypatch.setattr(module.time, "sleep", lambda *_args: None)
     monkeypatch.setattr(helper, "_sleep_before_request", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(helper, "_throttle_search", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(helper, "_read_interest_fields", lambda *_args: {})
     return helper
 
 

@@ -77,6 +77,7 @@ class TraktHelper:
             if str(key).strip() and str(value).strip()
         }
         self._last_oauth_unauthorized = False
+        self._request_issue_kind = "temporary"
 
         # 实例级基础请求头（含 api-key，避免每处重复构建）
         self._headers = {
@@ -111,14 +112,16 @@ class TraktHelper:
         logger.debug("Trakt %s 前随机等待 %.2f 秒", action, delay)
         time.sleep(delay)
 
-    @staticmethod
-    def _log_response_failure(action: str, response: Any, oauth: bool = False) -> None:
+    def _log_response_failure(self, action: str, response: Any, oauth: bool = False) -> None:
         """仅记录响应分类，避免错误正文或请求地址泄露认证信息。"""
         status = getattr(response, "status_code", None)
         headers = getattr(response, "headers", {}) or {}
         content_type = str(headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
         body_prefix = str(getattr(response, "text", "") or "")[:256].lstrip().lower()
         is_html = content_type == "text/html" or body_prefix.startswith(("<!doctype html", "<html"))
+        self._request_issue_kind = ("auth" if status == 401 and oauth else "access" if status == 403 and is_html
+                                    else "application" if status == 403 else "rate_limit" if status == 429
+                                    else "not_found" if status == 404 else "temporary")
         if content_type not in ("application/json", "text/html", "text/plain"):
             content_type = "其他" if content_type else "未知"
         detail = f"status={status}, content_type={content_type}, html={is_html}"
@@ -132,6 +135,10 @@ class TraktHelper:
             logger.warning(f"Trakt {action}拒绝访问（403）：{advice}（{detail}）")
         else:
             logger.warning(f"Trakt {action}请求失败（{detail}）")
+
+    def get_request_issue_kind(self) -> str:
+        """返回最近失败的安全分类，用于区分临时故障与确需处理的授权问题。"""
+        return "auth" if self._last_oauth_unauthorized else self._request_issue_kind
 
     @staticmethod
     def _trakt_rating_to_douban(trakt_rating: int) -> int:
@@ -152,14 +159,14 @@ class TraktHelper:
     # 公开评分接口（仅需 client_id）
     # ------------------------------------------------------------------
 
-    def fetch_ratings(self, media_type: str) -> List[Dict[str, Any]]:
+    def fetch_ratings(self, media_type: str) -> Optional[List[Dict[str, Any]]]:
         """拉取 Trakt 用户评分列表。
 
         Args:
             media_type: ``"movies"`` 或 ``"shows"``
 
         Returns:
-            Trakt 返回的评分项列表，失败时返回空列表。
+            成功无评分时返回空列表，读取失败时返回 None。
         """
         if not self._username or not self._client_id:
             return []
@@ -176,25 +183,37 @@ class TraktHelper:
             self._sleep_before_request(f"fetch_ratings/{media_type}")
             resp = RequestUtils(timeout=30, headers=self._headers, proxies=settings.PROXY).get_res(url=url)
             if resp is None:
-                logger.warning("Trakt API 请求失败（网络或超时）")
-                return []
+                self._log_response_failure("公开评分接口", resp)
+                return None
             if resp.status_code == 200:
                 data = resp.json()
                 if not isinstance(data, list):
                     logger.warning("Trakt API 返回格式异常，期望数组")
-                    return []
+                    self._request_issue_kind = "temporary"
+                    return None
                 return data
-            if resp.status_code == 429:
-                logger.warning("Trakt API 触发频率限制（429），请稍后再试")
-            elif resp.status_code == 403:
-                self._log_response_failure("公开评分接口", resp)
-            elif resp.status_code == 404:
+            self._log_response_failure("公开评分接口", resp)
+            if resp.status_code == 404:
                 logger.warning("Trakt 用户不存在或未公开评分: %s", self._username)
-            else:
-                self._log_response_failure("公开评分接口", resp)
         except Exception as e:
+            self._request_issue_kind = "temporary"
             logger.error(f"拉取 Trakt 评分失败：{type(e).__name__}")
-        return []
+        return None
+
+    def cache_show_ratings(self, items: List[Dict[str, Any]]) -> None:
+        """用完整成功读取的整剧评分替换缓存，撤销评分后不继续沿用旧星级。"""
+        ratings = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            show = item.get("show") or {}
+            ids = show.get("ids") or {}
+            show_id = ids.get("trakt") or ids.get("slug") or ids.get("imdb")
+            rating = item.get("rating")
+            if show_id and type(rating) is int and 1 <= rating <= 10:
+                ratings[str(show_id)] = {"show": show, "trakt_rating": rating,
+                                         "douban_rating": self._trakt_rating_to_douban(rating), "rated_at": item.get("rated_at")}
+        self._save_data("trakt_show_ratings", ratings)
 
     # ------------------------------------------------------------------
     # 播放进度接口（需要 OAuth Access Token）
@@ -229,10 +248,12 @@ class TraktHelper:
                 return None
             data = resp.json()
             if not isinstance(data, list):
+                self._request_issue_kind = "temporary"
                 logger.warning("Trakt 播放进度返回格式异常，期望数组")
                 return None
             return data
         except Exception as e:
+            self._request_issue_kind = "temporary"
             logger.error(f"拉取 Trakt 播放进度失败：{type(e).__name__}")
             return None
 
@@ -269,10 +290,12 @@ class TraktHelper:
                 return None
             data = resp.json()
             if not isinstance(data, list):
+                self._request_issue_kind = "temporary"
                 logger.warning("Trakt 观看历史返回格式异常，期望数组")
                 return None
             return data
         except Exception as e:
+            self._request_issue_kind = "temporary"
             logger.error(f"拉取 Trakt 观看历史失败：{type(e).__name__}")
             return None
 
@@ -297,10 +320,12 @@ class TraktHelper:
             data = response.json()
             expected = list if path == "seasons" else dict
             if not isinstance(data, expected):
+                self._request_issue_kind = "temporary"
                 logger.warning("Trakt 季度完成状态返回格式异常")
                 return None
             return data
         except Exception as error:
+            self._request_issue_kind = "temporary"
             logger.warning(f"Trakt 季度完成状态读取失败：{type(error).__name__}")
             return None
 
@@ -474,6 +499,7 @@ class TraktHelper:
         ids = media.get("ids") if isinstance(media.get("ids"), dict) else {}
         title = media.get("title", "未知")
         year = media.get("year")
+
         trakt_id = ids.get("trakt") or media.get("trakt_id")
         tmdb_id = ids.get("tmdb")
         imdb_id = ids.get("imdb")
@@ -548,6 +574,16 @@ class TraktHelper:
             return False
 
         key = f"{media_type}_{str(trakt_id) if trakt_id else slug or f'{title}_{year}'}"
+        # 整剧评分不能证明任何一季已看完，也不能确定第一季就是当前观看季。
+        if media_type == MediaType.TV:
+            show_id = trakt_id or slug or imdb_id
+            if not show_id or not 1 <= trakt_rating <= 10:
+                return False
+            ratings = dict(self._get_data("trakt_show_ratings") or {})
+            ratings[str(show_id)] = {"show": media, "trakt_rating": trakt_rating,
+                                     "douban_rating": douban_rating, "rated_at": item.get("rated_at")}
+            self._save_data("trakt_show_ratings", ratings)
+            return True
         if key in finished:
             prev = finished[key]
             if prev.get("trakt_rating") == trakt_rating and prev.get("douban_id"):
@@ -758,12 +794,11 @@ class TraktHelper:
             return False
         actual = ((self._get_data("douban_sync_state") or {}).get("synced") or {}).get(
             f"https://movie.douban.com/j/subject/{subject}/interest", {})
-        rated = next((record for record in (self._get_data("finished") or {}).values()
-                      if str(record.get("douban_id")) == subject), {})
-        if actual.get("interest") == "collect" or rated:
+        if actual.get("interest") == "collect":
             status = "看完"
         target = "collect" if status == "看完" else "do"
-        known_rating = actual.get("rating") or rated.get("douban_rating") or previous.get("douban_rating")
+        rated = (self._get_data("trakt_show_ratings") or {}).get(str(show_id)) or {}
+        known_rating = rated.get("douban_rating")
         rating = int(known_rating) if str(known_rating).isdigit() and 1 <= int(known_rating) <= 5 else None
         title = info.get("title") or info.get("alt_title") or previous.get("title") or f"{show.get('title', '未知')} 第{season}季"
         record = {**previous, "douban_id": subject, "title": title, "en_title": show.get("title"), "year": show.get("year"),
@@ -771,7 +806,8 @@ class TraktHelper:
                   "match_verified": True,
                   "watched_episodes": item.get("watched_episodes"), "total_episodes": item.get("total_episodes"),
                   "douban_rating": rating, "checked_at": int(time.time())}
-        if ((previous.get("status") == status and previous.get("private") == private and previous.get("douban_id") == subject)
+        rating_unchanged = rating is None or str(actual.get("rating") or previous.get("douban_rating") or "") == str(rating)
+        if rating_unchanged and ((previous.get("status") == status and previous.get("private") == private and previous.get("douban_id") == subject)
                 or (actual.get("interest") == target and actual.get("private", "") == ("on" if private else ""))):
             douban_helper.record_unchanged()
             record.setdefault("sync_time", int(time.time()))

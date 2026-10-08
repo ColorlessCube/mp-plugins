@@ -39,7 +39,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影评分、剧集逐季在看/看过，微信读书阅读记录，网易云音乐专辑，小宇宙播客。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.18.1"
+    plugin_version = "3.19.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -235,14 +235,16 @@ class TraktRatingsSync(_PluginBase):
                     summary["written"], summary["skipped"], summary["failed"], summary["pending"], summary["paused"])
         last_run = self.get_data("last_run") or {}
         last_run.update({**summary, "finished_at": int(time.time()),
-                         "status": "paused" if summary["paused"] else "partial" if summary["failed"] or self._source_issue_this_run else "completed",
+                         "status": "paused" if summary["paused"] else "partial" if summary["failed"] or self._source_issue_this_run else "pending" if summary["pending"] else "completed",
                          "source_errors": sorted(self._source_issue_this_run)})
         self.save_data("last_run", last_run)
         if not summary["paused"] and getattr(self._douban_helper, "is_authenticated", False):
             self._resolve_issue("豆瓣")
         if summary["written"] and self._notification_mode == "changes":
-            self._send_notification("豆瓣同步完成", f"成功写入 {summary['written']} 条，跳过未变化 {summary['skipped']} 条，"
-                                    f"待处理 {summary['pending']} 条，提交失败 {summary['failed']} 条。详情见插件页面。")
+            title = {"paused": "豆瓣同步已暂停", "partial": "豆瓣同步部分完成", "pending": "豆瓣同步仍有待处理"}.get(last_run["status"], "豆瓣同步完成")
+            source_note = f" 未完整读取：{'、'.join(last_run['source_errors'])}。" if last_run["source_errors"] else ""
+            self._send_notification(title, f"成功写入 {summary['written']} 条，跳过未变化 {summary['skipped']} 条，"
+                                    f"待处理 {summary['pending']} 条，提交失败 {summary['failed']} 条。{source_note}详情见插件页面。")
         logger.info("豆瓣书影音同步完成")
 
     # ------------------------------------------------------------------
@@ -275,11 +277,15 @@ class TraktRatingsSync(_PluginBase):
             self._notify_issue("Trakt", "Trakt同步异常", "本轮部分影视记录未完成，请查看插件日志。")
 
     def _sync_ratings(self) -> None:
-        """从 Trakt 拉取评分并批量同步到豆瓣「看过」。"""
+        """同步电影评分；剧集评分仅供核对季度后更新，不代表已看完。"""
         all_items: List[Dict[str, Any]] = []
 
         if self._sync_type in ("all", "movies"):
             movies = self._trakt_helper.fetch_ratings("movies")
+            if movies is None:
+                self._notify_trakt_read_issue("Trakt电影评分读取未完成")
+            else:
+                self._mark_source_success("Trakt")
             if movies:
                 for item in movies:
                     item["_media_type"] = MediaType.MOVIE
@@ -288,6 +294,11 @@ class TraktRatingsSync(_PluginBase):
 
         if self._sync_type in ("all", "shows"):
             shows = self._trakt_helper.fetch_ratings("shows")
+            if shows is None:
+                self._notify_trakt_read_issue("Trakt剧集评分读取未完成")
+            else:
+                self._trakt_helper.cache_show_ratings(shows)
+                self._mark_source_success("Trakt")
             if shows:
                 for item in shows:
                     item["_media_type"] = MediaType.TV
@@ -353,7 +364,7 @@ class TraktRatingsSync(_PluginBase):
 
         if episodes is None or recent_shows is None:
             logger.warning("Trakt 播放进度或观看历史拉取失败，保留已有在看记录，跳过本次剧集同步")
-            self._notify_issue("Trakt", "Trakt记录读取未完成", "请检查网络及Trakt应用状态；原有同步记录保留。")
+            self._notify_trakt_read_issue("Trakt记录读取未完成")
             return
 
         self._mark_source_success("Trakt")
@@ -404,7 +415,7 @@ class TraktRatingsSync(_PluginBase):
                 if not ids.get("tmdb") and not ids.get("imdb"):
                     show = self._trakt_helper.fetch_show_details(str(show_id))
                     if not show:
-                        self._notify_issue("Trakt", "Trakt季度信息读取未完成", "本轮保留该剧原有状态，稍后继续核对。")
+                        self._notify_trakt_read_issue("Trakt季度信息读取未完成")
                         continue
                     ids = show["ids"]
                 progress = self._trakt_helper.fetch_show_progress(str(show_id), access_token)
@@ -416,7 +427,7 @@ class TraktRatingsSync(_PluginBase):
                         self._trakt_helper.reset_oauth_unauthorized()
                         progress = self._trakt_helper.fetch_show_progress(str(show_id), access_token)
                 if progress is None or seasons is None:
-                    self._notify_issue("Trakt", "Trakt季度进度读取未完成", "本轮保留该剧原有状态，其他剧集继续处理。")
+                    self._notify_trakt_read_issue("Trakt季度进度读取未完成")
                     continue
                 states = self._trakt_helper.build_season_states(progress, seasons)
                 processed = False
@@ -1189,7 +1200,12 @@ class TraktRatingsSync(_PluginBase):
         self._source_fetch_ok = getattr(self, "_source_fetch_ok", set())
         self._source_fetch_ok.add(source)
 
-    def _notify_issue(self, source: str, title: str, content: str) -> bool:
+    def _notify_trakt_read_issue(self, title: str) -> bool:
+        """按最近请求的分类生成操作提示，不将临时网络失败误报成授权失效。"""
+        category = self._trakt_helper.get_request_issue_kind()
+        return self._notify_issue("Trakt", title, "", category=category)
+
+    def _notify_issue(self, source: str, title: str, content: str, category: str = "") -> bool:
         """按平台持久化异常，通知成功后才进入冷却，失败保留后续重试。"""
         credentials = {"Trakt": self._trakt_client_id, "豆瓣": self._douban_cookie,
                        "微信读书": self._weread_api_key, "网易云音乐": self._netease_cookie,
@@ -1200,11 +1216,13 @@ class TraktRatingsSync(_PluginBase):
         now = int(time.time())
         self._source_issue_this_run = getattr(self, "_source_issue_this_run", set())
         self._source_issue_this_run.add(source)
-        event_fingerprint = hashlib.sha256((title + (content if source == "豆瓣" else "")).encode()).hexdigest()[:16]
+        category = category or ("auth" if "重新授权" in title else "temporary" if source == "Trakt" else "auth")
+        event_key = category if source == "Trakt" else category + title + (content if source == "豆瓣" else "")
+        event_fingerprint = hashlib.sha256(event_key.encode()).hexdigest()[:16]
         same = (previous.get("fingerprint") == fingerprint and previous.get("event_fingerprint") == event_fingerprint
                 and previous.get("active"))
         state = dict(previous) if same else {"fingerprint": fingerprint, "last_success_at": 0, "last_attempt_at": 0}
-        state.update({"active": True, "title": title, "event_fingerprint": event_fingerprint, "updated_at": now, "recovery_pending": False})
+        state.update({"active": True, "title": title, "category": category, "event_fingerprint": event_fingerprint, "updated_at": now, "recovery_pending": False})
         issues[source] = state
         self.save_data("notification_issues", issues)
         if self._notification_mode == "off":
@@ -1213,7 +1231,13 @@ class TraktRatingsSync(_PluginBase):
             return False
         if now - state.get("last_attempt_at", 0) < self._NOTIFY_RETRY_INTERVAL:
             return False
-        actions = {"Trakt": "请确认Trakt后台应用仍有效，再在插件配置页检查Client ID和授权状态。",
+        trakt_actions = {"auth": "Trakt 授权未能续期，请在插件配置页重新授权；已有记录保留。",
+                         "application": "Trakt 拒绝访问（403），请检查后台应用是否仍有效以及 Client ID、访问权限；这不等同于令牌过期。",
+                         "access": "Trakt 返回访问拦截页面，请检查网络出口或上游限制；已有记录保留。",
+                         "rate_limit": "Trakt 暂时限制请求频率，后续定时任务会继续处理；无需重新授权。",
+                         "not_found": "Trakt 未找到请求的用户或条目，请检查用户名及对应条目；已有记录保留。",
+                         "temporary": "Trakt 本轮读取未完成，可能是网络、超时或服务异常；保留原状态，后续定时任务继续处理，无需重新授权。"}
+        actions = {"Trakt": trakt_actions.get(category, trakt_actions["temporary"]),
                    "微信读书": "请在插件配置页更新微信读书 API Key。",
                    "网易云音乐": "请在正常浏览器登录网易云，再更新插件 Cookie。",
                    "小宇宙": "请在插件配置页更新小宇宙认证信息。"}
@@ -1466,7 +1490,7 @@ class TraktRatingsSync(_PluginBase):
             auth_text = "上次授权链接已过期，请重新生成并在10分钟内完成授权"
         trakt = [
             row(field("trakt_username", "Trakt 用户名", hint="用于读取公开评分，仍需保留"), field("trakt_client_id", "Trakt Client ID")),
-            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "剧集无需评分：按季核对总集数与逐集观看记录；全季已播完且全部看过才标记看过，否则保持在看。"},
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "剧集无需评分：全季已播完且每集看过才标记看过；整剧评分只更新已核对季度的星级，不代表看完。写入前保留豆瓣已有短评、标签及未由来源指定的评分。"},
             field("trakt_redirect_uri", "Trakt HTTPS 回跳地址", hint=f"填写 MoviePilot 的 HTTPS 域名 + {self._trakt_callback_path}，并与 Trakt 后台一致", **{"persistent-hint": True}),
             {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "{{ _ui_trakt_message }}"}},
             {"component": "div", "props": {"class": "d-flex flex-wrap ga-3 my-3"}, "content": [self._config_action_button("重新授权" if authorized else "生成授权链接", "oauth/start", "_ui_trakt_message")]},
@@ -1550,7 +1574,7 @@ class TraktRatingsSync(_PluginBase):
             return "已同步（历史记录）" if legacy else "尚未同步"
 
         run = self.get_data("last_run") or {}
-        status_labels = {"running": "运行中", "completed": "本轮完成", "partial": "部分完成", "paused": "已暂停", "failed": "执行异常"}
+        status_labels = {"running": "运行中", "completed": "本轮完成", "pending": "仍有待处理", "partial": "部分完成", "paused": "已暂停", "failed": "执行异常"}
         running = self._run_lock.locked()
         next_run = "未启用"
         services = self.get_service()

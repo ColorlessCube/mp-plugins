@@ -90,7 +90,8 @@ def test_completion_preserves_known_rating_and_updates_only_matching_season(monk
     watching = {"电视剧_1_s1": {"douban_id": "123", "season": 1, "status": "在看", "show": _state()["show"]}}
     original = copy.deepcopy(watching["电视剧_1_s1"])
     assert helper.sync_one_progress(_state(), "show", module.MediaType.TV, watching, douban, False)
-    assert posts[0]["rating"] == 4
+    # 缓存评分可能被用户手动修改，未指定来源评分时由豆瓣读取步骤保留实时评分。
+    assert posts[0]["rating"] is None
     assert watching["电视剧_1_s1"] == original
 
 

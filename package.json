@@ -2,13 +2,14 @@
   "TraktRatingsSync": {
     "name": "豆瓣书影音同步",
     "description": "聚合多平台记录同步到豆瓣：Trakt 电影评分与剧集逐季在看/看过，微信读书阅读记录，网易云音乐专辑和小宇宙播客。",
-    "version": "3.18.1",
+    "version": "3.19.0",
     "icon": "trakt.svg",
     "author": "ColorlessCube",
     "level": 1,
     "v2": true,
     "labels": "同步,豆瓣,Trakt",
     "history": {
+      "v3.19.0": "整剧评分不再直接标记看过，按已核对季度更新星级；豆瓣写入前保留实时短评、标签及未指定评分，读取失败延后；区分临时故障与授权问题，汇总准确显示部分完成及待处理",
       "v1.0.0": "首次发布：支持从 Trakt 拉取电影评分并同步到豆瓣（看过+评分）",
       "v1.1.0": "支持手动触发同步（API /sync + 插件页）；新增配置「最大同步数量」",
       "v2.0.0": "改用 /sync/playback/movies & /sync/playback/episodes 同步 Trakt 未看完列表为豆瓣「在看」，需配置 Trakt Access Token",

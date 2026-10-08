@@ -60,6 +60,11 @@ class DoubanHelper:
         self._state = dict(state)
         self._state["pending"] = dict(state.get("pending") or {})
         self._state["synced"] = dict(state.get("synced") or {})
+        # 旧队列中的空短评、标签和评分不是用户清空意图，升级后不再提交这些空值。
+        for entry in self._state["pending"].values():
+            entry["data"] = {key: value for key, value in (entry.get("data") or {}).items()
+                             if key in ("interest", "rating", "private") and (key != "rating" or value)}
+            entry["data"].setdefault("private", "")
         self._write_limit = max(1, write_limit)
         self._write_interval = max(5, write_interval)
         self._next_write_at = 0.0
@@ -390,8 +395,12 @@ class DoubanHelper:
 
     def _post_interest(self, url: str, referer: str, host: str, data: dict) -> bool:
         """合并最新目标状态，成功缓存命中时跳过写入，延期条目跨运行保留。"""
-        desired = {key: value for key, value in data.items() if key != "ck"}
-        if self._state["synced"].get(url) == desired:
+        desired = {key: value for key, value in data.items() if key in ("interest", "rating", "private")
+                   and (key != "rating" or value)}
+        if "interest" in desired:
+            desired.setdefault("private", "")
+        cached = self._state["synced"].get(url)
+        if cached is not None and all(cached.get(key, "") == value for key, value in desired.items()):
             self._state["pending"].pop(url, None)
             self._stats["skipped"] += 1
             self._persist_sync_state()
@@ -405,6 +414,47 @@ class DoubanHelper:
         if next(iter(self._state["pending"])) != url:
             return False
         return self._submit_pending(url)
+
+    def _read_interest_fields(self, url: str, referer: str, host: str) -> Optional[Dict[str, str]]:
+        """读取条目编辑表单中的用户内容；无法确认时不允许用空值覆盖。"""
+        self._sleep_before_request("读取已有收藏内容")
+        try:
+            response = RequestUtils(headers=self._build_headers(referer, host), cookies=self.cookies, timeout=10).get_res(url=url)
+            if self._check_access_response(response, writing=True) or response is None or response.status_code != 200:
+                return None
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return None
+            if host == "www.douban.com" and "/j/ilmen/thing/" in url:
+                if (type(payload.get("r")) is not int or payload["r"] != 0
+                        or str(payload.get("id")) != url.split("/")[-2]
+                        or not isinstance(payload.get("comment"), str)
+                        or not isinstance(payload.get("selected_tags"), str)
+                        or payload.get("rating") not in (None, 0, 1, 2, 3, 4, 5)):
+                    return None
+                return {"comment": payload["comment"], "tags": payload["selected_tags"],
+                        "rating": str(payload["rating"]) if payload.get("rating") else ""}
+            if not isinstance(payload.get("html"), str):
+                return None
+            document = BeautifulSoup(payload["html"], "lxml")
+            form = next((item for item in document.find_all("form")
+                         if urlsplit(item.get("action", "")).path == urlsplit(url).path
+                         and urlsplit(item.get("action", "")).netloc in ("", host)), None)
+            if form is None:
+                return None
+            fields = {}
+            for name in ("rating", "tags", "comment", "foldcollect"):
+                element = form.find(attrs={"name": name})
+                if element is not None:
+                    fields[name] = element.get_text() if element.name == "textarea" else element.get("value", "")
+            if not {"rating", "tags", "comment"}.issubset(fields):
+                return None
+            if fields["rating"] not in ("", "0", "1", "2", "3", "4", "5"):
+                return None
+            return fields
+        except Exception as error:
+            logger.warning("读取豆瓣已有收藏内容失败（%s），暂不写入", type(error).__name__)
+            return None
 
     def _submit_pending(self, url: str) -> bool:
         """限速提交一个目标，不立即重试不确定结果或访问受限响应。"""
@@ -424,10 +474,18 @@ class DoubanHelper:
             time.sleep(wait)
         self._attempted.add(url)
         entry["last_attempt_at"] = int(time.time())
+        preserved = self._read_interest_fields(url, entry["referer"], entry["host"])
+        if preserved is None:
+            entry["last_error"] = self._state.get("reason") if self.requests_paused else "无法读取已有评分、短评或标签，已延后以保护手动内容"
+            self._stats["failed"] += 1
+            self._next_write_at = time.monotonic() + self._write_interval
+            self._persist_sync_state()
+            return False
+        submitted = {**preserved, **entry["data"], "ck": self.ck}
         try:
             response = RequestUtils(
                 headers=self._build_headers(entry["referer"], entry["host"]), cookies=self.cookies, timeout=10,
-            ).post_res(url=url, data={**entry["data"], "ck": self.ck})
+            ).post_res(url=url, data=submitted)
         except Exception as error:
             logger.warning("豆瓣提交请求异常（%s），保留队列等待下次处理", type(error).__name__)
             response = None
@@ -451,6 +509,8 @@ class DoubanHelper:
             ret = payload.get("r") if isinstance(payload, dict) else None
             if ret is True or (type(ret) is int and ret == 0):
                 self._state["synced"][url] = dict(entry["data"])
+                if submitted.get("rating"):
+                    self._state["synced"][url]["rating"] = submitted["rating"]
                 self._state.setdefault("target_success_at", {})[url] = int(time.time())
                 self._state["pending"].pop(url, None)
                 self._stats["written"] += 1

@@ -172,7 +172,7 @@ def test_sync_summary_is_one_message_only_for_changes(monkeypatch, mode, written
     assert len(calls) == expected
     assert plugin._data["last_run"]["written"] == written
     assert plugin._data["last_run"]["pending"] == 2
-    assert plugin._data["last_run"]["status"] == "completed"
+    assert plugin._data["last_run"]["status"] == "pending"
     assert "本轮写入" in json.dumps(plugin.get_page(), ensure_ascii=False)
 
 
