@@ -16,8 +16,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode, urlparse, urlunparse
 
+from fastapi import Depends, HTTPException, Request
+from starlette.responses import Response as HttpResponse
+
+from app.core.security import verify_resource_token
 from app.log import logger
 from app.plugins import _PluginBase
+from app.schemas import Response as ApiResponse, TokenPayload
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
 from .douban_helper import DoubanHelper
@@ -33,7 +38,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.15.0"
+    plugin_version = "3.15.1"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -66,6 +71,7 @@ class TraktRatingsSync(_PluginBase):
     _bark_webhook_url: str = ""
     _weread_auth_notify_cooldown: int = 6 * 60 * 60
     _netease_cookie_auth_notify_cooldown: int = 6 * 60 * 60
+    _trakt_callback_path = "/api/v1/plugin/TraktRatingsSync/oauth/callback"
 
     # helper 实例（延迟初始化）
     _douban_helper: Optional[DoubanHelper] = None
@@ -139,6 +145,13 @@ class TraktRatingsSync(_PluginBase):
         changed = previous_client is not None and previous_client != self._trakt_client_id
         start = bool(config.get("trakt_authorize"))
         callback_url = (config.get("trakt_authorization_response") or "").strip()
+        pending = self.get_data("trakt_pkce_pending") or {}
+        if pending and pending.get("redirect_uri") != self._trakt_redirect_uri:
+            self.save_data("trakt_pkce_pending", {})
+            self._merge_update_config({
+                "trakt_authorization_url": "",
+                "trakt_auth_message": "Trakt 回跳地址已更改，请重新生成授权链接",
+            })
         if changed or start or callback_url:
             helper = self._create_trakt_helper()
             if changed:
@@ -156,7 +169,10 @@ class TraktRatingsSync(_PluginBase):
                 if start:
                     self._merge_update_config({"trakt_auth_mode": "pkce"})
                     helper.begin_pkce_authorization()
-                    message = "授权链接已生成，请重新打开配置页，打开链接授权后粘贴完整回跳地址（10 分钟内）"
+                    if urlparse(self._trakt_redirect_uri).path == self._trakt_callback_path:
+                        message = "授权链接已生成，请在已登录 MoviePilot 的同一浏览器打开链接；回跳后自动保存令牌（10 分钟内）"
+                    else:
+                        message = "授权链接已生成，当前地址使用手动回跳模式；授权后复制完整地址并粘贴到下方保存（10 分钟内）"
                 elif callback_url:
                     authorized = helper.complete_pkce_authorization(callback_url)
                     message = "Trakt 授权成功，令牌已自动保存" if authorized else "Trakt 授权未完成，请重新生成链接；若仍返回 403，请检查应用访问权限"
@@ -164,6 +180,7 @@ class TraktRatingsSync(_PluginBase):
                     message = self._trakt_auth_message
             except ValueError as error:
                 message = str(error)
+                logger.warning(f"Trakt 授权配置未完成：{message}")
             except Exception as error:
                 logger.warning("Trakt 授权操作失败：%s", type(error).__name__)
                 message = "Trakt 授权操作失败，请检查配置并重新生成链接"
@@ -1146,8 +1163,51 @@ class TraktRatingsSync(_PluginBase):
                 "methods": ["GET", "POST"],
                 "summary": "手动执行同步",
                 "description": "立即执行一次 Trakt 评分同步到豆瓣",
-            }
+            },
+            {
+                "path": "/oauth/callback",
+                "endpoint": self._api_trakt_callback,
+                "methods": ["GET"],
+                "summary": "接收 Trakt PKCE 授权结果",
+                "description": "使用 MoviePilot 管理员资源 Cookie 和一次性 PKCE 请求完成授权，不触发同步",
+                "response_model": ApiResponse,
+                # 浏览器回跳无法携带 API key；改用已有资源 Cookie 依赖，仍要求管理员身份。
+                "allow_anonymous": True,
+                "dependencies": [Depends(self._verify_trakt_callback_admin)],
+            },
         ]
+
+    @staticmethod
+    def _verify_trakt_callback_admin(payload: TokenPayload = Depends(verify_resource_token)) -> TokenPayload:
+        """通过现有资源 Cookie 依赖验证回跳浏览器，限制为 MoviePilot 管理员。"""
+        if not payload.super_user:
+            raise HTTPException(status_code=403, detail="请在同一浏览器登录 MoviePilot 管理员后完成 Trakt 授权")
+        return payload
+
+    def _api_trakt_callback(self, request: Request, response: HttpResponse) -> ApiResponse:
+        """接收浏览器回跳并交换令牌，复用 Helper 的一次性 state 和 PKCE 校验。"""
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        if urlparse(self._trakt_redirect_uri).path != self._trakt_callback_path:
+            return ApiResponse(success=False, message="请将 Trakt 和插件的回跳地址设为插件真实的 OAuth 回跳接口，再重新生成授权链接")
+        try:
+            # 代理后的 Request URL 可能是内网 HTTP 地址；令牌交换必须使用登记的 HTTPS 地址。
+            callback_url = f"{self._trakt_redirect_uri}?{request.url.query}"
+            authorized = self._create_trakt_helper().complete_pkce_authorization(callback_url)
+            message = "Trakt 授权成功，令牌已自动保存；请返回 MoviePilot 插件配置页确认" if authorized else "Trakt 令牌交换失败，请查看插件日志并重新生成授权链接"
+        except ValueError as error:
+            authorized = False
+            message = str(error)
+        except Exception as error:
+            authorized = False
+            message = "Trakt 授权处理失败，请重新生成授权链接"
+            logger.warning(f"Trakt 回跳处理异常：{type(error).__name__}")
+        self._merge_update_config({"trakt_auth_message": message})
+        if authorized:
+            logger.info("Trakt PKCE 回跳授权成功，令牌已保存")
+        else:
+            logger.warning(f"Trakt PKCE 回跳未完成：{message}")
+        return ApiResponse(success=authorized, message=message)
 
     def _api_sync(self) -> Dict[str, Any]:
         """手动触发同步（API 端点）。"""
@@ -1271,14 +1331,18 @@ class TraktRatingsSync(_PluginBase):
                         {"title": "设备码（旧应用，需要 Secret）", "value": "device"},
                     ]), md=4),
                     col(field("trakt_redirect_uri", "Trakt HTTPS 回跳地址",
-                              hint="填写自己域名下的 HTTPS 地址，与 Trakt 应用登记值完全一致；地址应保留 code 和 state 参数",
+                              hint="自动回跳：MoviePilot 的 HTTPS 地址 + /api/v1/plugin/TraktRatingsSync/oauth/callback；与 Trakt 后台一致，并先在同一浏览器登录 MoviePilot",
                               **{"persistent-hint": True}), md=8),
                 ),
                 row(col(switch("trakt_authorize", "生成新的 PKCE 授权链接（保存后生效）"))),
                 row(col(textarea("trakt_authorization_url", "Trakt 授权链接（保存后重新打开配置页查看）",
                                  readonly=True, rows=2, **{"auto-grow": True}))),
-                row(col(textarea("trakt_authorization_response", "授权后的完整回跳地址（粘贴后保存）",
-                                 hint="打开上方链接完成授权后，复制浏览器地址栏中的完整地址；保存后自动清除",
+                row(col({"component": "VBtn", "props": {
+                    "href": self._trakt_authorization_url, "target": "_blank", "rel": "noreferrer",
+                    "disabled": not bool(self._trakt_authorization_url), "color": "primary",
+                }, "text": "打开 Trakt 授权页面"})),
+                row(col(textarea("trakt_authorization_response", "手动回跳地址（仅兼容旧流程，自动回跳无需填写）",
+                                 hint="使用自动回跳接口时无需粘贴；旧流程可复制含 code 和 state 的完整地址后保存",
                                  rows=2, **{"persistent-hint": True, "auto-grow": True}))),
                 row(col({"component": "VAlert", "props": {
                     "type": "info", "variant": "tonal",

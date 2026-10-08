@@ -5,6 +5,31 @@ import types
 from enum import Enum
 from pathlib import Path
 
+from fastapi import HTTPException, Request
+from pydantic import BaseModel, Field
+
+
+class _ApiResponse(BaseModel):
+    """测试用标准响应模型。"""
+
+    success: bool
+    message: str = ""
+    data: dict = Field(default_factory=dict)
+
+
+class _TokenPayload(BaseModel):
+    """测试用资源 Cookie 身份负载。"""
+
+    super_user: bool
+
+
+def _verify_resource_token(request: Request) -> _TokenPayload:
+    """替换资源 Cookie 验证边界，不允许未登录的测试请求。"""
+    cookie = request.cookies.get("MoviePilot")
+    if cookie not in ("test-admin", "test-member"):
+        raise HTTPException(status_code=403, detail="resource token not found")
+    return _TokenPayload(super_user=cookie == "test-admin")
+
 
 class _MediaType(Enum):
     """测试用媒体类型。"""
@@ -81,10 +106,13 @@ def _install_app_stubs(monkeypatch):
     app_pkg.__path__ = []
     schemas_pkg = types.ModuleType("app.schemas")
     schemas_pkg.__path__ = []
+    schemas_pkg.Response = _ApiResponse
+    schemas_pkg.TokenPayload = _TokenPayload
     utils_pkg = types.ModuleType("app.utils")
     utils_pkg.__path__ = []
 
     monkeypatch.setitem(sys.modules, "app", app_pkg)
+    monkeypatch.setitem(sys.modules, "app.core.security", types.SimpleNamespace(verify_resource_token=_verify_resource_token))
     monkeypatch.setitem(sys.modules, "app.log", types.SimpleNamespace(logger=_Logger()))
     monkeypatch.setitem(sys.modules, "app.plugins", types.SimpleNamespace(_PluginBase=_PluginBase))
     monkeypatch.setitem(sys.modules, "app.schemas", schemas_pkg)

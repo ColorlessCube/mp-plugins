@@ -407,7 +407,9 @@ def test_403_diagnostics_classify_without_exposing_body(monkeypatch, method, sou
 
 def _load_progress_plugin(monkeypatch, helper_module):
     """加载真实插件编排方法，仅替换插件基类与其他平台依赖。"""
-    monkeypatch.setitem(sys.modules, "app.plugins", types.SimpleNamespace(_PluginBase=object))
+    from test_traktratingssync_netease_cookie_mode import _install_app_stubs
+
+    _install_app_stubs(monkeypatch)
     package_name = "trakt_progress_test_plugin"
     for helper_name, class_name in (
         ("douban_helper", "DoubanHelper"), ("netease_helper", "NeteaseHelper"),
