@@ -100,7 +100,6 @@ def _build_helper(module, **kwargs):
 
     helper = module.TraktHelper(
         client_id=kwargs.get("client_id", "client-id"),
-        client_secret=kwargs.get("client_secret", "client-secret"),
         access_token=kwargs.get("access_token", ""),
         username="user",
         save_data_fn=save_data,
@@ -108,7 +107,6 @@ def _build_helper(module, **kwargs):
         update_config_fn=lambda patch: updated.update(patch),
         send_notification_fn=lambda _title, _body: None,
         manual_mappings=kwargs.get("manual_mappings"),
-        auth_mode=kwargs.get("auth_mode", "auto"),
         redirect_uri=kwargs.get("redirect_uri", "https://owned.example/callback"),
     )
     return helper, saved, updated
@@ -307,11 +305,9 @@ def test_force_reauthorize_refreshes_cached_refresh_token(monkeypatch):
     ("fetch_playback", ("/sync/playback/episodes", "access-token")),
     ("fetch_history", ("shows", "access-token")),
     ("_refresh_access_token", ()),
-    ("_create_device_code_and_wait", ()),
-    ("_exchange_device_token", ("device-code",)),
 ])
 def test_all_trakt_requests_use_configured_proxy_and_identify_plugin(monkeypatch, method, args):
-    """六类请求均使用 MoviePilot 代理和插件 UA，保留 API key 与 OAuth 认证。"""
+    """四类请求均使用 MoviePilot 代理和插件 UA，保留 API key 与 OAuth 认证。"""
     module = _load_trakt_helper_module(monkeypatch)
     calls = []
 
@@ -342,7 +338,7 @@ def test_all_trakt_requests_use_configured_proxy_and_identify_plugin(monkeypatch
     assert calls[0]["headers"]["trakt-api-version"] == "2"
     if method in ("fetch_playback", "fetch_history"):
         assert calls[0]["headers"]["Authorization"] == "Bearer access-token"
-    if method in ("_create_device_code_and_wait", "_exchange_device_token", "_refresh_access_token"):
+    if method in ("_refresh_access_token",):
         assert calls[0]["url"].startswith("https://auth.trakt.tv/oauth/")
     else:
         assert calls[0]["url"].startswith("https://api.trakt.tv/")
@@ -457,7 +453,7 @@ def test_progress_sync_preserves_watching_until_both_sources_succeed(monkeypatch
 
     plugin._sync_progress()
 
-    assert saved == ([("watching", {})] if should_clear else [])
+    assert [item for item in saved if item[0] == "watching"] == ([("watching", {})] if should_clear else [])
     assert watching == {"existing": {"title": "保留记录"}}
     assert len(refreshes) == refresh_count
 
@@ -577,8 +573,8 @@ def test_pkce_failed_exchange_consumes_pending_request_without_saving_token(monk
     monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: types.SimpleNamespace(post_res=lambda **_kwargs: response))
     assert helper.complete_pkce_authorization(callback) is False
     assert saved["trakt_pkce_pending"] == {}
-    assert not saved["trakt_token"]
-    assert updated["trakt_access_token"] == ""
+    assert not saved.get("trakt_token")
+    assert "trakt_access_token" not in updated
 
 
 def test_expired_config_token_refreshes_without_secret_and_rotates_refresh_token(monkeypatch):
@@ -601,7 +597,7 @@ def test_expired_config_token_refreshes_without_secret_and_rotates_refresh_token
     assert updated["trakt_access_token"] == "fresh-access"
 
 
-def test_pkce_refresh_keeps_original_flow_even_if_secret_is_added(monkeypatch):
+def test_pkce_refresh_preserves_flow_metadata(monkeypatch):
     """续期后的令牌继续标记为 PKCE，避免下次错误携带 Secret。"""
     module = _load_trakt_helper_module(monkeypatch)
     helper, saved, _updated = _build_helper(module, data={
@@ -620,11 +616,28 @@ def test_pkce_refresh_keeps_original_flow_even_if_secret_is_added(monkeypatch):
     assert saved["trakt_token"]["auth_mode"] == "pkce"
 
 
+def test_new_pkce_request_and_failed_exchange_preserve_existing_authorization(monkeypatch):
+    """新请求或交换失败不会清除现有授权，成功回跳才替换令牌。"""
+    module = _load_trakt_helper_module(monkeypatch)
+    token = {"client_id": "client-id", "access_token": "still-valid", "refresh_token": "old-refresh", "expires_at": 9999999999}
+    helper, saved, updated = _build_helper(module, access_token="still-valid", data={"trakt_token": token})
+    helper.begin_pkce_authorization()
+    assert helper.get_access_token() == "still-valid"
+    assert "trakt_token" not in saved
+    pending = saved["trakt_pkce_pending"]
+    callback = helper._redirect_uri + "?" + urlencode({"code": "new-code", "state": pending["state"]})
+    monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: types.SimpleNamespace(post_res=lambda **_request: _Response(403)))
+    assert not helper.complete_pkce_authorization(callback)
+    assert helper.get_access_token() == "still-valid"
+    assert "trakt_access_token" not in updated
+    assert helper._get_data("trakt_token") == token
+
+
 def test_pkce_without_token_does_not_start_blocking_device_flow(monkeypatch):
     """定时任务遇到尚未授权的新应用，只提示手动授权。"""
     module = _load_trakt_helper_module(monkeypatch)
     helper, _saved, _updated = _build_helper(module, client_secret="")
-    monkeypatch.setattr(helper, "_create_device_code_and_wait", lambda: pytest.fail("PKCE 不应启动设备码等待"))
+    assert not hasattr(helper, "_create_device_code_and_wait")
     assert helper.get_access_token() is None
 
 

@@ -39,7 +39,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影 →「看过」及评分，Trakt 剧集播放进度 →「在看」，微信读书书架 → 阅读记录，网易云音乐 → 「听过」专辑，小宇宙播客 → 「听过」。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.16.1"
+    plugin_version = "3.17.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -49,9 +49,7 @@ class TraktRatingsSync(_PluginBase):
     _enable: bool = False
     _trakt_username: str = ""
     _trakt_client_id: str = ""
-    _trakt_client_secret: str = ""
     _trakt_access_token: str = ""
-    _trakt_auth_mode: str = "auto"
     _trakt_redirect_uri: str = ""
     _trakt_authorization_url: str = ""
     _trakt_auth_message: str = ""
@@ -73,8 +71,10 @@ class TraktRatingsSync(_PluginBase):
     _trakt_history_days: int = 30
     _cron: str = "0 2 * * *"
     _bark_webhook_url: str = ""
-    _weread_auth_notify_cooldown: int = 6 * 60 * 60
-    _netease_cookie_auth_notify_cooldown: int = 6 * 60 * 60
+    _notification_mode: str = "changes"
+    _notification_channel: str = "moviepilot"
+    _NOTIFY_COOLDOWN = 6 * 60 * 60
+    _NOTIFY_RETRY_INTERVAL = 5 * 60
     _trakt_callback_path = "/api/v1/plugin/TraktRatingsSync/oauth/callback"
 
     # helper 实例（延迟初始化）
@@ -94,12 +94,15 @@ class TraktRatingsSync(_PluginBase):
         self._enable = config.get("enable", False)
         self._trakt_username = (config.get("trakt_username") or "").strip()
         self._trakt_client_id = (config.get("trakt_client_id") or "").strip()
-        self._trakt_client_secret = (config.get("trakt_client_secret") or "").strip()
-        self._trakt_access_token = (config.get("trakt_access_token") or "").strip()
-        self._trakt_auth_mode = config.get("trakt_auth_mode") or "auto"
+        self._trakt_access_token = (config.get("trakt_access_token") or (self.get_data("trakt_token") or {}).get("access_token") or "").strip()
         self._trakt_redirect_uri = (config.get("trakt_redirect_uri") or "").strip()
-        self._trakt_authorization_url = config.get("trakt_authorization_url") or ""
-        self._trakt_auth_message = config.get("trakt_auth_message") or ""
+        auth_status = self.get_data("trakt_auth_status") or {}
+        self._trakt_authorization_url = auth_status.get("url") or config.get("trakt_authorization_url") or ""
+        self._trakt_auth_message = auth_status.get("message") or config.get("trakt_auth_message") or ""
+        token_data = dict(self.get_data("trakt_token") or {})
+        if self._trakt_access_token and not token_data.get("access_token"):
+            token_data["access_token"] = self._trakt_access_token
+            self.save_data("trakt_token", token_data)
         self._trakt_manual_mappings = (config.get("trakt_manual_mappings") or "").strip()
         self._douban_cookie = (config.get("douban_cookie") or "").strip()
         self._douban_write_limit = max(1, int(config.get("douban_write_limit") or 10))
@@ -114,9 +117,14 @@ class TraktRatingsSync(_PluginBase):
         self._sync_type = config.get("sync_type", "all") or "all"
         self._max_sync_count = int(config.get("max_sync_count") or 0)
         self._trakt_history_limit = int(config.get("trakt_history_limit") or 20)
-        self._trakt_history_days = int(config.get("trakt_history_days") or 30)
+        history_days = config.get("trakt_history_days", 30)
+        self._trakt_history_days = int(history_days) if history_days not in (None, "") else 30
         self._cron = config.get("cron", "0 2 * * *") or "0 2 * * *"
         self._bark_webhook_url = (config.get("bark_webhook_url") or "").strip()
+        self._notification_mode = config.get("notification_mode") or "changes"
+        self._notification_channel = config.get("notification_channel") or ("bark" if self._bark_webhook_url else "moviepilot")
+        self._source_issue_this_run = set()
+        self._source_fetch_ok = set()
 
         # 重置 helper，下次 run() 时重新初始化
         self._douban_helper = None
@@ -126,86 +134,53 @@ class TraktRatingsSync(_PluginBase):
         self._xiaoyuzhou_helper = None
 
         self._init_trakt_authorization(config)
-        if config.get("douban_resume"):
-            state = dict(self.get_data("douban_sync_state") or {})
-            state.pop("requires_verification", None)
-            state.pop("reason", None)
-            self.save_data("douban_sync_state", state)
-            self._merge_update_config({"douban_resume": False})
+        # 清理旧配置同时迁移短期授权显示信息，现有令牌和业务设置继续保留。
+        self._merge_update_config({})
 
     def _create_trakt_helper(self) -> TraktHelper:
         """以当前配置创建 Trakt Helper，统一授权和同步入口的凭据来源。"""
         return TraktHelper(
             client_id=self._trakt_client_id,
-            client_secret=self._trakt_client_secret,
             access_token=self._trakt_access_token,
             username=self._trakt_username,
             save_data_fn=self.save_data,
             get_data_fn=self.get_data,
             update_config_fn=self._merge_update_config,
-            send_notification_fn=self._send_bark_notification,
+            send_notification_fn=lambda title, body: self._notify_issue("Trakt", title, body),
             manual_mappings=self._parse_trakt_manual_mappings(),
-            auth_mode=self._trakt_auth_mode,
             redirect_uri=self._trakt_redirect_uri,
         )
 
     def _init_trakt_authorization(self, config: Dict[str, Any]) -> None:
-        """处理配置页的一次性授权操作，更换应用时仅重置 Trakt 凭据。"""
+        """更换应用时清除对应令牌；加载配置不再执行任何一次性授权操作。"""
         bound_client = self.get_data("trakt_auth_client_id")
         token_client = (self.get_data("trakt_token") or {}).get("client_id")
         previous_client = bound_client if bound_client is not None else token_client
-        changed = previous_client is not None and previous_client != self._trakt_client_id
-        start = bool(config.get("trakt_authorize"))
-        callback_url = (config.get("trakt_authorization_response") or "").strip()
         pending = self.get_data("trakt_pkce_pending") or {}
-        if pending and pending.get("redirect_uri") != self._trakt_redirect_uri:
+        if previous_client is not None and previous_client != self._trakt_client_id:
+            self._create_trakt_helper().reset_authorization()
+            self._trakt_auth_message = "Trakt 应用已更换，请重新授权；同步记录已保留"
+        elif pending and (pending.get("redirect_uri") != self._trakt_redirect_uri
+                          or int(pending.get("expires_at") or 0) <= int(time.time())):
             self.save_data("trakt_pkce_pending", {})
-            self._merge_update_config({
-                "trakt_authorization_url": "",
-                "trakt_auth_message": "Trakt 回跳地址已更改，请重新生成授权链接",
-            })
-        if changed or start or callback_url:
-            helper = self._create_trakt_helper()
-            if changed:
-                helper.reset_authorization()
-                self._trakt_auth_message = "Trakt 应用已更换，请重新授权；同步记录已保留"
-            # 在任何网络请求前清除一次性输入，重载插件不会重复交换授权码。
-            self._merge_update_config({
-                "trakt_authorize": False,
-                "trakt_authorization_response": "",
-                "trakt_auth_message": self._trakt_auth_message,
-            })
-            try:
-                if start and callback_url:
-                    raise ValueError("请先生成授权链接并完成授权，再单独粘贴回跳地址保存")
-                if start:
-                    self._merge_update_config({"trakt_auth_mode": "pkce"})
-                    helper.begin_pkce_authorization()
-                    if urlparse(self._trakt_redirect_uri).path == self._trakt_callback_path:
-                        message = "授权链接已生成，请在已登录 MoviePilot 的同一浏览器打开链接；回跳后自动保存令牌（10 分钟内）"
-                    else:
-                        message = "授权链接已生成，当前地址使用手动回跳模式；授权后复制完整地址并粘贴到下方保存（10 分钟内）"
-                elif callback_url:
-                    authorized = helper.complete_pkce_authorization(callback_url)
-                    message = "Trakt 授权成功，令牌已自动保存" if authorized else "Trakt 授权未完成，请重新生成链接；若仍返回 403，请检查应用访问权限"
-                else:
-                    message = self._trakt_auth_message
-            except ValueError as error:
-                message = str(error)
-                logger.warning(f"Trakt 授权配置未完成：{message}")
-            except Exception as error:
-                logger.warning("Trakt 授权操作失败：%s", type(error).__name__)
-                message = "Trakt 授权操作失败，请检查配置并重新生成链接"
-            self._merge_update_config({"trakt_auth_message": message})
+            self._trakt_authorization_url = ""
+            self._trakt_auth_message = "授权请求已过期或回跳地址已变化，请重新生成授权链接"
         self.save_data("trakt_auth_client_id", self._trakt_client_id)
 
     def run(self) -> None:
         """串行执行同步，阻止定时与手动入口同时写入豆瓣。"""
+        if not self._enable:
+            return
         if not self._run_lock.acquire(blocking=False):
             logger.warning("豆瓣同步任务正在运行，跳过本次重复触发")
             return
+        started_at = int(time.time())
+        self.save_data("last_run", {"started_at": started_at, "status": "running"})
         try:
             self._run_sync()
+        except Exception:
+            self.save_data("last_run", {"started_at": started_at, "finished_at": int(time.time()), "status": "failed"})
+            raise
         finally:
             self._run_lock.release()
 
@@ -217,27 +192,32 @@ class TraktRatingsSync(_PluginBase):
 
         logger.info("开始豆瓣书影音同步（统一写入上限 %d，间隔 %d–%d 秒）", self._douban_write_limit,
                     self._douban_write_interval, self._douban_write_interval * 2)
+        self._source_issue_this_run = set()
+        self._source_fetch_ok = set()
         # 各来源共享请求预算与待处理队列，验证后不再进入下一个平台。
         try:
             self._douban_helper = DoubanHelper(
                 user_cookie=self._douban_cookie or None,
-                notify_fn=self._send_bark_notification,
+                notify_fn=lambda title, body: self._notify_issue("豆瓣", title, body),
                 save_data_fn=self.save_data,
                 get_data_fn=self.get_data,
                 write_limit=self._douban_write_limit,
                 write_interval=self._douban_write_interval,
             )
         except Exception as e:
-            logger.error("初始化豆瓣 Helper 失败: %s", e)
+            logger.error(f"初始化豆瓣 Helper 失败：{type(e).__name__}")
+            last_run = self.get_data("last_run") or {}
+            self.save_data("last_run", {**last_run, "status": "failed", "finished_at": int(time.time())})
+            self._notify_issue("豆瓣", "豆瓣同步初始化失败", "请检查豆瓣配置及插件日志；本轮未执行写入。")
             return
 
         sources = (
-            (self._trakt_client_id, self._sync_trakt),
-            (self._weread_api_key, self._sync_weread),
-            (self._has_netease_source(), self._sync_netease),
-            (self._xiaoyuzhou_cookie, self._sync_xiaoyuzhou),
+            ("Trakt", self._trakt_client_id, self._sync_trakt),
+            ("微信读书", self._weread_api_key, self._sync_weread),
+            ("网易云音乐", self._has_netease_source(), self._sync_netease),
+            ("小宇宙", self._xiaoyuzhou_cookie, self._sync_xiaoyuzhou),
         )
-        for enabled, sync in sources:
+        for source_name, enabled, sync in sources:
             if self._douban_helper.requests_paused:
                 break
             if not enabled:
@@ -245,11 +225,24 @@ class TraktRatingsSync(_PluginBase):
             try:
                 sync()
             except Exception as e:
-                logger.error("平台同步失败: %s", e, exc_info=True)
+                logger.error(f"{source_name}同步异常：{type(e).__name__}")
+                self._notify_issue(source_name, f"{source_name}同步异常", "本轮未能完成该平台处理，其他平台继续执行；请查看插件日志。")
+            if source_name in self._source_fetch_ok and source_name not in self._source_issue_this_run:
+                self._resolve_issue(source_name)
         self._douban_helper.flush_pending()
         summary = self._douban_helper.get_sync_summary()
         logger.info("豆瓣写入汇总: 新增成功 %d，状态未变跳过 %d，提交失败 %d，待处理 %d，暂停 %s",
                     summary["written"], summary["skipped"], summary["failed"], summary["pending"], summary["paused"])
+        last_run = self.get_data("last_run") or {}
+        last_run.update({**summary, "finished_at": int(time.time()),
+                         "status": "paused" if summary["paused"] else "partial" if summary["failed"] or self._source_issue_this_run else "completed",
+                         "source_errors": sorted(self._source_issue_this_run)})
+        self.save_data("last_run", last_run)
+        if not summary["paused"] and getattr(self._douban_helper, "is_authenticated", False):
+            self._resolve_issue("豆瓣")
+        if summary["written"] and self._notification_mode == "changes":
+            self._send_notification("豆瓣同步完成", f"成功写入 {summary['written']} 条，跳过未变化 {summary['skipped']} 条，"
+                                    f"待处理 {summary['pending']} 条，提交失败 {summary['failed']} 条。详情见插件页面。")
         logger.info("豆瓣书影音同步完成")
 
     # ------------------------------------------------------------------
@@ -270,6 +263,7 @@ class TraktRatingsSync(_PluginBase):
             self._sync_ratings()
         except Exception as e:
             logger.error("同步 Trakt 评分到豆瓣失败: %s", e, exc_info=True)
+            self._notify_issue("Trakt", "Trakt同步异常", "本轮部分影视记录未完成，请查看插件日志。")
 
         if self._douban_helper.requests_paused:
             return
@@ -278,6 +272,7 @@ class TraktRatingsSync(_PluginBase):
             self._sync_progress()
         except Exception as e:
             logger.error("同步 Trakt 观看进度到豆瓣失败: %s", e, exc_info=True)
+            self._notify_issue("Trakt", "Trakt同步异常", "本轮部分影视记录未完成，请查看插件日志。")
 
     def _sync_ratings(self) -> None:
         """从 Trakt 拉取评分并批量同步到豆瓣「看过」。"""
@@ -358,8 +353,10 @@ class TraktRatingsSync(_PluginBase):
 
         if episodes is None or recent_shows is None:
             logger.warning("Trakt 播放进度或观看历史拉取失败，保留已有在看记录，跳过本次剧集同步")
+            self._notify_issue("Trakt", "Trakt记录读取未完成", "请检查网络及Trakt应用状态；原有同步记录保留。")
             return
 
+        self._mark_source_success("Trakt")
         # 豆瓣无法将电影设置为在看，仅同步剧集
         logger.info("获取到 %d 条 Trakt 剧集播放进度", len(episodes))
 
@@ -512,6 +509,7 @@ class TraktRatingsSync(_PluginBase):
         # 持久化书单（供详情页展示）
         self.save_data("weread_books", books)
 
+        self._mark_source_success("微信读书")
         logger.info("微信读书拉取完成，共 %d 本，开始同步到豆瓣：", len(books))
         for i, book in enumerate(books, 1):
             time_str = WereadHelper.format_reading_time(book.get("reading_time", 0))
@@ -607,6 +605,8 @@ class TraktRatingsSync(_PluginBase):
                 continue
 
             # ── 提交到豆瓣 ────────────────────────────────────────────────
+            if hasattr(self._douban_helper, "set_target_context"):
+                self._douban_helper.set_target_context(subject_id, "book.douban.com", douban_title or title, "微信读书")
             ok = self._douban_helper.set_book_status(
                 subject_id=subject_id,
                 status=douban_status,
@@ -632,14 +632,14 @@ class TraktRatingsSync(_PluginBase):
                 )
                 success_count += 1
             else:
-                logger.warning("豆瓣图书提交失败: %s (id=%s)", title, subject_id)
+                logger.info("豆瓣图书尚未完成（含额度延期），已保留待处理: %s", title)
                 fail_count += 1
 
         # 持久化两份缓存
         self.save_data("weread_synced", synced)
         self.save_data("weread_book_id_map", book_id_map)
         logger.info(
-            "微信读书同步完成: 成功 %d，跳过 %d（已同步），失败/未匹配 %d",
+            "微信读书同步完成: 成功 %d，跳过 %d（已同步），未完成/未匹配 %d（含额度延期；实际失败见写入汇总）",
             success_count, skip_count, fail_count,
         )
 
@@ -672,6 +672,7 @@ class TraktRatingsSync(_PluginBase):
             logger.info("网易云音乐未获取到最近专辑记录（Cookie 可能失效或暂无听歌记录）")
             return
 
+        self._mark_source_success("网易云音乐")
         # 已同步缓存（key = 豆瓣 subject_id，避免重复提交）
         synced: Dict[str, Any] = self.get_data("netease_albums") or {}
 
@@ -742,6 +743,8 @@ class TraktRatingsSync(_PluginBase):
                 continue
 
             # ── 提交「听过」状态 ──────────────────────────────────────────
+            if hasattr(self._douban_helper, "set_target_context"):
+                self._douban_helper.set_target_context(subject_id, "music.douban.com", douban_title or album_name, "网易云音乐")
             ok = self._douban_helper.set_music_status(
                 subject_id=subject_id,
                 status="collect",
@@ -765,14 +768,14 @@ class TraktRatingsSync(_PluginBase):
                 )
                 success_count += 1
             else:
-                logger.warning("豆瓣音乐提交失败: %s - %s (id=%s)", artist, album_name, subject_id)
+                logger.info(f"豆瓣音乐尚未完成（含额度延期），已保留待处理：{artist} - {album_name}")
                 fail_count += 1
 
         # 持久化两份缓存
         self.save_data("netease_albums", synced)
         self.save_data("netease_album_map", album_map)
         logger.info(
-            "网易云音乐同步完成: 成功 %d，跳过 %d（已同步），失败/未匹配 %d",
+            "网易云音乐同步完成: 成功 %d，跳过 %d（已同步），未完成/未匹配 %d（含额度延期；实际失败见写入汇总）",
             success_count, skip_count, fail_count,
         )
 
@@ -799,7 +802,7 @@ class TraktRatingsSync(_PluginBase):
         if not self._xiaoyuzhou_helper:
             self._xiaoyuzhou_helper = XiaoyuzhouHelper(
                 access_token=self._xiaoyuzhou_cookie,
-                notify_fn=self._send_bark_notification,
+                notify_fn=lambda title, body: self._notify_issue("小宇宙", title, body),
             )
 
         logger.info("开始同步小宇宙播客最近听取记录到豆瓣...")
@@ -810,6 +813,7 @@ class TraktRatingsSync(_PluginBase):
             logger.info("小宇宙未获取到最近听取记录（Cookie 可能已失效或暂无听取记录）")
             return
 
+        self._mark_source_success("小宇宙")
         # 持久化播客列表（供详情页展示）
         self.save_data("xiaoyuzhou_episodes", episodes)
 
@@ -930,6 +934,8 @@ class TraktRatingsSync(_PluginBase):
                 )
 
             # ── 提交豆瓣状态 ─────────────────────────────────────────────
+            if hasattr(self._douban_helper, "set_target_context"):
+                self._douban_helper.set_target_context(subject_id, "www.douban.com", douban_title or podcast_name, "小宇宙")
             ok = self._douban_helper.set_podcast_status(
                 subject_id=subject_id,
                 status=target_status,
@@ -953,14 +959,14 @@ class TraktRatingsSync(_PluginBase):
                 )
                 success_count += 1
             else:
-                logger.warning("豆瓣播客提交失败: %s (id=%s)", podcast_name, subject_id)
+                logger.info("豆瓣播客尚未完成（含额度延期），已保留待处理: %s", podcast_name)
                 fail_count += 1
 
         # 持久化两份缓存
         self.save_data("xiaoyuzhou_podcasts", synced)
         self.save_data("xiaoyuzhou_podcast_map", podcast_map)
         logger.info(
-            "小宇宙播客同步完成: 成功 %d，跳过 %d（已同步且状态无变化），失败/未匹配 %d",
+            "小宇宙播客同步完成: 成功 %d，跳过 %d（已同步且状态无变化），未完成/未匹配 %d（含额度延期；实际失败见写入汇总）",
             success_count, skip_count, fail_count,
         )
 
@@ -989,19 +995,11 @@ class TraktRatingsSync(_PluginBase):
             "enable": self._enable,
             "trakt_username": self._trakt_username,
             "trakt_client_id": self._trakt_client_id,
-            "trakt_client_secret": self._trakt_client_secret,
-            "trakt_access_token": self._trakt_access_token,
-            "trakt_auth_mode": self._trakt_auth_mode,
             "trakt_redirect_uri": self._trakt_redirect_uri,
-            "trakt_authorization_url": self._trakt_authorization_url,
-            "trakt_auth_message": self._trakt_auth_message,
-            "trakt_authorize": False,
-            "trakt_authorization_response": "",
             "trakt_manual_mappings": self._trakt_manual_mappings,
             "douban_cookie": self._douban_cookie,
             "douban_write_limit": self._douban_write_limit,
             "douban_write_interval": self._douban_write_interval,
-            "douban_resume": False,
             "weread_api_key": self._weread_api_key,
             "weread_limit": self._weread_limit,
             "netease_cookie": self._netease_cookie,
@@ -1016,11 +1014,13 @@ class TraktRatingsSync(_PluginBase):
             "cron": self._cron,
             "bark_webhook_url": self._bark_webhook_url,
         }
-        current.update(patch)
-        self._trakt_access_token = current.get("trakt_access_token") or ""
-        self._trakt_auth_mode = current.get("trakt_auth_mode") or "auto"
-        self._trakt_authorization_url = current.get("trakt_authorization_url") or ""
-        self._trakt_auth_message = current.get("trakt_auth_message") or ""
+        self._trakt_authorization_url = patch.get("trakt_authorization_url", self._trakt_authorization_url)
+        self._trakt_auth_message = patch.get("trakt_auth_message", self._trakt_auth_message)
+        self.save_data("trakt_auth_status", {"url": self._trakt_authorization_url, "message": self._trakt_auth_message})
+        current["notification_mode"] = self._notification_mode
+        current["notification_channel"] = self._notification_channel
+        current.update({key: value for key, value in patch.items() if key in current})
+        self._trakt_access_token = patch.get("trakt_access_token", self._trakt_access_token) or ""
         self._trakt_manual_mappings = current.get("trakt_manual_mappings") or ""
         self._netease_cookie = current.get("netease_cookie") or ""
         self.update_config(current)
@@ -1066,11 +1066,11 @@ class TraktRatingsSync(_PluginBase):
             logger.warning(
                 "❌ Bark 通知发送失败: HTTP %s %s",
                 getattr(resp, "status_code", "None"),
-                (getattr(resp, "text", "") or "")[:200],
+                "",
             )
             return False
         except Exception as e:
-            logger.error("❌ Bark 通知发送异常: %s", e)
+            logger.error(f"Bark 通知发送异常：{type(e).__name__}")
             return False
 
     @staticmethod
@@ -1115,61 +1115,86 @@ class TraktRatingsSync(_PluginBase):
             payload["url"] = link_url
         return url, payload
 
-    def _send_netease_cookie_auth_notification(self, title: str, content: str) -> bool:
-        """发送网易云 Cookie 鉴权失败通知，并按 Cookie 指纹做持久化冷却。"""
-        auth_value = self._netease_cookie
-        fingerprint = hashlib.sha256(auth_value.encode("utf-8")).hexdigest()[:16]
-        state = self.get_data("netease_cookie_auth_notify_state") or {}
-        now = int(time.time())
+    def _send_notification(self, title: str, content: str) -> bool:
+        """按单一通道投递通知，默认只发送数量和必要操作。"""
+        if self._notification_mode == "off":
+            return False
+        if self._notification_channel == "bark":
+            return self._send_bark_notification(title, content)
         try:
-            last_notified_at = int(state.get("last_notified_at") or 0)
-        except (TypeError, ValueError):
-            last_notified_at = 0
-
-        if (
-            state.get("fingerprint") == fingerprint
-            and now - last_notified_at < self._netease_cookie_auth_notify_cooldown
-        ):
-            logger.warning(
-                "网易云 Cookie 鉴权失败通知仍在冷却期内，跳过 Bark 推送: cooldown=%ss",
-                self._netease_cookie_auth_notify_cooldown,
-            )
+            self.post_message(title=title, text=content)
+            return True
+        except Exception as error:
+            logger.warning(f"MoviePilot 通知投递异常：{type(error).__name__}")
             return False
 
-        self.save_data("netease_cookie_auth_notify_state", {
-            "fingerprint": fingerprint,
-            "last_notified_at": now,
-            "title": title,
-        })
-        return self._send_bark_notification(title, content)
+    def _mark_source_success(self, source: str) -> None:
+        """只有读取到有效数据时才确认来源恢复，保留独立测试调用的兼容性。"""
+        self._source_fetch_ok = getattr(self, "_source_fetch_ok", set())
+        self._source_fetch_ok.add(source)
+
+    def _notify_issue(self, source: str, title: str, content: str) -> bool:
+        """按平台持久化异常，通知成功后才进入冷却，失败保留后续重试。"""
+        credentials = {"Trakt": self._trakt_client_id, "豆瓣": self._douban_cookie,
+                       "微信读书": self._weread_api_key, "网易云音乐": self._netease_cookie,
+                       "小宇宙": self._xiaoyuzhou_cookie}
+        fingerprint = hashlib.sha256((credentials.get(source) or "").encode()).hexdigest()[:16]
+        issues = dict(self.get_data("notification_issues") or {})
+        previous = issues.get(source) or {}
+        now = int(time.time())
+        self._source_issue_this_run = getattr(self, "_source_issue_this_run", set())
+        self._source_issue_this_run.add(source)
+        event_fingerprint = hashlib.sha256((title + (content if source == "豆瓣" else "")).encode()).hexdigest()[:16]
+        same = (previous.get("fingerprint") == fingerprint and previous.get("event_fingerprint") == event_fingerprint
+                and previous.get("active"))
+        state = dict(previous) if same else {"fingerprint": fingerprint, "last_success_at": 0, "last_attempt_at": 0}
+        state.update({"active": True, "title": title, "event_fingerprint": event_fingerprint, "updated_at": now, "recovery_pending": False})
+        issues[source] = state
+        self.save_data("notification_issues", issues)
+        if self._notification_mode == "off":
+            return False
+        if now - state.get("last_success_at", 0) < self._NOTIFY_COOLDOWN:
+            return False
+        if now - state.get("last_attempt_at", 0) < self._NOTIFY_RETRY_INTERVAL:
+            return False
+        actions = {"Trakt": "请确认Trakt后台应用仍有效，再在插件配置页检查Client ID和授权状态。",
+                   "微信读书": "请在插件配置页更新微信读书 API Key。",
+                   "网易云音乐": "请在正常浏览器登录网易云，再更新插件 Cookie。",
+                   "小宇宙": "请在插件配置页更新小宇宙认证信息。"}
+        body = content if source == "豆瓣" else actions.get(source, "请查看插件详情与日志。")
+        state["last_attempt_at"] = now
+        delivered = self._send_notification(title, body)
+        if delivered:
+            state["last_success_at"] = now
+        state["delivery_pending"] = not delivered
+        self.save_data("notification_issues", issues)
+        return delivered
+
+    def _resolve_issue(self, source: str) -> None:
+        """确认有效来源数据后清除异常，只为已投递的故障发送一次恢复消息。"""
+        issues = dict(self.get_data("notification_issues") or {})
+        state = dict(issues.get(source) or {})
+        if not state.get("active") and not state.get("recovery_pending"):
+            return
+        now = int(time.time())
+        recovery_pending = False
+        if state.get("last_success_at") and self._notification_mode != "off":
+            if state.get("recovery_pending") and now - state.get("recovery_attempt_at", 0) < self._NOTIFY_RETRY_INTERVAL:
+                recovery_pending = True
+            else:
+                state["recovery_attempt_at"] = now
+                recovery_pending = not self._send_notification(f"{source}同步已恢复", "本次检查通过，后续将按原定时任务继续处理。")
+        state.update({"active": False, "delivery_pending": False, "recovery_pending": recovery_pending, "resolved_at": now})
+        issues[source] = state
+        self.save_data("notification_issues", issues)
+
+    def _send_netease_cookie_auth_notification(self, title: str, content: str) -> bool:
+        """将网易云授权异常交给统一通知规则。"""
+        return self._notify_issue("网易云音乐", title, content)
 
     def _send_weread_auth_notification(self, title: str, content: str) -> bool:
-        """发送微信读书鉴权失败通知，并按凭据指纹做持久化冷却。"""
-        auth_value = self._weread_api_key
-        fingerprint = hashlib.sha256(auth_value.encode("utf-8")).hexdigest()[:16]
-        state = self.get_data("weread_auth_notify_state") or {}
-        now = int(time.time())
-        try:
-            last_notified_at = int(state.get("last_notified_at") or 0)
-        except (TypeError, ValueError):
-            last_notified_at = 0
-
-        if (
-            state.get("fingerprint") == fingerprint
-            and now - last_notified_at < self._weread_auth_notify_cooldown
-        ):
-            logger.warning(
-                "微信读书鉴权失败通知仍在冷却期内，跳过 Bark 推送: cooldown=%ss",
-                self._weread_auth_notify_cooldown,
-            )
-            return False
-
-        self.save_data("weread_auth_notify_state", {
-            "fingerprint": fingerprint,
-            "last_notified_at": now,
-            "title": title,
-        })
-        return self._send_bark_notification(title, content)
+        """将微信读书授权异常交给统一通知规则。"""
+        return self._notify_issue("微信读书", title, content)
 
     # ------------------------------------------------------------------
     # 插件接口
@@ -1191,12 +1216,19 @@ class TraktRatingsSync(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         """返回插件暴露给 MoviePilot 的 API 定义。"""
         return [
+            {"path": "/oauth/start", "endpoint": self._api_trakt_start, "methods": ["POST"],
+             "summary": "生成 Trakt PKCE 授权链接", "response_model": ApiResponse,
+             "allow_anonymous": True, "dependencies": [Depends(self._verify_trakt_callback_admin)]},
+            {"path": "/douban/resume", "endpoint": self._api_douban_resume, "methods": ["POST"],
+             "summary": "完成验证后恢复豆瓣同步", "response_model": ApiResponse,
+             "allow_anonymous": True, "dependencies": [Depends(self._verify_trakt_callback_admin)]},
             {
                 "path": "/sync",
                 "endpoint": self._api_sync,
                 "methods": ["GET", "POST"],
                 "summary": "手动执行同步",
                 "description": "立即执行一次 Trakt 评分同步到豆瓣",
+                "response_model": ApiResponse,
             },
             {
                 "path": "/oauth/callback",
@@ -1243,14 +1275,49 @@ class TraktRatingsSync(_PluginBase):
             logger.warning(f"Trakt PKCE 回跳未完成：{message}")
         return ApiResponse(success=authorized, message=message)
 
-    def _api_sync(self) -> Dict[str, Any]:
+    def _api_trakt_start(self, response: HttpResponse = None) -> ApiResponse:
+        """使用已经保存的应用配置生成授权链接，不启动同步或设备码轮询。"""
+        if response is not None:
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Referrer-Policy"] = "no-referrer"
+        if not self._run_lock.acquire(blocking=False):
+            return ApiResponse(success=False, message="同步任务正在运行，请结束后再重新授权")
+        try:
+            if urlparse(self._trakt_redirect_uri).path != self._trakt_callback_path:
+                return ApiResponse(success=False, message="请先保存正确的插件 HTTPS 回跳地址，再生成授权链接")
+            try:
+                self._create_trakt_helper().begin_pkce_authorization()
+            except ValueError as error:
+                return ApiResponse(success=False, message=str(error))
+            self._merge_update_config({"trakt_auth_message": "链接已生成，有效期10分钟；请点击打开授权页面"})
+            return ApiResponse(success=True, message="链接已生成，请点击打开授权页面；现有令牌和同步记录已保留",
+                               data={"authorization_url": self._trakt_authorization_url})
+        finally:
+            self._run_lock.release()
+
+    def _api_douban_resume(self) -> ApiResponse:
+        """完成浏览器验证后解除人工暂停，保留待处理队列和服务端冷却。"""
+        if not self._run_lock.acquire(blocking=False):
+            return ApiResponse(success=False, message="同步任务正在运行，请稍后恢复")
+        try:
+            state = dict(self.get_data("douban_sync_state") or {})
+            if state.get("blocked_until", 0) > time.time():
+                return ApiResponse(success=False, message="豆瓣仍在冷却期，冷却结束后由定时任务继续处理")
+            state.pop("requires_verification", None)
+            state.pop("reason", None)
+            self.save_data("douban_sync_state", state)
+            return ApiResponse(success=True, message="已解除人工暂停，待处理记录保留；下次定时任务继续处理")
+        finally:
+            self._run_lock.release()
+
+    def _api_sync(self) -> ApiResponse:
         """手动触发同步（API 端点）。"""
         try:
             self.run()
-            return {"success": True, "message": "同步任务已执行"}
+            return ApiResponse(success=True, message="同步任务已执行")
         except Exception as e:
             logger.error("手动同步失败: %s", e, exc_info=True)
-            return {"success": False, "message": str(e)}
+            return ApiResponse(success=False, message="同步执行异常，请查看插件日志")
 
     def get_service(self) -> List[Dict[str, Any]]:
         """返回定时同步服务定义。"""
@@ -1279,498 +1346,246 @@ class TraktRatingsSync(_PluginBase):
             }
         ]
 
+    @staticmethod
+    def _action_button(label: str, path: str, disabled: bool = False) -> dict:
+        """构建由管理员资源 Cookie 鉴权的原生插件操作按钮。"""
+        return {"component": "VBtn", "text": label, "props": {"color": "primary", "variant": "tonal", "disabled": disabled},
+                "events": {"click": {"api": f"plugin/TraktRatingsSync/{path}", "method": "post"}}}
+
+    @staticmethod
+    def _fold(title: str, content: List[dict]) -> dict:
+        """使用原生折叠面板减少默认页面长度，保留键盘可操作的标题。"""
+        return {"component": "VExpansionPanels", "props": {"variant": "accordion", "class": "my-3"}, "content": [
+            {"component": "VExpansionPanel", "content": [
+                {"component": "VExpansionPanelTitle", "text": title},
+                {"component": "VExpansionPanelText", "content": content},
+            ]},
+        ]}
+
+    @staticmethod
+    def _config_action_button(label: str, path: str, message_model: str, show: Optional[str] = None) -> dict:
+        """使用宿主表单的onClick契约调用同源管理员接口，并立即更新显示状态。"""
+        update = ("model._ui_trakt_url = result.data.authorization_url;" if path == "oauth/start"
+                  else "model._ui_douban_paused = false;")
+        handler = f"""async function(event) {{
+            if (model._ui_busy) return;
+            model._ui_busy = true;
+            try {{
+                const response = await fetch('/api/v1/plugin/TraktRatingsSync/{path}', {{method: 'POST', credentials: 'same-origin'}});
+                const result = await response.json();
+                model.{message_model} = result.message || (result.detail ? '操作未完成，请确认已登录MoviePilot管理员' : '操作未完成');
+                if (response.ok && result.success) {{ {update} }}
+            }} catch(error) {{
+                model.{message_model} = '请求未完成，请检查网络后重试';
+            }} finally {{ model._ui_busy = false; }}
+        }}"""
+        props = {"color": "primary", "variant": "tonal", "disabled": "{{ _ui_busy }}", "onClick": handler}
+        if show:
+            props["show"] = show
+        return {"component": "VBtn", "text": label, "props": props}
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """返回插件配置页表单结构和默认配置。"""
+        """返回精简配置，只支持 PKCE；授权和恢复同步通过按钮执行。"""
         def field(model: str, label: str, **props) -> dict:
             return {"component": "VTextField", "props": {"model": model, "label": label, **props}}
 
-        def switch(model: str, label: str) -> dict:
-            return {"component": "VSwitch", "props": {"model": model, "label": label}}
+        def row(*components: dict) -> dict:
+            return {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [item]} for item in components]}
 
-        def select(model: str, label: str, items: List[dict]) -> dict:
-            return {"component": "VSelect", "props": {"model": model, "label": label, "items": items}}
+        def select(model: str, label: str, options: List[Tuple[str, str]]) -> dict:
+            return {"component": "VSelect", "props": {"model": model, "label": label, "items": [{"title": title, "value": value} for title, value in options]}}
 
-        def textarea(model: str, label: str, **props) -> dict:
-            return {"component": "VTextarea", "props": {"model": model, "label": label, **props}}
+        def heading(title: str) -> dict:
+            return {"component": "div", "text": title, "props": {"class": "text-subtitle-1 font-weight-medium mt-4 mb-2"}}
 
-        def col(component: dict, cols: int = 12, md: Optional[int] = None) -> dict:
-            props = {"cols": cols}
-            if md:
-                props["md"] = md
-            return {"component": "VCol", "props": props, "content": [component]}
+        def credential(model: str, label: str, hint: str, **props) -> dict:
+            return field(model, label, type="password", autocomplete="off", hint=hint, **{"persistent-hint": True}, **props)
 
-        def row(*cols: dict) -> dict:
-            return {"component": "VRow", "content": list(cols)}
-
-        def section(title: str) -> dict:
-            return row(col({
-                "component": "div",
-                "props": {"class": "text-subtitle-1 font-weight-medium mt-4 mb-1"},
-                "text": title,
-            }))
-
-        form = [{
-            "component": "VForm",
-            "content": [
-                section("基础设置"),
-                row(
-                    col(switch("enable", "启用插件"), md=2),
-                    col(select(
-                        "sync_type",
-                        "同步类型",
-                        [
-                            {"title": "全部(电影 + 电视剧)", "value": "all"},
-                            {"title": "仅电影", "value": "movies"},
-                            {"title": "仅电视剧", "value": "shows"},
-                        ],
-                    ), md=4),
-                    col(field("cron", "定时执行 cron", placeholder="0 2 * * *"), md=3),
-                    col(field("max_sync_count", "最大同步数量", placeholder="0 表示不限制", type="number"), md=3),
-                ),
-                section("通知"),
-                row(
-                    col(field(
-                        "bark_webhook_url",
-                        "Bark Webhook URL",
-                        placeholder="https://api.day.app/your_key/your_message",
-                    )),
-                ),
-                section("豆瓣"),
-                row(
-                    col(field("douban_write_limit", "各平台合计每轮最多写入", type="number", min=1,
-                              hint="默认10次，包含失败请求；超额条目保留到后续同步", **{"persistent-hint": True}), md=6),
-                    col(field("douban_write_interval", "豆瓣写入最小间隔（秒）", type="number", min=5,
-                              hint="默认10秒，实际等待10–20秒；不保证不会触发验证", **{"persistent-hint": True}), md=6),
-                ),
-                row(col(switch("douban_resume", "已完成豆瓣验证，恢复同步（保存后生效）"))),
-                row(
-                    col(field(
-                        "douban_cookie",
-                        "豆瓣 Cookie",
-                        placeholder="可直接填豆瓣 Cookie，或粘贴包含 Cookie 的完整豆瓣 cURL",
-                    ), md=9),
-                    col(switch("private", "仅自己可见"), md=3),
-                ),
-                section("Trakt"),
-                row(
-                    col(field("trakt_username", "Trakt 用户名", placeholder="例如 ialex-cube"), md=4),
-                    col(field(
-                        "trakt_client_id",
-                        "Trakt Client ID",
-                        placeholder="在 developer.trakt.tv/apps 创建应用获取",
-                    ), md=4),
-                    col(field(
-                        "trakt_client_secret",
-                        "Trakt Client Secret(可选)",
-                        placeholder="仅旧应用使用，新 PKCE 应用留空",
-                    ), md=4),
-                ),
-                row(
-                    col(select("trakt_auth_mode", "Trakt 授权方式", [
-                        {"title": "自动（无 Secret 使用 PKCE）", "value": "auto"},
-                        {"title": "PKCE（新应用，仅需 Client ID）", "value": "pkce"},
-                        {"title": "设备码（旧应用，需要 Secret）", "value": "device"},
-                    ]), md=4),
-                    col(field("trakt_redirect_uri", "Trakt HTTPS 回跳地址",
-                              hint="自动回跳：MoviePilot 的 HTTPS 地址 + /api/v1/plugin/TraktRatingsSync/oauth/callback；与 Trakt 后台一致，并先在同一浏览器登录 MoviePilot",
-                              **{"persistent-hint": True}), md=8),
-                ),
-                row(col(switch("trakt_authorize", "生成新的 PKCE 授权链接（保存后生效）"))),
-                row(col(textarea("trakt_authorization_url", "Trakt 授权链接（保存后重新打开配置页查看）",
-                                 readonly=True, rows=2, **{"auto-grow": True}))),
-                row(col({"component": "VBtn", "props": {
-                    "href": self._trakt_authorization_url, "target": "_blank", "rel": "noreferrer",
-                    "disabled": not bool(self._trakt_authorization_url), "color": "primary",
-                }, "text": "打开 Trakt 授权页面"})),
-                row(col(textarea("trakt_authorization_response", "手动回跳地址（仅兼容旧流程，自动回跳无需填写）",
-                                 hint="使用自动回跳接口时无需粘贴；旧流程可复制含 code 和 state 的完整地址后保存",
-                                 rows=2, **{"persistent-hint": True, "auto-grow": True}))),
-                row(col({"component": "VAlert", "props": {
-                    "type": "info", "variant": "tonal",
-                    "text": self._trakt_auth_message or "新应用不需要 Client Secret。填写 Client ID 和回跳地址后生成链接，再完成浏览器授权。",
-                }})),
-                row(
-                    col(field(
-                        "trakt_history_limit",
-                        "剧集观看历史数量",
-                        placeholder="20",
-                        type="number",
-                        hint="用于将最近看过单集的剧集同步为豆瓣在看",
-                        **{"persistent-hint": True},
-                    ), md=3),
-                    col(field(
-                        "trakt_history_days",
-                        "剧集观看历史天数",
-                        placeholder="30",
-                        type="number",
-                        hint="只处理最近 N 天观看过单集的剧集，0 表示不限制",
-                        **{"persistent-hint": True},
-                    ), md=3),
-                    col(textarea(
-                        "trakt_manual_mappings",
-                        "Trakt → 豆瓣手动映射（可选）",
-                        placeholder="每行一条，例如：imdb:tt1234567=12345678 或 movie:294048=12345678",
-                        rows=2,
-                        **{"auto-grow": True},
-                    ), md=6),
-                ),
-                section("微信读书"),
-                row(
-                    col(field("weread_api_key", "微信读书 Skill API Key", placeholder="wrk-..."), md=9),
-                    col(field("weread_limit", "微信读书同步数量", placeholder="20", type="number"), md=3),
-                ),
-                section("网易云音乐"),
-                row(
-                    col(field(
-                        "netease_cookie",
-                        "网易云 Cookie",
-                        placeholder="可直接填网易云 Cookie，或粘贴包含 Cookie 的完整网易云 cURL",
-                    ), md=9),
-                    col(field("netease_limit", "网易云同步专辑数", placeholder="20", type="number"), md=3),
-                ),
-                section("小宇宙"),
-                row(
-                    col(field(
-                        "xiaoyuzhou_cookie",
-                        "小宇宙 FM Token（可选）",
-                        placeholder="可直接填 x-jike-access-token，或粘贴包含该字段的完整小宇宙 cURL",
-                    ), md=9),
-                    col(field("xiaoyuzhou_limit", "小宇宙同步播客数", placeholder="20", type="number"), md=3),
-                ),
-                row(col({
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "class": "mt-2",
-                        "text": (
-                            "配置提示：Trakt Access Token 授权后自动保存，不在本页展示。"
-                            "网易云音乐仅使用 Cookie/完整 cURL；Cookie 失效时会按冷却策略通过 Bark 提醒。"
-                        ),
-                    },
-                })),
-            ],
-        }]
-        return form, {
-            "enable": False,
-            "trakt_username": "",
-            "trakt_client_id": "",
-            "trakt_client_secret": "",
-            "trakt_access_token": "",
-            "trakt_auth_mode": "auto",
-            "trakt_redirect_uri": "",
-            "trakt_authorization_url": "",
-            "trakt_auth_message": "",
-            "trakt_authorize": False,
-            "trakt_authorization_response": "",
-            "trakt_manual_mappings": "",
-            "douban_cookie": "",
-            "douban_write_limit": 10,
-            "douban_write_interval": 10,
-            "douban_resume": False,
-            "weread_api_key": "",
-            "weread_limit": 20,
-            "netease_cookie": "",
-            "netease_limit": 20,
-            "xiaoyuzhou_cookie": "",
-            "xiaoyuzhou_limit": 20,
-            "private": True,
-            "sync_type": "all",
-            "max_sync_count": 0,
-            "trakt_history_limit": 20,
-            "trakt_history_days": 30,
-            "cron": "0 2 * * *",
-            "bark_webhook_url": "",
-        }
+        token = self.get_data("trakt_token") or {}
+        pending = self.get_data("trakt_pkce_pending") or {}
+        url = self._trakt_authorization_url if pending.get("expires_at", 0) > time.time() else ""
+        authorized = bool(token.get("access_token") or self._trakt_access_token)
+        auth_text = self._trakt_auth_message if url else "已保存 Trakt 授权，令牌会自动续期" if authorized else self._trakt_auth_message or "尚未授权：保存 Client ID 与回跳地址后，点击生成授权链接"
+        if pending and not url and not authorized:
+            auth_text = "上次授权链接已过期，请重新生成并在10分钟内完成授权"
+        trakt = [
+            row(field("trakt_username", "Trakt 用户名", hint="用于读取公开评分，仍需保留"), field("trakt_client_id", "Trakt Client ID")),
+            field("trakt_redirect_uri", "Trakt HTTPS 回跳地址", hint=f"填写 MoviePilot 的 HTTPS 域名 + {self._trakt_callback_path}，并与 Trakt 后台一致", **{"persistent-hint": True}),
+            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "{{ _ui_trakt_message }}"}},
+            {"component": "div", "props": {"class": "d-flex flex-wrap ga-3 my-3"}, "content": [self._config_action_button("重新授权" if authorized else "生成授权链接", "oauth/start", "_ui_trakt_message")]},
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "按钮使用已保存的配置；修改应用信息后请先保存。链接会立即显示，请在10分钟内完成授权。"},
+            {"component": "VBtn", "text": "打开 Trakt 授权页面", "props": {"href": "{{ _ui_trakt_url }}", "show": "{{ !!_ui_trakt_url }}", "target": "_blank", "rel": "noreferrer", "color": "primary", "class": "my-3"}},
+        ]
+        state = self.get_data("douban_sync_state") or {}
+        douban = [credential("douban_cookie", "豆瓣 Cookie", "支持 Cookie 字符串或含 Cookie 的完整 cURL")]
+        if state.get("requires_verification"):
+            douban.extend([
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "{{ _ui_douban_message }}"}},
+                self._config_action_button("已完成验证，恢复同步", "douban/resume", "_ui_douban_message", "{{ _ui_douban_paused }}"),
+            ])
+        advanced = [
+            heading("豆瓣请求节制"), row(field("douban_write_limit", "所有平台每轮写入额度", type="number", min=1, hint="默认10次，失败请求也占额度；超额记录自动延期"),
+                                         field("douban_write_interval", "写入最小间隔（秒）", type="number", min=5, hint="默认10秒，实际间隔10–20秒")),
+            heading("Trakt 读取范围"), row(select("sync_type", "Trakt 影视同步范围", [("电影和剧集", "all"), ("仅电影", "movies"), ("仅剧集", "shows")]),
+                                         field("max_sync_count", "Trakt 最近评分读取上限", type="number", min=0, hint="0表示不限制；不影响其他平台及豆瓣写入额度")),
+            row(field("trakt_history_limit", "剧集观看历史读取条数", type="number", min=1), field("trakt_history_days", "剧集历史范围（天）", type="number", min=0, hint="0表示不限天数")),
+            {"component": "VTextarea", "props": {"model": "trakt_manual_mappings", "label": "Trakt → 豆瓣手动映射", "rows": 2, "placeholder": "imdb:tt1234567=12345678", "auto-grow": True}},
+            heading("各平台读取数量"), row(field("weread_limit", "微信读书读取本数", type="number", min=1), field("netease_limit", "网易云读取专辑数", type="number", min=1)),
+            field("xiaoyuzhou_limit", "小宇宙读取单集数", type="number", min=1),
+        ]
+        form = [{"component": "VForm", "content": [
+            heading("基础设置"), row({"component": "VSwitch", "props": {"model": "enable", "label": "启用插件"}},
+                                       {"component": "VSwitch", "props": {"model": "private", "label": "豆瓣记录仅自己可见"}}),
+            field("cron", "定时同步", hint="五段cron表达式，例如0 10 * * *代表每天上午10点", **{"persistent-hint": True}),
+            heading("豆瓣"), *douban,
+            self._fold("Trakt", trakt),
+            self._fold("微信读书", [credential("weread_api_key", "微信读书 API Key", "仅支持现有 Skill API Key")]),
+            self._fold("网易云音乐", [credential("netease_cookie", "网易云 Cookie", "支持 Cookie 字符串或完整 cURL")]),
+            self._fold("小宇宙", [credential("xiaoyuzhou_cookie", "小宇宙认证信息", "支持 Token、含刷新令牌的 Cookie 或完整 cURL")]),
+            self._fold("通知", [select("notification_mode", "通知内容", [("有新增时汇总，并提醒异常", "changes"), ("仅异常和恢复", "errors"), ("关闭推送", "off")]),
+                                select("notification_channel", "通知通道", [("MoviePilot 已配置通道", "moviepilot"), ("Bark", "bark")]),
+                                credential("bark_webhook_url", "Bark 地址", "优先填写服务器/设备Key，不必附带标题和正文", show="{{ notification_channel === 'bark' }}")]),
+            self._fold("高级设置", advanced),
+        ]}]
+        return form, {"enable": False, "private": True, "cron": "0 2 * * *", "douban_cookie": "",
+                      "trakt_username": "", "trakt_client_id": "", "trakt_redirect_uri": "", "trakt_manual_mappings": "",
+                      "weread_api_key": "", "netease_cookie": "", "xiaoyuzhou_cookie": "",
+                      "weread_limit": 20, "netease_limit": 20, "xiaoyuzhou_limit": 20,
+                      "sync_type": "all", "max_sync_count": 0, "trakt_history_limit": 20, "trakt_history_days": 30,
+                      "douban_write_limit": 10, "douban_write_interval": 10,
+                      "notification_mode": "changes", "notification_channel": "moviepilot", "bark_webhook_url": "",
+                      "_ui_busy": False, "_ui_trakt_url": url, "_ui_trakt_message": auth_text,
+                      "_ui_douban_paused": bool(state.get("requires_verification")), "_ui_douban_message": state.get("reason") or ""}
 
     def get_page(self) -> Optional[List[dict]]:
-        """插件详情页：展示 Trakt 同步历史（看完/在看）、微信读书最近阅读、网易云音乐同步记录、小宇宙播客同步记录。"""
-        def format_sync_time(value: Any) -> str:
-            if not value:
-                return "-"
-            return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+        """展示本轮真实写入汇总、异常和待处理明细，来源状态单独标识。"""
+        def timestamp(value: Any) -> str:
+            return datetime.fromtimestamp(value).strftime("%m-%d %H:%M") if value else "—"
 
-        def cell(text: Any = "-", **props) -> dict:
-            return {
-                "component": "td",
-                "props": {"class": "text-start ps-4", **props},
-                "text": str(text) if text is not None else "-",
-            }
+        def table(headers: List[str], rows: List[List[Any]]) -> dict:
+            return {"component": "VTable", "props": {"density": "compact", "hover": True, "class": "text-no-wrap", "style": "max-height:420px;overflow:auto"}, "content": [
+                {"component": "thead", "content": [{"component": "tr", "content": [{"component": "th", "text": label} for label in headers]}]},
+                {"component": "tbody", "content": [{"component": "tr", "content": [value if isinstance(value, dict) else {"component": "td", "text": str(value)} for value in row]} for row in rows]},
+            ]}
 
-        def chip_cell(text: str, color: str) -> dict:
-            return {
-                "component": "td",
-                "props": {"class": "text-start ps-4"},
-                "content": [{
-                    "component": "VChip",
-                    "props": {"size": "small", "color": color, "variant": "flat"},
-                    "text": text,
-                }],
-            }
+        def link(subject: str, host: str) -> dict:
+            path = "podcast" if host == "www.douban.com" else "subject"
+            return {"component": "td", "content": [{"component": "VBtn", "text": "豆瓣条目", "props": {"href": f"https://{host}/{path}/{subject}/", "target": "_blank", "rel": "noreferrer", "variant": "text", "size": "small"}}]} if subject else {"component": "td", "text": "—"}
 
-        def link_cell(text: str, href: str) -> dict:
-            if not href:
-                return cell()
-            return {
-                "component": "td",
-                "props": {"class": "text-start ps-4"},
-                "content": [{
-                    "component": "VBtn",
-                    "props": {
-                        "variant": "text",
-                        "color": "primary",
-                        "size": "small",
-                        "href": href,
-                        "target": "_blank",
-                    },
-                    "text": text,
-                }],
-            }
+        state = self.get_data("douban_sync_state") or {}
+        pending = state.get("pending") or {}
+        actual = state.get("synced") or {}
+        targets = state.get("targets") or {}
 
-        def section(title: str, count: int) -> dict:
-            return {
-                "component": "VRow",
-                "props": {"class": "mt-4"},
-                "content": [{
-                    "component": "VCol",
-                    "props": {"cols": 12},
-                    "content": [{
-                        "component": "div",
-                        "props": {"class": "d-flex align-center ga-2 mb-2"},
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {"class": "text-h6"},
-                                "text": title,
-                            },
-                            {
-                                "component": "VChip",
-                                "props": {"size": "small", "variant": "tonal"},
-                                "text": str(count),
-                            },
-                        ],
-                    }],
-                }],
-            }
+        def target_url(subject: str, host: str) -> str:
+            path = "ilmen/thing" if host == "www.douban.com" else "subject"
+            return f"https://{host}/j/{path}/{subject}/interest"
 
-        def table(headers: List[str], rows: List[List[dict]]) -> dict:
-            return {
-                "component": "VTable",
-                "props": {"hover": True, "fixedHeader": True, "density": "comfortable"},
-                "content": [
-                    {
-                        "component": "thead",
-                        "content": [
-                            {"component": "th", "props": {"class": "text-start ps-4"}, "text": header}
-                            for header in headers
-                        ],
-                    },
-                    {
-                        "component": "tbody",
-                        "content": [
-                            {
-                                "component": "tr",
-                                "props": {"key": f"row_{idx}"},
-                                "content": row,
-                            }
-                            for idx, row in enumerate(rows)
-                        ],
-                    },
-                ],
-            }
+        def sync_status(subject: str, host: str, expected: str = "", legacy: bool = False) -> str:
+            if not subject:
+                return "未匹配"
+            url = target_url(subject, host)
+            if url in pending:
+                return "待重试" if pending[url].get("last_error") else "待处理"
+            saved = actual.get(url) or {}
+            if saved:
+                return "已同步" if not expected or saved.get("interest") == expected else "来源状态已变化，待处理"
+            return "已同步（历史记录）" if legacy else "尚未同步"
 
-        def overview_chip(label: str, count: int, color: str) -> dict:
-            return {
-                "component": "VChip",
-                "props": {"color": color, "variant": "tonal", "class": "ma-1"},
-                "text": f"{label} {count}",
-            }
-
-        finished = self.get_data("finished") or {}
-        watching = self.get_data("watching") or {}
-
-        if not finished:
-            synced = self.get_data("synced") or {}
-            if synced:
-                logger.info("检测到旧数据格式，迁移 synced -> finished")
-                finished = synced
-                self.save_data("finished", finished)
-
-        all_items: Dict[str, Any] = {}
-        for item in finished.values():
-            douban_id = item.get("douban_id")
-            if douban_id:
-                all_items[douban_id] = item
-        for item in watching.values():
-            douban_id = item.get("douban_id")
-            if douban_id and douban_id not in all_items:
-                all_items[douban_id] = item
-
-        history_list = sorted(all_items.values(), key=lambda x: x.get("sync_time", 0), reverse=True)[:100]
-        weread_books: List[Dict[str, Any]] = self.get_data("weread_books") or []
-        netease_synced: Dict[str, Any] = self.get_data("netease_albums") or {}
-        netease_list = sorted(
-            netease_synced.values(), key=lambda x: x.get("sync_time", 0), reverse=True
-        )[:100]
-        xiaoyuzhou_episodes: List[Dict[str, Any]] = self.get_data("xiaoyuzhou_episodes") or []
-
-        page: List[dict] = [
-            {
-                "component": "VRow",
-                "content": [{
-                    "component": "VCol",
-                    "props": {"cols": 12},
-                    "content": [
-                        {
-                            "component": "div",
-                            "props": {"class": "text-h6 mb-2"},
-                            "text": "同步概览",
-                        },
-                        {
-                            "component": "div",
-                            "props": {"class": "d-flex flex-wrap"},
-                            "content": [
-                                overview_chip("Trakt 看过", len(finished), "success"),
-                                overview_chip("Trakt 在看", len(watching), "primary"),
-                                overview_chip("微信读书", len(weread_books), "info"),
-                                overview_chip("网易云音乐", len(netease_list), "warning"),
-                                overview_chip("小宇宙", len(xiaoyuzhou_episodes), "secondary"),
-                            ],
-                        },
-                    ],
-                }],
-            }
+        run = self.get_data("last_run") or {}
+        status_labels = {"running": "运行中", "completed": "本轮完成", "partial": "部分完成", "paused": "已暂停", "failed": "执行异常"}
+        running = self._run_lock.locked()
+        next_run = "未启用"
+        services = self.get_service()
+        if services:
+            fire_time = services[0]["trigger"].get_next_fire_time(None, datetime.now().astimezone())
+            next_run = fire_time.strftime("%m-%d %H:%M") if fire_time else "无后续时间"
+        status = "运行中" if running else status_labels.get(run.get("status"), "等待定时同步")
+        page = [{"component": "div", "props": {"class": "text-h6 mb-2"}, "text": "同步概览"},
+                {"component": "VAlert", "props": {"type": "warning" if run.get("status") in ("partial", "paused", "failed") else "info", "variant": "tonal",
+                 "text": f"{status} · 最近执行 {timestamp(run.get('started_at'))} · 完成 {timestamp(run.get('finished_at'))} · 下次执行 {next_run}"}},
+                {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 my-3"}, "content": [
+                    {"component": "VChip", "props": {"variant": "tonal"}, "text": f"{label} {count}"} for label, count in (
+                        ("本轮写入", run.get("written", 0)), ("未变化跳过", run.get("skipped", 0)),
+                        ("提交失败", run.get("failed", 0)), ("待处理", len(pending)),
+                    )]},
         ]
+        issues = self.get_data("notification_issues") or {}
+        for source, issue in issues.items():
+            if issue.get("active"):
+                page.append({"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "class": "my-2", "text": f"{source}：{issue.get('title', '异常')}"}})
+        paused = bool(state.get("requires_verification") or state.get("blocked_until", 0) > time.time())
+        if paused:
+            recovery = "请先在浏览器完成验证，再更新Cookie或点击恢复同步" if state.get("requires_verification") else f"冷却至 {timestamp(state.get('blocked_until'))}，随后按定时任务继续"
+            page.append({"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": f"豆瓣已暂停：{state.get('reason', '')}。{recovery}"}})
+            if state.get("requires_verification"):
+                page.append(self._action_button("已完成验证，恢复同步", "douban/resume", running))
+        if pending:
+            rows = []
+            for url, entry in list(pending.items())[:20]:
+                context = targets.get(url) or {}
+                subject = url.split('/')[-2]
+                reason = entry.get("last_error") or (state.get("reason") if paused else "等待后续写入额度")
+                rows.append([context.get("title") or f"豆瓣条目 {subject}", context.get("source") or "历史待处理", reason, link(subject, entry.get("host", "www.douban.com"))])
+            page.append(self._fold(f"待处理记录 · {len(pending)} 条（最近20条）", [table(["名称", "来源", "原因", "链接"], rows)]))
 
-        sync_state = self.get_data("douban_sync_state") or {}
-        pending_count = len(sync_state.get("pending") or {})
-        paused = bool(sync_state.get("requires_verification") or sync_state.get("blocked_until", 0) > time.time())
-        if pending_count or paused:
-            reason = sync_state.get("reason") or "等待后续同步"
-            page.insert(0, {"component": "VAlert", "props": {
-                "type": "warning" if paused else "info", "variant": "tonal",
-                "text": f"豆瓣待同步 {pending_count} 条；{'已暂停：' + reason if paused else '下次按额度继续处理'}。"
-                        + ("请先完成浏览器验证，再更新 Cookie 或保存恢复同步开关。"
-                           if sync_state.get("requires_verification") else
-                           "冷却结束后按定时任务继续处理，无需重新授权。" if paused else ""),
-            }})
-        if not any((history_list, weread_books, netease_list, xiaoyuzhou_episodes)):
-            page.append({
-                "component": "VAlert",
-                "props": {
-                    "type": "info",
-                    "variant": "tonal",
-                    "class": "mt-4",
-                    "text": "暂无同步记录，执行一次同步后会在这里显示最近结果。",
-                },
-            })
-            return page
+        successful_times = state.get("target_success_at") or {}
+        if successful_times:
+            rows = []
+            labels = {"collect": "已看/读/听过", "do": "正在看/读/听"}
+            for url, when in sorted(successful_times.items(), key=lambda item: item[1], reverse=True)[:20]:
+                context = targets.get(url) or {}
+                subject = url.split('/')[-2]
+                host = urlparse(url).hostname or "www.douban.com"
+                rows.append([context.get("title") or f"豆瓣条目 {subject}", context.get("source") or "队列补交",
+                             labels.get((actual.get(url) or {}).get("interest"), "已提交"), timestamp(when), link(subject, host)])
+            page.append(self._fold("最近成功写入 · 最近20条（包含队列补交）", [table(["名称", "来源", "豆瓣状态", "成功时间", "链接"], rows)]))
 
-        if history_list:
-            page.extend([
-                section("Trakt 视频", len(history_list)),
-                table(
-                    ["标题", "年份", "类型", "状态", "Trakt", "豆瓣", "同步时间", "链接"],
-                    [
-                        [
-                            cell(item.get("title", "未知")),
-                            cell(item.get("year", "-")),
-                            cell(item.get("media_type") or "-"),
-                            chip_cell(
-                                item.get("status", "在看"),
-                                "success" if item.get("status") == "看完" else "primary",
-                            ),
-                            cell(item.get("trakt_rating", "-") if item.get("status") == "看完" else "-"),
-                            cell(item.get("douban_rating", "-") if item.get("status") == "看完" else "-"),
-                            cell(format_sync_time(item.get("sync_time"))),
-                            link_cell(
-                                str(item.get("douban_id", "")),
-                                f"https://movie.douban.com/subject/{item.get('douban_id', '')}/"
-                                if item.get("douban_id") else "",
-                            ),
-                        ]
-                        for item in history_list
-                    ],
-                ),
-            ])
+        finished = self.get_data("finished") or self.get_data("synced") or {}
+        watching = self.get_data("watching") or {}
+        video = {str(item.get("douban_id")): item for item in [*watching.values(), *finished.values()] if item.get("douban_id")}
+        video_rows = [[item.get("title", "未知"), item.get("status", "在看"), sync_status(str(item.get("douban_id")), "movie.douban.com", legacy=True), timestamp(item.get("sync_time")), link(str(item.get("douban_id")), "movie.douban.com")]
+                      for item in sorted(video.values(), key=lambda item: item.get("sync_time", 0), reverse=True)[:20]]
+        if video:
+            page.append(self._fold(f"Trakt · {len(video)} 条历史记录", [table(["标题", "豆瓣目标状态", "同步结果", "同步时间", "链接"], video_rows)]))
 
-        if weread_books:
-            page.extend([
-                section("微信读书", len(weread_books)),
-                table(
-                    ["书名", "作者", "状态", "进度", "阅读时长", "完成日", "链接"],
-                    [
-                        [
-                            cell(book.get("title", "")),
-                            cell(book.get("author", "-")),
-                            chip_cell(
-                                book.get("status", "在读"),
-                                (
-                                    "success" if book.get("status") == "读完"
-                                    else "primary" if book.get("status") == "在读"
-                                    else "default"
-                                ),
-                            ),
-                            cell(f"{book.get('reading_progress', 0)}%"),
-                            cell(WereadHelper.format_reading_time(book.get("reading_time", 0))),
-                            cell(book.get("finished_date") or "-"),
-                            link_cell("打开", book.get("weread_url", "")),
-                        ]
-                        for book in weread_books
-                    ],
-                ),
-            ])
+        books = self.get_data("weread_books") or []
+        book_maps = self.get_data("weread_book_id_map") or {}
+        book_synced = self.get_data("weread_synced") or {}
+        book_rows = []
+        for book in books[:20]:
+            subject = str((book_maps.get(str(book.get("book_id"))) or {}).get("subject_id") or "")
+            expected = "collect" if book.get("status") == "读完" else "do"
+            legacy = (book_synced.get(subject) or {}).get("douban_status") == expected
+            result = sync_status(subject, "book.douban.com", expected, legacy) if book.get("status") in ("读完", "在读") else "不需同步"
+            book_rows.append([book.get("title", "未知"), book.get("status") or "未读", f"{book.get('reading_progress', 0)}%", result, link(subject, "book.douban.com")])
+        if books:
+            page.append(self._fold(f"微信读书 · {len(books)} 本来源记录", [table(["书名", "来源阅读状态", "进度", "豆瓣同步结果", "链接"], book_rows)]))
 
-        if netease_list:
-            page.extend([
-                section("网易云音乐", len(netease_list)),
-                table(
-                    ["专辑", "艺术家", "曲目", "播放", "同步时间", "豆瓣"],
-                    [
-                        [
-                            cell(rec.get("douban_title") or rec.get("album", "-")),
-                            cell(rec.get("artist", "-")),
-                            cell(rec.get("song_count", "-")),
-                            cell(rec.get("total_play_count", "-")),
-                            cell(format_sync_time(rec.get("sync_time"))),
-                            link_cell(
-                                str(rec.get("douban_id", "")),
-                                f"https://music.douban.com/subject/{rec.get('douban_id', '')}/"
-                                if rec.get("douban_id") else "",
-                            ),
-                        ]
-                        for rec in netease_list
-                    ],
-                ),
-            ])
+        albums = self.get_data("netease_albums") or {}
+        album_rows = [[item.get("douban_title") or item.get("album", "未知"), item.get("artist", "—"), sync_status(str(item.get("douban_id")), "music.douban.com", legacy=True), timestamp(item.get("sync_time")), link(str(item.get("douban_id")), "music.douban.com")]
+                      for item in sorted(albums.values(), key=lambda item: item.get("sync_time", 0), reverse=True)[:20]]
+        if albums:
+            page.append(self._fold(f"网易云音乐 · {len(albums)} 条历史记录", [table(["专辑", "艺术家", "豆瓣同步结果", "同步时间", "链接"], album_rows)]))
 
-        if xiaoyuzhou_episodes:
-            page.extend([
-                section("小宇宙", len(xiaoyuzhou_episodes)),
-                table(
-                    ["单集", "播客", "时长", "状态"],
-                    [
-                        [
-                            cell(ep.get("title", "")),
-                            cell(ep.get("podcast_name", "-")),
-                            cell(XiaoyuzhouHelper.format_duration(ep.get("duration", 0))),
-                            chip_cell(
-                                (
-                                    "已听完" if ep.get("is_finished")
-                                    else f"听了 {ep.get('listen_pct', 0) * 100:.0f}%"
-                                    if ep.get("listen_pct", 0) > 0
-                                    else "无记录"
-                                ),
-                                (
-                                    "success" if ep.get("is_finished")
-                                    else "primary" if ep.get("listen_pct", 0) > 0
-                                    else "default"
-                                ),
-                            ),
-                        ]
-                        for ep in xiaoyuzhou_episodes
-                    ],
-                ),
-            ])
-
+        episodes = self.get_data("xiaoyuzhou_episodes") or []
+        podcasts = {}
+        for ep in episodes:
+            key = str(ep.get("podcast_id") or ep.get("podcast_name") or "")
+            previous = podcasts.get(key)
+            if not previous or (ep.get("is_finished", False), ep.get("listen_pct", 0)) > (previous.get("is_finished", False), previous.get("listen_pct", 0)):
+                podcasts[key] = ep
+        podcast_map = self.get_data("xiaoyuzhou_podcast_map") or {}
+        podcast_synced = self.get_data("xiaoyuzhou_podcasts") or {}
+        podcast_rows = []
+        for ep in list(podcasts.values())[:20]:
+            name = ep.get("podcast_name", "未知")
+            subject = str((podcast_map.get(name) or {}).get("subject_id") or "")
+            expected = "collect" if ep.get("is_finished") or not ep.get("listen_pct") else "do"
+            legacy = (podcast_synced.get(subject) or {}).get("status") == expected
+            podcast_rows.append([name, "听完" if ep.get("is_finished") else f"进度 {ep.get('listen_pct', 0) * 100:.0f}%", sync_status(subject, "www.douban.com", expected, legacy), link(subject, "www.douban.com")])
+        if podcasts:
+            page.append(self._fold(f"小宇宙 · {len(podcasts)} 个播客（来源 {len(episodes)} 条单集）", [table(["播客", "来源收听状态", "豆瓣同步结果", "链接"], podcast_rows)]))
+        if not any((video, books, albums, episodes, pending)):
+            page.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "暂无同步记录，执行一次同步后会在这里显示最近结果。"}})
         return page

@@ -25,9 +25,9 @@ def test_existing_config_load_preserves_tokens_and_never_starts_authorization(mo
     plugin._data["trakt_token"] = token
     monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: pytest.fail("加载配置不能请求 Trakt"))
     plugin.init_plugin({"enable": True, "trakt_client_id": "legacy-client", "trakt_access_token": "legacy-access"})
-    assert plugin._data["trakt_token"] == token
+    assert plugin._data["trakt_token"] == {**token, "access_token": "legacy-access"}
     assert plugin._trakt_access_token == "legacy-access"
-    assert plugin._config_updates == []
+    assert "trakt_access_token" not in plugin._config_updates[-1]
     assert plugin._data["trakt_auth_client_id"] == "legacy-client"
 
 
@@ -43,57 +43,52 @@ def test_changed_client_resets_only_trakt_auth_and_preserves_history_and_platfor
     assert plugin._data["watching"] == {"show": "history"}
     assert plugin._data["netease_finished"] == {"album": "history"}
     config = plugin._config_updates[-1]
-    assert config["trakt_access_token"] == ""
+    assert "trakt_access_token" not in config
+    assert plugin._trakt_access_token == ""
     assert config["douban_cookie"] == "cookie"
     assert config["weread_api_key"] == "key"
     assert config["netease_cookie"] == "music-cookie"
     assert config["cron"] == "0 10 * * *"
 
 
-def test_config_authorization_actions_are_consumed_and_do_not_sync(monkeypatch):
-    """保存链接生成和回跳操作后重载不会重复执行，也不能启动同步。"""
+def test_authorization_button_uses_saved_config_and_keeps_secrets_private(monkeypatch):
+    """操作按钮生成链接，移除旧开关和手动回跳配置，令牌保持私有。"""
     plugin, module = _build_plugin(monkeypatch)
     monkeypatch.setattr(plugin, "run", lambda: pytest.fail("授权不能触发同步"))
-    config = {"trakt_client_id": "new-client", "trakt_redirect_uri": "https://owned.example/callback",
-              "trakt_authorize": True, "douban_cookie": "cookie"}
-    plugin.init_plugin(config)
-    generated = plugin._config_updates[-1]
-    assert generated["trakt_authorize"] is False
-    assert generated["trakt_auth_mode"] == "pkce"
-    assert generated["trakt_authorization_url"].startswith("https://auth.trakt.tv/")
+    redirect = "https://owned.example/api/v1/plugin/TraktRatingsSync/oauth/callback"
+    plugin.init_plugin({"trakt_client_id": "new-client", "trakt_redirect_uri": redirect, "douban_cookie": "cookie",
+                        "trakt_client_secret": "removed", "trakt_authorize": True, "trakt_authorization_response": "removed"})
+    assert not plugin._data.get("trakt_pkce_pending")
+    assert plugin._api_trakt_start().success
     pending = dict(plugin._data["trakt_pkce_pending"])
-    plugin.init_plugin(generated)
+    assert plugin._trakt_authorization_url.startswith("https://auth.trakt.tv/")
+    assert not {"trakt_authorize", "trakt_authorization_response", "trakt_client_secret", "trakt_auth_mode", "trakt_authorization_url"} & set(plugin._config_updates[-1])
+    plugin.init_plugin(plugin._config_updates[-1])
     assert plugin._data["trakt_pkce_pending"] == pending
     calls = []
-
     def post(**request):
-        """验证授权码在交换前已从配置清除，再返回授权结果。"""
-        assert plugin._config_updates[-1]["trakt_authorization_response"] == ""
+        """记录一次授权码交换。"""
         calls.append(request)
         return _Response(200, {"access_token": "access", "refresh_token": "refresh", "expires_in": 604800})
-
     monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: types.SimpleNamespace(post_res=post))
-    callback_config = {**generated, "trakt_authorization_response": config["trakt_redirect_uri"] + "?" + urlencode({"code": "private-code", "state": pending["state"]})}
-    plugin.init_plugin(callback_config)
-    final = plugin._config_updates[-1]
-    assert final["trakt_authorization_response"] == ""
-    assert final["trakt_access_token"] == "access"
-    assert final["trakt_authorization_url"] == ""
-    assert "授权成功" in final["trakt_auth_message"]
+    callback = redirect + "?" + urlencode({"code": "private-code", "state": pending["state"]})
+    assert plugin._create_trakt_helper().complete_pkce_authorization(callback)
+    assert plugin._data["trakt_token"]["access_token"] == "access"
     assert "private-code" not in str(plugin._config_updates)
     assert pending["code_verifier"] not in str(plugin._config_updates)
-    plugin.init_plugin(final)
+    assert "access" not in plugin._config_updates[-1].values()
+    plugin.init_plugin(plugin._config_updates[-1])
+    assert plugin._trakt_access_token == "access"
     assert len(calls) == 1
 
 
-def test_config_reports_invalid_callback_without_losing_other_settings(monkeypatch):
-    """不合法回跳输入清除后给出可见提示，不覆盖其他平台配置。"""
+def test_authorization_button_rejects_non_callback_address(monkeypatch):
+    """已删除手动回跳，未登记真实回跳路径时不能生成链接。"""
     plugin, module = _build_plugin(monkeypatch)
-    monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: pytest.fail("无待授权请求不能访问 Trakt"))
-    plugin.init_plugin({"trakt_client_id": "client", "douban_cookie": "cookie", "trakt_authorization_response": "https://owned.example/?code=private"})
-    assert plugin._config_updates[-1]["trakt_authorization_response"] == ""
-    assert plugin._config_updates[-1]["douban_cookie"] == "cookie"
-    assert "重新生成授权链接" in plugin._config_updates[-1]["trakt_auth_message"]
+    monkeypatch.setattr(module, "RequestUtils", lambda **_kwargs: pytest.fail("配置失败不能访问Trakt"))
+    plugin.init_plugin({"trakt_client_id": "client", "trakt_redirect_uri": "https://owned.example/", "douban_cookie": "cookie"})
+    assert not plugin._api_trakt_start().success
+    assert not plugin._data.get("trakt_pkce_pending")
 
 
 def _build_callback_client(plugin):
@@ -126,7 +121,8 @@ def _begin_callback_authorization(plugin):
     """为真实注册的回跳路径生成 PKCE 请求。"""
     redirect = "https://owned.example/api/v1/plugin/TraktRatingsSync/oauth/callback"
     plugin.init_plugin({"trakt_client_id": "client", "trakt_redirect_uri": redirect,
-                        "trakt_authorize": True, "douban_cookie": "preserved-cookie"})
+                        "douban_cookie": "preserved-cookie"})
+    assert plugin._api_trakt_start().success
     pending = dict(plugin._data["trakt_pkce_pending"])
     return plugin._trakt_callback_path + "?" + urlencode({"code": "private-code", "state": pending["state"]}), pending
 

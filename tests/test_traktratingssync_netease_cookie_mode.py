@@ -292,15 +292,16 @@ def test_netease_cookie_auth_notification_uses_persistent_cooldown(monkeypatch):
     notifications = []
     monkeypatch.setattr(
         plugin,
-        "_send_bark_notification",
+        "_send_notification",
         lambda title, content: notifications.append((title, content)) or True,
     )
 
     assert plugin._send_netease_cookie_auth_notification("网易云 Cookie 已失效", "需要更新") is True
     assert plugin._send_netease_cookie_auth_notification("网易云 Cookie 已失效", "需要更新") is False
 
-    assert notifications == [("网易云 Cookie 已失效", "需要更新")]
-    assert plugin.get_data("netease_cookie_auth_notify_state")["title"] == "网易云 Cookie 已失效"
+    assert len(notifications) == 1
+    assert "更新插件 Cookie" in notifications[0][1]
+    assert plugin.get_data("notification_issues")["网易云音乐"]["title"] == "网易云 Cookie 已失效"
 
 
 def test_get_form_only_exposes_netease_cookie_config(monkeypatch):
@@ -338,7 +339,6 @@ def test_get_form_only_exposes_netease_cookie_config(monkeypatch):
         "bark_webhook_url",
         "trakt_username",
         "trakt_client_id",
-        "trakt_client_secret",
         "trakt_manual_mappings",
         "trakt_history_limit",
         "trakt_history_days",
@@ -351,6 +351,12 @@ def test_get_form_only_exposes_netease_cookie_config(monkeypatch):
     }
     removed_models = {
         "trakt_access_token",
+        "trakt_client_secret",
+        "trakt_auth_mode",
+        "trakt_authorize",
+        "trakt_authorization_response",
+        "trakt_authorization_url",
+        "douban_resume",
         "netease_app_id",
         "netease_app_secret",
         "netease_private_key",
@@ -376,7 +382,7 @@ def test_get_form_only_exposes_netease_cookie_config(monkeypatch):
     assert "阅读与音乐" not in section_titles
     assert editable_models <= models
     assert not (models & removed_models)
-    assert "trakt_access_token" in defaults
+    assert "trakt_access_token" not in defaults
     assert not (set(defaults) & (removed_models - {"trakt_access_token"}))
 
 
@@ -448,9 +454,8 @@ def test_get_page_shows_overview_and_platform_sections(monkeypatch):
     tables = [item for item in iter_items(page) if item.get("component") == "VTable"]
 
     assert "同步概览" in texts
-    assert "Trakt 看过 1" in texts
-    assert "Trakt 在看 1" in texts
-    assert {"Trakt 视频", "微信读书", "网易云音乐", "小宇宙"} <= texts
+    assert "Trakt · 2 条历史记录" in texts
+    assert {"微信读书 · 1 本来源记录", "网易云音乐 · 1 条历史记录", "小宇宙 · 1 个播客（来源 1 条单集）"} <= texts
     assert "暂无 Trakt 同步历史记录" not in texts
     assert "暂无同步记录，执行一次同步后会在这里显示最近结果。" not in texts
     assert len(tables) == 4

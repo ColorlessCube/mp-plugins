@@ -28,7 +28,6 @@ class TraktHelper:
 
     Args:
         client_id: Trakt Client ID（必填，用于公开接口）
-        client_secret: Trakt Client Secret（可选，用于设备码授权）
         access_token: 已有的 Trakt Access Token（可选，优先于自动授权）
         username: Trakt 用户名（用于公开评分接口）
         save_data_fn: 持久化回调，签名 ``(key: str, value: Any) -> None``
@@ -36,7 +35,6 @@ class TraktHelper:
         update_config_fn: 更新插件配置回调，签名 ``(config: dict) -> None``
         send_notification_fn: 发送通知回调（可选），签名 ``(title: str, body: str) -> None``
         manual_mappings: Trakt 条目到豆瓣 subject_id 的手动映射
-        auth_mode: 授权方式，自动识别、新版 PKCE 或旧版设备码
         redirect_uri: 与 Trakt 应用登记值一致的 HTTPS 回跳地址
     """
 
@@ -51,7 +49,6 @@ class TraktHelper:
     def __init__(
         self,
         client_id: str,
-        client_secret: str,
         access_token: str,
         username: str,
         save_data_fn: Callable[[str, Any], None],
@@ -59,15 +56,12 @@ class TraktHelper:
         update_config_fn: Callable[[Dict[str, Any]], None],
         send_notification_fn: Optional[Callable[[str, str], None]] = None,
         manual_mappings: Optional[Dict[str, str]] = None,
-        auth_mode: str = "auto",
         redirect_uri: str = "",
     ):
         """初始化 Trakt 凭据、授权方式及插件持久化回调。"""
         self._client_id = client_id
-        self._client_secret = client_secret
         self._access_token = access_token
         self._username = username
-        self._auth_mode = auth_mode
         self._redirect_uri = redirect_uri
         self._save_data = save_data_fn
         self._get_data = get_data_fn
@@ -453,6 +447,8 @@ class TraktHelper:
 
         display_title = douban_info.get("alt_title", title)
 
+        if hasattr(douban_helper, "set_target_context"):
+            douban_helper.set_target_context(subject_id, "movie.douban.com", display_title, "Trakt")
         ret = douban_helper.set_watching_status(
             subject_id=subject_id,
             status="collect",
@@ -558,6 +554,8 @@ class TraktHelper:
             or title
         )
 
+        if hasattr(douban_helper, "set_target_context"):
+            douban_helper.set_target_context(subject_id, "movie.douban.com", display_title, "Trakt")
         if douban_helper.set_watching_status(
             subject_id=subject_id,
             status="do",
@@ -592,10 +590,6 @@ class TraktHelper:
         self._save_data("trakt_pkce_pending", {})
         self._update_config({"trakt_access_token": "", "trakt_authorization_url": ""})
 
-    def _uses_pkce(self) -> bool:
-        """根据显式选择或 Secret 是否存在选择授权流程。"""
-        return self._auth_mode == "pkce" or (self._auth_mode == "auto" and not self._client_secret)
-
     @staticmethod
     def _validate_redirect_uri(redirect_uri: str) -> None:
         """要求无查询参数的 HTTPS 回跳地址，避免使用本地或旧版 OOB 地址。"""
@@ -619,7 +613,8 @@ class TraktHelper:
         verifier = secrets.token_urlsafe(64)
         state = secrets.token_urlsafe(32)
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
-        self.reset_authorization()
+        # 新请求只替换待授权校验信息；用户取消或请求过期不应破坏仍可用的令牌。
+        self._save_data("trakt_pkce_pending", {})
         self._save_data("trakt_pkce_pending", {
             "client_id": self._client_id,
             "redirect_uri": self._redirect_uri,
@@ -693,7 +688,7 @@ class TraktHelper:
         1. 配置中未过期的 ``access_token``
         2. 持久化缓存中未过期的 token
         3. 使用 Refresh Token 自动续期
-        4. 旧应用启动设备码授权；PKCE 应用提示在配置页完成授权
+        4. 提示在插件配置页完成 PKCE 授权
 
         Returns:
             有效的 access_token 字符串，无法获取时返回 None。
@@ -718,15 +713,9 @@ class TraktHelper:
             logger.info("Trakt Refresh Token 续期成功")
             return self._access_token
 
-        if self._uses_pkce():
-            logger.warning("Trakt 尚未授权或需要重新授权，请在插件配置页生成 PKCE 授权链接并完成授权")
-            return None
-        if not self._client_secret:
-            logger.warning("旧版设备码授权需要 Client Secret，新应用请切换到 PKCE 授权")
-            return None
-
-        logger.info("开始 Trakt 设备码授权流程...")
-        return self._create_device_code_and_wait()
+        logger.warning("Trakt 尚未授权或需要重新授权，请在插件配置页完成 PKCE 授权")
+        self._notify("Trakt 需要重新授权", "请打开插件配置页，点击重新授权并完成浏览器授权；已有同步记录会保留。")
+        return None
 
     def _get_cached_token(self) -> Optional[str]:
         """读取持久化缓存中未过期的 Access Token。"""
@@ -749,18 +738,14 @@ class TraktHelper:
         if not refresh_token:
             return False
         url = f"{self._AUTH_BASE}/oauth/token"
-        uses_pkce = self._uses_pkce() or token_data.get("auth_mode") == "pkce"
         payload = {
             "refresh_token": refresh_token,
             "client_id": self._client_id,
             "grant_type": "refresh_token",
         }
-        if not uses_pkce:
-            payload.update({"client_secret": self._client_secret, "redirect_uri": "urn:ietf:wg:oauth:2.0:oob"})
-        else:
-            redirect_uri = token_data.get("redirect_uri") or self._redirect_uri
-            if redirect_uri:
-                payload["redirect_uri"] = redirect_uri
+        redirect_uri = token_data.get("redirect_uri") or self._redirect_uri
+        if redirect_uri:
+            payload["redirect_uri"] = redirect_uri
         try:
             resp = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
                 url=url,
@@ -770,13 +755,13 @@ class TraktHelper:
                 self._log_response_failure("Refresh Token 续期", resp, oauth=True)
                 return False
             data = resp.json()
-            return self._persist_token_response(data, auth_mode="pkce" if uses_pkce else "device",
+            return self._persist_token_response(data, auth_mode="pkce",
                                                 redirect_uri=payload.get("redirect_uri", ""))
         except Exception as e:
             logger.warning(f"Trakt Refresh Token 续期异常：{type(e).__name__}")
             return False
 
-    def _persist_token_response(self, data: Dict[str, Any], auth_mode: str = "device", redirect_uri: str = "") -> bool:
+    def _persist_token_response(self, data: Dict[str, Any], auth_mode: str = "pkce", redirect_uri: str = "") -> bool:
         """持久化 Trakt OAuth token 响应。"""
         if not isinstance(data, dict):
             return False
@@ -800,120 +785,3 @@ class TraktHelper:
         self._update_config({"trakt_access_token": access_token})
         logger.info("✅ Access Token 已保存（有效期约 %d 小时）", expires_in // 3600)
         return True
-
-    def _create_device_code_and_wait(self) -> Optional[str]:
-        """创建 Trakt 设备码并阻塞等待用户授权（最多 10 分钟）。
-
-        Returns:
-            授权成功后的 access_token，失败返回 None。
-        """
-        url = f"{self._AUTH_BASE}/oauth/device/code"
-        try:
-            resp = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
-                url=url,
-                json={"client_id": self._client_id},
-            )
-            if resp is None or resp.status_code != 200:
-                self._log_response_failure("设备码授权", resp, oauth=True)
-                return None
-
-            data = resp.json()
-            device_code = data.get("device_code")
-            user_code = data.get("user_code")
-            verification_url = data.get("verification_url")
-            interval = int(data.get("interval") or 5)
-
-            if not device_code or not user_code or not verification_url:
-                logger.warning("Trakt 设备码返回内容不完整")
-                return None
-
-            msg = (
-                f"豆瓣书影音同步 - Trakt 需要授权。\n\n"
-                f"请在浏览器打开: {verification_url}\n"
-                f"并输入授权码: {user_code}\n\n"
-                f"系统将等待 10 分钟，请在此时间内完成授权。"
-            )
-            self._notify("豆瓣书影音同步 - Trakt 授权", msg)
-            logger.info("Trakt 设备码已生成: %s", user_code)
-            logger.info("授权链接: %s", verification_url)
-            logger.info("系统将阻塞等待授权，最多等待 10 分钟...")
-
-            max_wait_seconds = 600
-            start_time = time.time()
-            attempt = 0
-
-            while time.time() - start_time < max_wait_seconds:
-                attempt += 1
-                elapsed = int(time.time() - start_time)
-                logger.info("第 %d 次尝试获取 token（已等待 %d 秒）...", attempt, elapsed)
-
-                access_token = self._exchange_device_token(device_code)
-                if access_token:
-                    logger.info("✅ 授权成功！用时 %d 秒", elapsed)
-                    self._notify(
-                        "豆瓣书影音同步 - Trakt 授权成功",
-                        f"Trakt 授权已完成，用时 {elapsed} 秒。\n未看完列表同步功能已启用。",
-                    )
-                    return access_token
-
-                time.sleep(interval)
-
-            logger.warning("❌ Trakt 授权超时（等待了 10 分钟）")
-            self._notify(
-                "豆瓣书影音同步 - Trakt 授权超时",
-                "等待授权超时（10分钟）。请重新运行同步任务或手动配置 Access Token。",
-            )
-            return None
-
-        except Exception as e:
-            logger.error(f"Trakt 设备码授权流程异常：{type(e).__name__}")
-            return None
-
-    def _exchange_device_token(self, device_code: str) -> Optional[str]:
-        """使用设备码轮询交换 Trakt Access Token。
-
-        Args:
-            device_code: 从设备码接口获取的 device_code
-
-        Returns:
-            成功时返回 access_token，等待中或失败时返回 None。
-        """
-        url = f"{self._AUTH_BASE}/oauth/device/token"
-        try:
-            resp = RequestUtils(timeout=10, headers=self._headers, proxies=settings.PROXY).post_res(
-                url=url,
-                json={
-                    "code": device_code,
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                },
-            )
-            if resp is None:
-                return None
-
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception as e:
-                    logger.debug(f"解析 Trakt Access Token 响应失败：{type(e).__name__}")
-                    return None
-
-                if self._persist_token_response(data):
-                    return self._access_token
-                return None
-
-            if resp.status_code == 400:
-                try:
-                    err = (resp.json().get("error") or "").lower()
-                except Exception:
-                    err = ""
-                if err not in ("authorization_pending", "slow_down"):
-                    self._log_response_failure("设备码交换 Token", resp, oauth=True)
-                return None
-
-            self._log_response_failure("设备码交换 Token", resp, oauth=True)
-            return None
-
-        except Exception as e:
-            logger.debug(f"交换 Trakt Token 异常：{type(e).__name__}")
-            return None

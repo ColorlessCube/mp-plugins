@@ -151,8 +151,8 @@ def test_pause_page_distinguishes_verification_from_automatic_cooldown(monkeypat
     plugin.save_data("douban_sync_state", {"requires_verification": requires_verification,
         "blocked_until": 9999999999, "reason": "test", "pending": {}})
     text = json.dumps(plugin.get_page(), ensure_ascii=False)
-    assert ("请先完成浏览器验证" in text) is requires_verification
-    assert ("冷却结束后按定时任务继续处理" in text) is not requires_verification
+    assert ("请先在浏览器完成验证" in text) is requires_verification
+    assert ("随后按定时任务继续" in text) is not requires_verification
 
 
 @pytest.mark.parametrize("payload", [{"r": False}, {"r": 1}, {}, {"r": "0"}])
@@ -180,18 +180,21 @@ def test_three_network_failures_cool_down_but_preserve_all_targets(monkeypatch):
     assert len(helper._state["pending"]) == 4
 
 
-def test_explicit_resume_consumes_switch_and_preserves_server_cooldown(monkeypatch):
-    """人工恢复不删除队列，也不绕过服务端指定冷却。"""
+def test_resume_button_preserves_queue_and_cannot_bypass_server_cooldown(monkeypatch):
+    """恢复按钮不删除队列，不允许绕过服务端冷却。"""
     module = _load_plugin_module(monkeypatch)
     plugin = module.TraktRatingsSync()
     plugin.save_data("douban_sync_state", {"requires_verification": True, "blocked_until": 9999999999,
         "pending": {"target": {"data": {"interest": "do"}}}})
     plugin.init_plugin({"douban_resume": True, "douban_write_limit": 3, "douban_write_interval": 20})
+    assert not plugin._api_douban_resume().success
     state = plugin.get_data("douban_sync_state")
-    assert not state.get("requires_verification")
-    assert state["blocked_until"] == 9999999999
-    assert "target" in state["pending"]
-    assert plugin._config_updates[-1]["douban_resume"] is False
+    assert state["requires_verification"]
+    state["blocked_until"] = 0
+    assert plugin._api_douban_resume().success
+    assert not plugin.get_data("douban_sync_state").get("requires_verification")
+    assert "target" in plugin.get_data("douban_sync_state")["pending"]
+    assert "douban_resume" not in plugin._config_updates[-1]
     assert plugin._config_updates[-1]["douban_write_limit"] == 3
 
 
@@ -278,6 +281,7 @@ def test_run_releases_lock_after_exception(monkeypatch):
     def fail():
         """模拟同步过程异常。"""
         raise RuntimeError("test")
+    plugin._enable = True
     monkeypatch.setattr(plugin, "_run_sync", fail)
     with pytest.raises(RuntimeError):
         plugin.run()

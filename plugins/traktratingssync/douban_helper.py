@@ -131,7 +131,7 @@ class DoubanHelper:
         self._persist_sync_state()
         if not already_paused:
             logger.warning("%s；已暂停豆瓣请求，待同步记录已保留", reason)
-            recovery = ("请在浏览器完成验证后更新 Cookie，或保存“恢复豆瓣同步”开关。" if seconds is None
+            recovery = ("请在浏览器完成验证后更新 Cookie，或点击“已完成验证，恢复同步”。" if seconds is None
                         else "请等待冷却结束，之后由定时同步继续处理；无需重新授权。")
             self._notify("豆瓣同步已暂停", reason + "；" + recovery)
 
@@ -381,6 +381,13 @@ class DoubanHelper:
             return False
         return isinstance(data, dict) and (data.get("code") == 103 or data.get("msg") == "need_login")
 
+    def set_target_context(self, subject_id: str, host: str, title: str, source: str) -> None:
+        """记录目标名称和来源，供详情页展示待处理项及实际同步结果。"""
+        path = "ilmen/thing" if host == "www.douban.com" else "subject"
+        url = f"https://{host}/j/{path}/{subject_id}/interest"
+        self._state.setdefault("targets", {})[url] = {"title": title, "source": source}
+        self._persist_sync_state()
+
     def _post_interest(self, url: str, referer: str, host: str, data: dict) -> bool:
         """合并最新目标状态，成功缓存命中时跳过写入，延期条目跨运行保留。"""
         desired = {key: value for key, value in data.items() if key != "ck"}
@@ -389,7 +396,10 @@ class DoubanHelper:
             self._stats["skipped"] += 1
             self._persist_sync_state()
             return True
-        self._state["pending"][url] = {"data": desired, "referer": referer, "host": host}
+        previous = self._state["pending"].get(url) or {}
+        if previous.get("data") != desired:
+            previous = {}
+        self._state["pending"][url] = {**previous, "data": desired, "referer": referer, "host": host}
         self._persist_sync_state()
         # 旧待处理条目优先，避免每日新记录持续挤占重试额度。
         if next(iter(self._state["pending"])) != url:
@@ -413,6 +423,7 @@ class DoubanHelper:
         if wait:
             time.sleep(wait)
         self._attempted.add(url)
+        entry["last_attempt_at"] = int(time.time())
         try:
             response = RequestUtils(
                 headers=self._build_headers(entry["referer"], entry["host"]), cookies=self.cookies, timeout=10,
@@ -428,6 +439,8 @@ class DoubanHelper:
         else:
             self._transient_failures = 0
         if self._check_access_response(response, writing=True):
+            entry["last_error"] = self._state.get("reason") or "等待验证或冷却"
+            self._persist_sync_state()
             self._stats["failed"] += 1
             return False
         if response is not None and response.status_code == 200:
@@ -438,10 +451,13 @@ class DoubanHelper:
             ret = payload.get("r") if isinstance(payload, dict) else None
             if ret is True or (type(ret) is int and ret == 0):
                 self._state["synced"][url] = dict(entry["data"])
+                self._state.setdefault("target_success_at", {})[url] = int(time.time())
                 self._state["pending"].pop(url, None)
                 self._stats["written"] += 1
                 self._persist_sync_state()
                 return True
+        entry["last_error"] = "网络或超时" if response is None else f"提交未确认成功（HTTP {response.status_code}）"
+        self._persist_sync_state()
         self._stats["failed"] += 1
         logger.warning("豆瓣写入未确认成功（status=%s），保留队列等待下次处理", getattr(response, "status_code", None))
         return False
