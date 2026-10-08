@@ -11,6 +11,7 @@
   - XiaoyuzhouHelper → 小宇宙 FM API（播客听取历史）
 """
 import hashlib
+import re
 import time
 from datetime import datetime, timezone
 from threading import Lock
@@ -18,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode, urlparse, urlunparse
 
 from fastapi import Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from starlette.responses import Response as HttpResponse
 
 from app.core.security import verify_resource_token
@@ -27,19 +29,27 @@ from app.schemas import Response as ApiResponse, TokenPayload
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
 from .douban_helper import DoubanHelper
+from .matching_helper import MatchingHelper
 from .netease_helper import NeteaseHelper
 from .trakt_helper import TraktHelper
 from .weread_helper import WereadHelper
 from .xiaoyuzhou_helper import XiaoyuzhouHelper
 
 
+class DoubanMatchRequest(BaseModel):
+    """接收管理员手动确认的豆瓣关联，不允许提交任意来源候选。"""
+
+    match_key: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    subject_url: str = Field(min_length=1, max_length=512)
+
+
 class TraktRatingsSync(_PluginBase):
     """豆瓣书影音同步插件入口，负责配置、调度和多平台同步编排。"""
 
     plugin_name = "豆瓣书影音同步"
-    plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影评分、剧集逐季在看/看过，微信读书阅读记录，网易云音乐专辑，小宇宙播客。"
+    plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影无需评分同步看过、剧集逐季在看/看过，微信读书、网易云专辑、小宇宙播客；支持未匹配记录处理。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.19.0"
+    plugin_version = "3.20.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -83,6 +93,7 @@ class TraktRatingsSync(_PluginBase):
     _weread_helper: Optional[WereadHelper] = None
     _netease_helper: Optional[NeteaseHelper] = None
     _xiaoyuzhou_helper: Optional[XiaoyuzhouHelper] = None
+    _matching_helper: Optional[MatchingHelper] = None
 
     # ------------------------------------------------------------------
     # 插件生命周期
@@ -132,6 +143,7 @@ class TraktRatingsSync(_PluginBase):
         self._weread_helper = None
         self._netease_helper = None
         self._xiaoyuzhou_helper = None
+        self._matching_helper = None
 
         self._init_trakt_authorization(config)
         # 清理旧配置同时迁移短期授权显示信息，现有令牌和业务设置继续保留。
@@ -149,6 +161,7 @@ class TraktRatingsSync(_PluginBase):
             send_notification_fn=lambda title, body: self._notify_issue("Trakt", title, body),
             manual_mappings=self._parse_trakt_manual_mappings(),
             redirect_uri=self._trakt_redirect_uri,
+            matching_helper=self._get_matching_helper(),
         )
 
     def _init_trakt_authorization(self, config: Dict[str, Any]) -> None:
@@ -231,11 +244,13 @@ class TraktRatingsSync(_PluginBase):
                 self._resolve_issue(source_name)
         self._douban_helper.flush_pending()
         summary = self._douban_helper.get_sync_summary()
+        summary["unmatched"] = len(self._get_matching_helper().items)
+        logger.info("豆瓣未匹配记录 %d 条，可在插件详情查看原因、安排重试或在配置页关联条目", summary["unmatched"])
         logger.info("豆瓣写入汇总: 新增成功 %d，状态未变跳过 %d，提交失败 %d，待处理 %d，暂停 %s",
                     summary["written"], summary["skipped"], summary["failed"], summary["pending"], summary["paused"])
         last_run = self.get_data("last_run") or {}
         last_run.update({**summary, "finished_at": int(time.time()),
-                         "status": "paused" if summary["paused"] else "partial" if summary["failed"] or self._source_issue_this_run else "pending" if summary["pending"] else "completed",
+                         "status": "paused" if summary["paused"] else "partial" if summary["failed"] or self._source_issue_this_run else "pending" if summary["pending"] or summary["unmatched"] else "completed",
                          "source_errors": sorted(self._source_issue_this_run)})
         self.save_data("last_run", last_run)
         if not summary["paused"] and getattr(self._douban_helper, "is_authenticated", False):
@@ -244,7 +259,7 @@ class TraktRatingsSync(_PluginBase):
             title = {"paused": "豆瓣同步已暂停", "partial": "豆瓣同步部分完成", "pending": "豆瓣同步仍有待处理"}.get(last_run["status"], "豆瓣同步完成")
             source_note = f" 未完整读取：{'、'.join(last_run['source_errors'])}。" if last_run["source_errors"] else ""
             self._send_notification(title, f"成功写入 {summary['written']} 条，跳过未变化 {summary['skipped']} 条，"
-                                    f"待处理 {summary['pending']} 条，提交失败 {summary['failed']} 条。{source_note}详情见插件页面。")
+                                    f"待写入 {summary['pending']} 条，未匹配 {summary['unmatched']} 条，提交失败 {summary['failed']} 条。{source_note}详情见插件页面。")
         logger.info("豆瓣书影音同步完成")
 
     # ------------------------------------------------------------------
@@ -259,6 +274,7 @@ class TraktRatingsSync(_PluginBase):
 
         # 初始化 Trakt helper
         self._trakt_helper = self._create_trakt_helper()
+        self._movie_rating_candidates = set()
 
         # 同步 Trakt 评分 → 豆瓣看过
         try:
@@ -269,12 +285,57 @@ class TraktRatingsSync(_PluginBase):
 
         if self._douban_helper.requests_paused:
             return
+        if self._sync_type in ("all", "movies"):
+            try:
+                self._sync_movie_history()
+            except Exception as error:
+                logger.error("电影观看历史同步异常：%s", type(error).__name__)
+                self._notify_issue("Trakt", "Trakt电影历史同步异常", "部分电影未处理，剧集同步将继续；请查看插件日志。")
+        if self._douban_helper.requests_paused:
+            return
         # 同步 Trakt 播放进度 → 豆瓣在看
         try:
             self._sync_progress()
         except Exception as e:
             logger.error("同步 Trakt 观看进度到豆瓣失败: %s", e, exc_info=True)
             self._notify_issue("Trakt", "Trakt同步异常", "本轮部分影视记录未完成，请查看插件日志。")
+
+    def _sync_movie_history(self) -> None:
+        """读取有限的最近电影观看历史；来源读取失败时保留记录，不重放旧快照。"""
+        token = self._trakt_helper.get_access_token()
+        if not token:
+            self._notify_trakt_read_issue("Trakt电影观看历史尚未授权")
+            return
+        self._trakt_helper.reset_oauth_unauthorized()
+        items = self._trakt_helper.fetch_history("movies", token, self._trakt_history_limit)
+        if self._trakt_helper.has_oauth_unauthorized():
+            token = self._trakt_helper.get_access_token(force_reauthorize=True)
+            if not token:
+                self._notify_trakt_read_issue("Trakt电影观看历史授权未完成")
+                return
+            self._trakt_helper.reset_oauth_unauthorized()
+            items = self._trakt_helper.fetch_history("movies", token, self._trakt_history_limit)
+        if items is None:
+            self._notify_trakt_read_issue("Trakt电影观看历史读取未完成")
+            return
+        self._mark_source_success("Trakt")
+        movies = self._trakt_helper.extract_watched_movies(items, self._trakt_history_days)
+        self.save_data("trakt_movie_history", movies)
+        movies = self._get_matching_helper().merge_candidates("trakt_movie", movies, TraktHelper.movie_identity)
+        movies = [item for item in movies if TraktHelper.movie_identity(item) not in getattr(self, "_movie_rating_candidates", set())]
+        finished = self.get_data("finished") or {}
+        processed = 0
+        for item in movies:
+            if self._douban_helper.requests_paused:
+                break
+            try:
+                if self._trakt_helper.sync_one_watched_movie(item, finished, self._douban_helper, self._private):
+                    processed += 1
+            except Exception as error:
+                logger.warning("电影观看历史单条处理异常：%s", type(error).__name__)
+                self._notify_issue("Trakt", "Trakt电影历史同步异常", "部分电影未处理，其他候选继续同步；请查看插件日志。")
+        self.save_data("finished", finished)
+        logger.info("Trakt电影观看历史处理完成：候选 %d，已处理 %d；无需评分，实际写入见豆瓣汇总", len(movies), processed)
 
     def _sync_ratings(self) -> None:
         """同步电影评分；剧集评分仅供核对季度后更新，不代表已看完。"""
@@ -305,15 +366,26 @@ class TraktRatingsSync(_PluginBase):
                 all_items.extend(shows)
                 logger.info("获取到 %d 条电视剧评分", len(shows))
 
-        if not all_items:
-            logger.info("未获取到 Trakt 评分或接口异常")
-            return
-
         # 按评分时间倒序，优先同步最近评分；按最大数量截断
         all_items.sort(key=lambda x: (x.get("rated_at") or "")[:19], reverse=True)
         if self._max_sync_count > 0:
             all_items = all_items[: self._max_sync_count]
             logger.info("本次最多同步 %d 条，已按最近评分取前 N 条", self._max_sync_count)
+
+        # 手动处理的旧评分仍须存在于本轮来源快照，避免重放已撤销的评分。
+        known = {TraktHelper.movie_identity(item): item for item in movies or []} if self._sync_type in ("all", "movies") and movies is not None else {}
+        selected = {TraktHelper.movie_identity(item) for item in all_items if item.get("movie")}
+        for key, record in self._get_matching_helper().items.copy().items():
+            if record.get("kind") == "trakt_rating" and self._sync_type in ("all", "movies") and movies is not None:
+                identity = record.get("identity")
+                if identity not in known:
+                    self._get_matching_helper().matched(key)
+                elif identity not in selected and self._get_matching_helper().should_retry(key):
+                    all_items.append({**known[identity], "_media_type": MediaType.MOVIE})
+
+        if not all_items:
+            logger.info("未获取到 Trakt 评分或接口异常")
+            return
 
         finished: Dict[str, Any] = self.get_data("finished") or {}
         wait_retry: Dict[str, Any] = self.get_data("wait") or {}
@@ -324,6 +396,12 @@ class TraktRatingsSync(_PluginBase):
             if self._douban_helper.requests_paused:
                 break
             media_type = item.pop("_media_type", MediaType.MOVIE)
+            if media_type == MediaType.MOVIE:
+                if not hasattr(self, "_movie_rating_candidates"):
+                    self._movie_rating_candidates = set()
+                identity = TraktHelper.movie_identity(item)
+                self._movie_rating_candidates.add(identity)
+                self._get_matching_helper().matched(MatchingHelper.make_key("trakt_movie", identity))
             try:
                 if self._trakt_helper.sync_one_rate(
                     item, finished, wait_retry, media_type,
@@ -402,6 +480,14 @@ class TraktRatingsSync(_PluginBase):
             key = ids.get("trakt") or ids.get("slug") or ids.get("imdb")
             if key and record.get("status") == "在看" and not record.get("season_tracking"):
                 candidates.setdefault(str(key), {"progress": "tracked", "show": show})
+        unmatched_seasons = [record["candidate"] for key, record in self._get_matching_helper().items.items()
+                             if record.get("kind") == "trakt_season" and self._get_matching_helper().should_retry(key)]
+        for record in unmatched_seasons:
+            show = record.get("show") or {}
+            ids = show.get("ids") or {}
+            key = ids.get("trakt") or ids.get("slug") or ids.get("imdb")
+            if key:
+                candidates.setdefault(str(key), {"progress": "retry", "show": show})
         logger.info(f"Trakt 观看记录去重后共 {len(candidates)} 个剧集，逐季核对完成状态")
         for item in candidates.values():
             if self._douban_helper.requests_paused:
@@ -419,7 +505,7 @@ class TraktRatingsSync(_PluginBase):
                         continue
                     ids = show["ids"]
                 progress = self._trakt_helper.fetch_show_progress(str(show_id), access_token)
-                seasons = self._trakt_helper.fetch_show_seasons(str(show_id))
+                seasons = self._trakt_helper.fetch_show_seasons(str(show_id), progress)
                 if self._trakt_helper.has_oauth_unauthorized():
                     refreshed = self._trakt_helper.get_access_token(force_reauthorize=True)
                     if refreshed:
@@ -440,6 +526,10 @@ class TraktRatingsSync(_PluginBase):
                                           or (record.get("show") or {}).get("ids", {}).get("slug")
                                           or (record.get("show") or {}).get("ids", {}).get("imdb")) == str(show_id)}
                 wanted_seasons = active_seasons | tracked_seasons
+                wanted_seasons.update(record.get("season") for record in unmatched_seasons
+                                      if str((record.get("show") or {}).get("ids", {}).get("trakt")
+                                             or (record.get("show") or {}).get("ids", {}).get("slug")
+                                             or (record.get("show") or {}).get("ids", {}).get("imdb")) == str(show_id))
                 wanted_seasons.discard(None)
                 legacy_key = f"{MediaType.TV.value}_{show_id}"
                 if legacy_key in watching and not watching[legacy_key].get("season_tracking"):
@@ -548,7 +638,7 @@ class TraktRatingsSync(_PluginBase):
         3. 对每本书：
            a. 先查 weread_book_id → douban_subject_id 缓存映射，命中则跳过搜索
            b. 缓存未命中时，调用 get_book_subject_id(title, author) 搜索豆瓣
-              （内部按「书名+作者 → 纯书名 → 书名截断」逐级 fallback）
+              （最多搜索「书名+作者」和纯书名两次）
            c. 搜索成功后将映射写入缓存，下次直接复用
         4. 「读完」→ 豆瓣「读过」(collect)；「在读」→ 豆瓣「在读」(do)；其余跳过
         5. 已同步过（相同 subject_id + 状态未变）则跳过，避免重复提交
@@ -598,7 +688,9 @@ class TraktRatingsSync(_PluginBase):
         skip_count = 0
         fail_count = 0
 
-        for book in books:
+        candidates = [{key: book.get(key) for key in ("book_id", "title", "author", "status", "reading_progress", "reading_time")} for book in books]
+        candidates = self._get_matching_helper().merge_candidates("weread_book", candidates, lambda book: book.get("book_id") or f"{book.get('title')}\t{book.get('author')}")
+        for book in candidates:
             if self._douban_helper.requests_paused:
                 break
             title = (book.get("title") or "").strip()
@@ -618,47 +710,18 @@ class TraktRatingsSync(_PluginBase):
                 logger.debug("跳过非在读/读完书目: %s (status=%s)", title, weread_status)
                 continue
 
-            # ── 方案 2：先查 weread_book_id 缓存映射 ──────────────────────
-            subject_id: Optional[str] = None
-            douban_title: Optional[str] = None
-
-            if weread_book_id and weread_book_id in book_id_map:
-                cached_map = book_id_map[weread_book_id]
-                subject_id = cached_map.get("subject_id")
-                douban_title = cached_map.get("douban_title")
-                logger.debug(
-                    "命中 book_id 缓存: %s → 豆瓣 %s (id=%s)",
-                    title, douban_title, subject_id,
-                )
-
-            # ── 方案 3：缓存未命中，执行 fallback 搜索 ────────────────────
+            identity = weread_book_id or f"{title}\t{author}"
+            douban_title, subject_id = self._find_douban_match(
+                "weread_book", identity, "微信读书", title, "book.douban.com", book,
+                book_id_map.get(weread_book_id) or {},
+                lambda: self._douban_helper.get_book_subject_id(title=title, author=author or None),
+            )
             if not subject_id:
-                try:
-                    douban_title, subject_id = self._douban_helper.get_book_subject_id(
-                        title=title, author=author or None
-                    )
-                except Exception as e:
-                    logger.warning("豆瓣图书搜索异常 [%s]: %s", title, e)
-                    fail_count += 1
-                    continue
-
-                if not subject_id:
-                    logger.debug("豆瓣未找到图书条目（含 fallback）: %s", title)
-                    fail_count += 1
-                    continue
-
-                # 搜索成功，写入 book_id 映射缓存
-                if weread_book_id:
-                    book_id_map[weread_book_id] = {
-                        "subject_id": subject_id,
-                        "douban_title": douban_title or title,
-                        "weread_title": title,
-                        "author": author,
-                    }
-                    logger.debug(
-                        "新增 book_id 缓存: %s (weread=%s) → 豆瓣 %s (id=%s)",
-                        title, weread_book_id, douban_title, subject_id,
-                    )
+                fail_count += 1
+                continue
+            if weread_book_id:
+                book_id_map[weread_book_id] = {"subject_id": subject_id, "douban_title": douban_title or title,
+                                              "weread_title": title, "author": author}
 
             # ── 已同步且状态未变则跳过 ────────────────────────────────────
             cached = synced.get(subject_id) or {}
@@ -751,7 +814,9 @@ class TraktRatingsSync(_PluginBase):
         skip_count = 0
         fail_count = 0
 
-        for album_info in albums:
+        candidates = [{key: album.get(key) for key in ("album", "artist", "song_count", "total_play_count")} for album in albums]
+        candidates = self._get_matching_helper().merge_candidates("netease_album", candidates, lambda album: f"{album.get('album')}\t{album.get('artist')}")
+        for album_info in candidates:
             if self._douban_helper.requests_paused:
                 break
             album_name = album_info.get("album") or ""
@@ -759,48 +824,17 @@ class TraktRatingsSync(_PluginBase):
             if not album_name:
                 continue
 
-            # ── 方案 2：先查专辑缓存映射 ──────────────────────────────────
-            # 用 tab 分隔专辑名和艺术家作为缓存 key，避免拼接歧义
             cache_key = f"{album_name}\t{artist}"
-            subject_id: Optional[str] = None
-            douban_title: Optional[str] = None
-
-            if cache_key in album_map:
-                cached_map = album_map[cache_key]
-                subject_id = cached_map.get("subject_id")
-                douban_title = cached_map.get("douban_title")
-                logger.debug(
-                    "命中专辑缓存: %s - %s → 豆瓣 %s (id=%s)",
-                    artist, album_name, douban_title, subject_id,
-                )
-
-            # ── 方案 3：缓存未命中，执行 fallback 搜索 ────────────────────
+            douban_title, subject_id = self._find_douban_match(
+                "netease_album", cache_key, "网易云音乐", album_name, "music.douban.com", album_info,
+                album_map.get(cache_key) or {},
+                lambda: self._douban_helper.get_music_subject_id(title=album_name, artist=artist or None),
+            )
             if not subject_id:
-                try:
-                    douban_title, subject_id = self._douban_helper.get_music_subject_id(
-                        title=album_name, artist=artist or None
-                    )
-                except Exception as e:
-                    logger.warning("豆瓣音乐搜索异常 [%s - %s]: %s", artist, album_name, e)
-                    fail_count += 1
-                    continue
-
-                if not subject_id:
-                    logger.debug("豆瓣未找到音乐条目（含 fallback）: %s - %s", artist, album_name)
-                    fail_count += 1
-                    continue
-
-                # 搜索成功，写入专辑缓存
-                album_map[cache_key] = {
-                    "subject_id": subject_id,
-                    "douban_title": douban_title or album_name,
-                    "album": album_name,
-                    "artist": artist,
-                }
-                logger.debug(
-                    "新增专辑缓存: %s - %s → 豆瓣 %s (id=%s)",
-                    artist, album_name, douban_title, subject_id,
-                )
+                fail_count += 1
+                continue
+            album_map[cache_key] = {"subject_id": subject_id, "douban_title": douban_title or album_name,
+                                    "album": album_name, "artist": artist}
 
             # ── 已同步过则跳过 ────────────────────────────────────────────
             if subject_id in synced:
@@ -920,7 +954,10 @@ class TraktRatingsSync(_PluginBase):
             len(episodes), len(seen_podcasts),
         )
 
-        for podcast_id, ep_info in seen_podcasts.items():
+        candidates = [{key: ep.get(key) for key in ("podcast_id", "podcast_name", "title", "is_finished", "listen_pct")} for ep in seen_podcasts.values()]
+        candidates = self._get_matching_helper().merge_candidates("xiaoyuzhou_podcast", candidates, lambda ep: ep.get("podcast_id"))
+        for ep_info in candidates:
+            podcast_id = ep_info.get("podcast_id")
             if self._douban_helper.requests_paused:
                 break
             podcast_name = ep_info.get("podcast_name", "")
@@ -937,51 +974,16 @@ class TraktRatingsSync(_PluginBase):
             else:
                 target_status = "do"
 
-            # ── 先查播客缓存映射 ───────────────────────────────────────────
-            subject_id: Optional[str] = None
-            douban_title: Optional[str] = None
-
-            if podcast_name in podcast_map:
-                cached_map = podcast_map[podcast_name]
-                subject_id = cached_map.get("subject_id")
-                douban_title = cached_map.get("douban_title")
-                logger.debug(
-                    "命中播客缓存: %s → 豆瓣 %s (id=%s)",
-                    podcast_name, douban_title, subject_id,
-                )
-
-            # ── 缓存未命中，执行搜索 ─────────────────────────────────────
+            douban_title, subject_id = self._find_douban_match(
+                "xiaoyuzhou_podcast", str(podcast_id), "小宇宙", podcast_name, "www.douban.com", ep_info,
+                podcast_map.get(podcast_name) or {},
+                lambda: self._douban_helper.get_podcast_subject_id(title=podcast_name),
+            )
             if not subject_id:
-                try:
-                    douban_title, subject_id = self._douban_helper.get_podcast_subject_id(
-                        title=podcast_name
-                    )
-                except Exception as e:
-                    logger.warning("豆瓣播客搜索异常 [%s]: %s", podcast_name, e)
-                    fail_count += 1
-                    continue
-
-                if not subject_id:
-                    logger.warning(
-                        "豆瓣未找到播客条目: %s；代表单集=%s；目标状态=%s；播放进度=%.0f%%",
-                        podcast_name,
-                        ep_info.get("title", ""),
-                        "听过" if target_status == "collect" else "在听",
-                        listen_pct * 100,
-                    )
-                    fail_count += 1
-                    continue
-
-                # 搜索成功，写入播客缓存
-                podcast_map[podcast_name] = {
-                    "subject_id": subject_id,
-                    "douban_title": douban_title or podcast_name,
-                    "podcast_name": podcast_name,
-                }
-                logger.debug(
-                    "新增播客缓存: %s → 豆瓣 %s (id=%s)",
-                    podcast_name, douban_title, subject_id,
-                )
+                fail_count += 1
+                continue
+            podcast_map[podcast_name] = {"subject_id": subject_id, "douban_title": douban_title or podcast_name,
+                                        "podcast_name": podcast_name}
 
             # ── 已同步且状态相同则跳过 ────────────────────────────────────
             if subject_id in synced:
@@ -1040,6 +1042,35 @@ class TraktRatingsSync(_PluginBase):
 # ------------------------------------------------------------------
 # 辅助工具
 # ------------------------------------------------------------------
+
+    def _get_matching_helper(self) -> MatchingHelper:
+        """延迟加载统一的未匹配状态，配置/API 与定时同步复用同一存储。"""
+        if self._matching_helper is None:
+            self._matching_helper = MatchingHelper(self.save_data, self.get_data)
+        return self._matching_helper
+
+    def _find_douban_match(self, kind: str, identity: str, source: str, title: str, host: str,
+                           candidate: dict, cached: dict, lookup: Any) -> Tuple[Optional[str], Optional[str]]:
+        """优先使用管理员关联和成功映射，失败候选按原因延期以减少重复搜索。"""
+        helper = self._get_matching_helper()
+        key = helper.prepare(kind, identity, source, title, host, candidate)
+        subject = helper.get_manual(key) or cached.get("subject_id")
+        if subject:
+            helper.matched(key)
+            return cached.get("douban_title") or title, subject
+        if not helper.should_retry(key):
+            return None, None
+        try:
+            douban_title, subject = lookup()
+        except Exception as error:
+            helper.fail(key, f"搜索暂时失败（{type(error).__name__}），稍后重试", transient=True)
+            return None, None
+        if not subject:
+            transient = bool(getattr(self._douban_helper, "search_temporarily_failed", True))
+            helper.fail(key, "搜索暂时不可用，稍后重试" if transient else "未找到对应豆瓣条目，可补充条目链接", transient=transient)
+            return None, None
+        helper.matched(key)
+        return douban_title, subject
 
     def _has_netease_source(self) -> bool:
         """判断网易云音乐是否存在可用数据源配置。"""
@@ -1296,6 +1327,12 @@ class TraktRatingsSync(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         """返回插件暴露给 MoviePilot 的 API 定义。"""
         return [
+            {"path": "/matches/associate", "endpoint": self._api_match_associate, "methods": ["POST"],
+             "summary": "关联未匹配记录的豆瓣条目", "response_model": ApiResponse,
+             "allow_anonymous": True, "dependencies": [Depends(self._verify_trakt_callback_admin)]},
+            {"path": "/matches/{match_key}/retry", "endpoint": self._api_match_retry, "methods": ["POST"],
+             "summary": "下次同步重新匹配记录", "response_model": ApiResponse,
+             "allow_anonymous": True, "dependencies": [Depends(self._verify_trakt_callback_admin)]},
             {"path": "/oauth/start", "endpoint": self._api_trakt_start, "methods": ["POST"],
              "summary": "生成 Trakt PKCE 授权链接", "response_model": ApiResponse,
              "allow_anonymous": True, "dependencies": [Depends(self._verify_trakt_callback_admin)]},
@@ -1307,7 +1344,7 @@ class TraktRatingsSync(_PluginBase):
                 "endpoint": self._api_sync,
                 "methods": ["GET", "POST"],
                 "summary": "手动执行同步",
-                "description": "立即执行一次 Trakt 评分同步到豆瓣",
+                "description": "按共享额度执行一次书影音同步，包括无需评分的电影观看历史",
                 "response_model": ApiResponse,
             },
             {
@@ -1322,6 +1359,43 @@ class TraktRatingsSync(_PluginBase):
                 "dependencies": [Depends(self._verify_trakt_callback_admin)],
             },
         ]
+
+    def _api_match_associate(self, body: DoubanMatchRequest) -> ApiResponse:
+        """仅接受已有未匹配记录与同类型豆瓣条目，保存关联后等待正常同步。"""
+        if not self._run_lock.acquire(blocking=False):
+            return ApiResponse(success=False, message="同步正在运行，请结束后处理未匹配记录")
+        try:
+            record = self._get_matching_helper().items.get(body.match_key)
+            if not record:
+                return ApiResponse(success=False, message="记录已处理或不存在，请重新打开配置页")
+            value = body.subject_url.strip()
+            if re.fullmatch(r"[0-9]{1,20}", value):
+                subject = value
+            else:
+                parsed = urlparse(value)
+                path = "podcast" if record["host"] == "www.douban.com" else "subject"
+                match = re.fullmatch(rf"/{path}/([0-9]{{1,20}})/?", parsed.path)
+                if (parsed.scheme != "https" or parsed.netloc != record["host"] or not match
+                        or parsed.query or parsed.fragment):
+                    return ApiResponse(success=False, message=f"请填写 https://{record['host']}/{path}/条目ID/ 或数字ID；剧集请确认对应季度")
+                subject = match.group(1)
+            if not int(subject):
+                return ApiResponse(success=False, message="豆瓣条目ID必须大于0")
+            self._get_matching_helper().associate(body.match_key, subject)
+            return ApiResponse(success=True, message="关联已保存，下次同步将按写入额度处理；无需再次保存配置")
+        finally:
+            self._run_lock.release()
+
+    def _api_match_retry(self, match_key: str) -> ApiResponse:
+        """解除一条记录的匹配延期，不立即搜索或写入豆瓣。"""
+        if not self._run_lock.acquire(blocking=False):
+            return ApiResponse(success=False, message="同步正在运行，请结束后再重试")
+        try:
+            if not re.fullmatch(r"[a-f0-9]{64}", match_key) or not self._get_matching_helper().retry(match_key):
+                return ApiResponse(success=False, message="记录已处理或不存在，请刷新插件详情页")
+            return ApiResponse(success=True, message="已安排下次同步重新匹配，不会立即增加豆瓣请求")
+        finally:
+            self._run_lock.release()
 
     @staticmethod
     def _verify_trakt_callback_admin(payload: TokenPayload = Depends(verify_resource_token)) -> TokenPayload:
@@ -1490,7 +1564,7 @@ class TraktRatingsSync(_PluginBase):
             auth_text = "上次授权链接已过期，请重新生成并在10分钟内完成授权"
         trakt = [
             row(field("trakt_username", "Trakt 用户名", hint="用于读取公开评分，仍需保留"), field("trakt_client_id", "Trakt Client ID")),
-            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "剧集无需评分：全季已播完且每集看过才标记看过；整剧评分只更新已核对季度的星级，不代表看完。写入前保留豆瓣已有短评、标签及未由来源指定的评分。"},
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "电影、剧集均无需评分：电影依据最近已观看历史同步看过；剧集全季已播完且每集看过才标记看过。整剧评分只更新已核对季度的星级，不代表看完。写入前保留豆瓣已有短评、标签及未由来源指定的评分。"},
             field("trakt_redirect_uri", "Trakt HTTPS 回跳地址", hint=f"填写 MoviePilot 的 HTTPS 域名 + {self._trakt_callback_path}，并与 Trakt 后台一致", **{"persistent-hint": True}),
             {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "{{ _ui_trakt_message }}"}},
             {"component": "div", "props": {"class": "d-flex flex-wrap ga-3 my-3"}, "content": [self._config_action_button("重新授权" if authorized else "生成授权链接", "oauth/start", "_ui_trakt_message")]},
@@ -1509,7 +1583,7 @@ class TraktRatingsSync(_PluginBase):
                                          field("douban_write_interval", "写入最小间隔（秒）", type="number", min=5, hint="默认10秒，实际间隔10–20秒")),
             heading("Trakt 读取范围"), row(select("sync_type", "Trakt 影视同步范围", [("电影和剧集", "all"), ("仅电影", "movies"), ("仅剧集", "shows")]),
                                          field("max_sync_count", "Trakt 最近评分读取上限", type="number", min=0, hint="0表示不限制；不影响其他平台及豆瓣写入额度")),
-            row(field("trakt_history_limit", "剧集观看历史读取条数", type="number", min=1), field("trakt_history_days", "剧集历史范围（天）", type="number", min=0, hint="0表示不限天数")),
+            row(field("trakt_history_limit", "电影/剧集各自的历史读取条数", type="number", min=1), field("trakt_history_days", "观看历史范围（天）", type="number", min=0, hint="默认30天；0表示不限天数，仍受读取条数限制")),
             {"component": "VTextarea", "props": {"model": "trakt_manual_mappings", "label": "Trakt → 豆瓣手动映射", "rows": 2, "placeholder": "show:123:s2=12345678", "hint": "逐季映射使用show:TraktID:s季号=豆瓣ID；旧通用映射仅用于第1季", "persistent-hint": True, "auto-grow": True}},
             heading("各平台读取数量"), row(field("weread_limit", "微信读书读取本数", type="number", min=1), field("netease_limit", "网易云读取专辑数", type="number", min=1)),
             field("xiaoyuzhou_limit", "小宇宙读取单集数", type="number", min=1),
@@ -1528,6 +1602,18 @@ class TraktRatingsSync(_PluginBase):
                                 credential("bark_webhook_url", "Bark 地址", "优先填写服务器/设备Key，不必附带标题和正文", show="{{ notification_channel === 'bark' }}")]),
             self._fold("高级设置", advanced),
         ]}]
+        unmatched = self._get_matching_helper().items
+        if unmatched:
+            button = self._config_action_button("保存豆瓣关联", "matches/associate", "_ui_match_message")
+            handler = button["props"]["onClick"]
+            handler = handler.replace("credentials: 'same-origin'", "credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({match_key: model._ui_match_key, subject_url: model._ui_match_url})")
+            handler = handler.replace("model._ui_douban_paused = false;", "model._ui_match_url = '';")
+            button["props"]["onClick"] = handler
+            form[0]["content"].insert(5, self._fold(f"处理未匹配记录 · {len(unmatched)} 条", [
+                select("_ui_match_key", "选择未匹配记录", [(f"{record['source']} · {record['title']}", key) for key, record in unmatched.items()]),
+                field("_ui_match_url", "对应豆瓣条目链接", hint="填写对应类型的豆瓣完整HTTPS链接或数字ID；剧集必须对应这一季", **{"persistent-hint": True}),
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "{{ _ui_match_message }}"}}, button,
+            ]))
         return form, {"enable": False, "private": True, "cron": "0 2 * * *", "douban_cookie": "",
                       "trakt_username": "", "trakt_client_id": "", "trakt_redirect_uri": "", "trakt_manual_mappings": "",
                       "weread_api_key": "", "netease_cookie": "", "xiaoyuzhou_cookie": "",
@@ -1536,7 +1622,9 @@ class TraktRatingsSync(_PluginBase):
                       "douban_write_limit": 10, "douban_write_interval": 10,
                       "notification_mode": "changes", "notification_channel": "moviepilot", "bark_webhook_url": "",
                       "_ui_busy": False, "_ui_trakt_url": url, "_ui_trakt_message": auth_text,
-                      "_ui_douban_paused": bool(state.get("requires_verification")), "_ui_douban_message": state.get("reason") or ""}
+                      "_ui_douban_paused": bool(state.get("requires_verification")), "_ui_douban_message": state.get("reason") or "",
+                      "_ui_match_key": next(iter(unmatched), ""), "_ui_match_url": "",
+                      "_ui_match_message": "详情页可查看原因或安排重新匹配；手动关联保存后由下次同步处理。"}
 
     def get_page(self) -> Optional[List[dict]]:
         """展示本轮真实写入汇总、异常和待处理明细，来源状态单独标识。"""
@@ -1555,6 +1643,7 @@ class TraktRatingsSync(_PluginBase):
 
         state = self.get_data("douban_sync_state") or {}
         pending = state.get("pending") or {}
+        unmatched = self._get_matching_helper().items
         actual = state.get("synced") or {}
         targets = state.get("targets") or {}
 
@@ -1588,7 +1677,7 @@ class TraktRatingsSync(_PluginBase):
                 {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 my-3"}, "content": [
                     {"component": "VChip", "props": {"variant": "tonal"}, "text": f"{label} {count}"} for label, count in (
                         ("本轮写入", run.get("written", 0)), ("未变化跳过", run.get("skipped", 0)),
-                        ("提交失败", run.get("failed", 0)), ("待处理", len(pending)),
+                        ("提交失败", run.get("failed", 0)), ("待写入", len(pending)), ("未匹配", len(unmatched)),
                     )]},
         ]
         issues = self.get_data("notification_issues") or {}
@@ -1609,6 +1698,15 @@ class TraktRatingsSync(_PluginBase):
                 reason = entry.get("last_error") or (state.get("reason") if paused else "等待后续写入额度")
                 rows.append([context.get("title") or f"豆瓣条目 {subject}", context.get("source") or "历史待处理", reason, link(subject, entry.get("host", "www.douban.com"))])
             page.append(self._fold(f"待处理记录 · {len(pending)} 条（最近20条）", [table(["名称", "来源", "原因", "链接"], rows)]))
+
+        if unmatched:
+            rows = [[record.get("title", "未知"), record.get("source", ""), record.get("reason", ""),
+                     timestamp(record.get("retry_after")), {"component": "td", "content": [self._action_button("下次重新匹配", f"matches/{key}/retry", running)]}]
+                    for key, record in sorted(unmatched.items(), key=lambda pair: pair[1].get("last_seen_at", 0), reverse=True)]
+            page.append(self._fold(f"未匹配记录 · {len(unmatched)} 条", [
+                {"component": "div", "text": "自动匹配失败不会写入豆瓣；可安排重试，或在插件配置的“处理未匹配记录”中补充对应豆瓣链接。"},
+                table(["名称", "来源", "原因", "自动重试时间", "操作"], rows),
+            ]))
 
         successful_times = state.get("target_success_at") or {}
         if successful_times:
@@ -1669,6 +1767,6 @@ class TraktRatingsSync(_PluginBase):
             podcast_rows.append([name, "听完" if ep.get("is_finished") else f"进度 {ep.get('listen_pct', 0) * 100:.0f}%", sync_status(subject, "www.douban.com", expected, legacy), link(subject, "www.douban.com")])
         if podcasts:
             page.append(self._fold(f"小宇宙 · {len(podcasts)} 个播客（来源 {len(episodes)} 条单集）", [table(["播客", "来源收听状态", "豆瓣同步结果", "链接"], podcast_rows)]))
-        if not any((video, books, albums, episodes, pending)):
+        if not any((video, books, albums, episodes, pending, unmatched)):
             page.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "暂无同步记录，执行一次同步后会在这里显示最近结果。"}})
         return page

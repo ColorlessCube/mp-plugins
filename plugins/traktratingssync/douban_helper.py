@@ -115,6 +115,12 @@ class DoubanHelper:
         self._last_search_ts = 0.0
         self._search_forbidden_until = 0.0
         self._search_forbidden_count = 0
+        self._search_temporarily_failed = False
+
+    @property
+    def search_temporarily_failed(self) -> bool:
+        """区分搜索不可用和有效空结果，避免将暂时异常缓存成不存在。"""
+        return self._search_temporarily_failed
 
     @property
     def requests_paused(self) -> bool:
@@ -399,13 +405,17 @@ class DoubanHelper:
                    and (key != "rating" or value)}
         if "interest" in desired:
             desired.setdefault("private", "")
+        previous = self._state["pending"].get(url) or {}
+        queued_rating = (previous.get("data") or {}).get("rating")
+        if queued_rating and "rating" not in desired:
+            # 无评分只表示保留星级，不能清除前序来源尚未提交的明确评分。
+            desired["rating"] = queued_rating
         cached = self._state["synced"].get(url)
         if cached is not None and all(cached.get(key, "") == value for key, value in desired.items()):
             self._state["pending"].pop(url, None)
             self._stats["skipped"] += 1
             self._persist_sync_state()
             return True
-        previous = self._state["pending"].get(url) or {}
         if previous.get("data") != desired:
             previous = {}
         self._state["pending"][url] = {**previous, "data": desired, "referer": referer, "host": host}
@@ -524,6 +534,7 @@ class DoubanHelper:
 
     def _search_subject(self, keyword: str, cat: str) -> Tuple[Optional[str], Optional[str]]:
         """通用豆瓣搜索（cat=1001图书/1002影视/1003音乐），返回 (title, subject_id)"""
+        self._search_temporarily_failed = True
         if self._is_search_blocked():
             return None, None
         self._sleep_before_request("搜索")
@@ -548,6 +559,7 @@ class DoubanHelper:
             )
             return None, None
         soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
+        self._search_temporarily_failed = False
         for div in soup.find_all("div", class_="title"):
             a_tag = div.find_all("a")
             if not a_tag:
@@ -562,6 +574,7 @@ class DoubanHelper:
 
     def _search_podcast_subject(self, keyword: str) -> Tuple[Optional[str], Optional[str]]:
         """搜索豆瓣播客条目，返回 (title, subject_id)。"""
+        self._search_temporarily_failed = True
         if self._is_search_blocked():
             return None, None
         self._sleep_before_request("播客搜索")
@@ -591,6 +604,7 @@ class DoubanHelper:
                 data = {}
             douban_title, subject_id = self._parse_podcast_rexxar_result(keyword, data)
             if subject_id:
+                self._search_temporarily_failed = False
                 return douban_title, subject_id
             logger.debug("豆瓣 rexxar 播客搜索未命中: %s", keyword)
         elif not need_login and (not response or response.status_code != 200):
@@ -629,6 +643,7 @@ class DoubanHelper:
             return None, None
 
         soup = BeautifulSoup(response.text.encode("utf-8"), "lxml")
+        self._search_temporarily_failed = False
         for a in soup.find_all("a", href=True):
             link = unquote(a.get("href", ""))
             match = re.search(r"/(?:podcast|subject)/(\d+)(?:/|$|\?)", link)
@@ -709,8 +724,7 @@ class DoubanHelper:
         搜索策略（逐级 fallback，找到即返回）：
         1. 「书名 + 作者」（精度最高）
         2. 纯书名（去掉作者，兼容作者名不一致的情况）
-        3. 书名逐字截断（每次去掉最后一个字，最短保留 4 字），
-           用于处理微信读书书名含版本号/括号等后缀的情况
+        最多搜索两次，不逐字截断书名，避免请求突增及误匹配。
         """
         if not title:
             return None, None
@@ -726,16 +740,6 @@ class DoubanHelper:
         result = self._search_subject(title, "1001")
         if result[1]:
             return result
-        logger.debug("豆瓣图书纯书名未命中，尝试截断搜索: %s", title)
-
-        # 策略 3：书名逐字截断（最短保留 4 字）
-        for length in range(len(title) - 1, 3, -1):
-            short_title = title[:length]
-            result = self._search_subject(short_title, "1001")
-            if result[1]:
-                logger.debug("豆瓣图书截断命中 [%s → %s]", title, short_title)
-                return result
-
         return None, None
 
     def get_music_subject_id(
@@ -848,7 +852,7 @@ class DoubanHelper:
         if not title:
             return None, None
 
-        for keyword in self._podcast_search_candidates(title):
+        for keyword in self._podcast_search_candidates(title)[:2]:
             douban_title, subject_id = self._search_podcast_subject(keyword)
             if subject_id:
                 if keyword != title:

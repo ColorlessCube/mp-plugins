@@ -141,6 +141,13 @@ def _install_helper_stubs(monkeypatch):
         module.__path__ = []
         monkeypatch.setitem(sys.modules, name, module)
 
+    matching_path = Path(__file__).resolve().parents[1] / "plugins/traktratingssync/matching_helper.py"
+    matching_name = "plugins.traktratingssync.matching_helper"
+    spec = importlib.util.spec_from_file_location(matching_name, matching_path)
+    matching_module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, matching_name, matching_module)
+    spec.loader.exec_module(matching_module)
+
     monkeypatch.setitem(
         sys.modules,
         "plugins.traktratingssync.douban_helper",

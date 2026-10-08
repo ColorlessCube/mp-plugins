@@ -415,6 +415,11 @@ def _load_progress_plugin(monkeypatch, helper_module):
         monkeypatch.setitem(sys.modules, f"{package_name}.{helper_name}",
                             types.SimpleNamespace(**{class_name: object}))
     plugin_path = Path(helper_module.__file__).with_name("__init__.py")
+    matching_name = f"{package_name}.matching_helper"
+    matching_spec = importlib.util.spec_from_file_location(matching_name, plugin_path.with_name("matching_helper.py"))
+    matching_module = importlib.util.module_from_spec(matching_spec)
+    monkeypatch.setitem(sys.modules, matching_name, matching_module)
+    matching_spec.loader.exec_module(matching_module)
     spec = importlib.util.spec_from_file_location(package_name, plugin_path,
                                                 submodule_search_locations=[str(plugin_path.parent)])
     module = importlib.util.module_from_spec(spec)

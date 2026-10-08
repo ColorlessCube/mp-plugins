@@ -14,7 +14,7 @@ import random
 import re
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
@@ -61,6 +61,7 @@ class TraktHelper:
         send_notification_fn: Optional[Callable[[str, str], None]] = None,
         manual_mappings: Optional[Dict[str, str]] = None,
         redirect_uri: str = "",
+        matching_helper: Any = None,
     ):
         """初始化 Trakt 凭据、授权方式及插件持久化回调。"""
         self._client_id = client_id
@@ -78,6 +79,8 @@ class TraktHelper:
         }
         self._last_oauth_unauthorized = False
         self._request_issue_kind = "temporary"
+        self._matching = matching_helper
+        self._match_transient = False
 
         # 实例级基础请求头（含 api-key，避免每处重复构建）
         self._headers = {
@@ -333,9 +336,102 @@ class TraktHelper:
         """读取整部剧的逐季逐集观看记录，包含隐藏季并排除特别篇。"""
         return self._fetch_show_completion_data(show_id, "progress/watched", access_token)
 
-    def fetch_show_seasons(self, show_id: str) -> Optional[List[Dict[str, Any]]]:
+    def fetch_show_seasons(self, show_id: str, progress: Optional[Dict[str, Any]] = None) -> Optional[List[Dict[str, Any]]]:
         """读取各季总集数与已播集数，避免把追平更新误判为全季看完。"""
-        return self._fetch_show_completion_data(show_id, "seasons")
+        cache = dict(self._get_data("trakt_seasons") or {})
+        entry = cache.get(str(show_id)) or {}
+        metadata = entry.get("seasons")
+        fresh = isinstance(metadata, list) and time.time() - entry.get("fetched_at", 0) < 21600
+        if fresh and progress:
+            counts = {item.get("number"): item.get("aired_episodes") for item in metadata if isinstance(item, dict)}
+            fresh = all(counts.get(item.get("number")) == item.get("aired")
+                        for item in progress.get("seasons") or [] if isinstance(item, dict) and item.get("number", 0) > 0)
+        if fresh:
+            logger.debug("复用 Trakt 季度资料缓存：%s", show_id)
+            return metadata
+        metadata = self._fetch_show_completion_data(show_id, "seasons")
+        if metadata is not None:
+            cache[str(show_id)] = {"fetched_at": int(time.time()), "seasons": metadata}
+            cache = dict(sorted(cache.items(), key=lambda item: item[1].get("fetched_at", 0), reverse=True)[:256])
+            self._save_data("trakt_seasons", cache)
+        return metadata
+
+    @staticmethod
+    def movie_identity(item: Dict[str, Any]) -> str:
+        """提取电影稳定标识，供观看历史去重及失败匹配重试使用。"""
+        movie = item.get("movie") or {}
+        ids = movie.get("ids") or {}
+        return str(ids.get("trakt") or ids.get("slug") or ids.get("imdb") or ids.get("tmdb") or f"{movie.get('title')}_{movie.get('year')}")
+
+    @staticmethod
+    def extract_watched_movies(items: List[Dict[str, Any]], days: int) -> List[Dict[str, Any]]:
+        """仅接受有有效观看日期的电影历史，过滤未来日期、过旧记录和重复观看。"""
+        result, seen = [], set()
+        now = datetime.now(timezone.utc)
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") != "movie" or not isinstance(item.get("movie"), dict):
+                continue
+            try:
+                watched = datetime.fromisoformat(item["watched_at"].replace("Z", "+00:00"))
+                if watched.tzinfo is None or watched > now or (days > 0 and (now - watched).days > days):
+                    continue
+            except (KeyError, AttributeError, TypeError, ValueError):
+                continue
+            identity = TraktHelper.movie_identity(item)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            movie = item["movie"]
+            result.append({"type": "movie", "watched_at": item["watched_at"],
+                           "movie": {"title": movie.get("title"), "year": movie.get("year"), "ids": movie.get("ids") or {}}})
+        return result
+
+    def sync_one_watched_movie(self, item: Dict[str, Any], finished: Dict[str, Any], douban_helper: Any, private: bool) -> bool:
+        """将明确的电影观看历史同步为看过；未评分时只更新状态并保留实时星级。"""
+        movie = item.get("movie") or {}
+        ids = movie.get("ids") or {}
+        identity = self.movie_identity(item)
+        key = f"{MediaType.MOVIE}_{identity}"
+        match_key = self._prepare_match("trakt_movie", identity, movie.get("title", "未知"), item)
+        previous = finished.get(key) or {}
+        if previous.get("douban_id") and previous.get("private", private) == private:
+            if self._matching:
+                self._matching.matched(match_key)
+            douban_helper.record_unchanged()
+            return True
+        subject = (self._matching.get_manual(match_key) or self._matching.get_manual(self._matching.make_key("trakt_rating", identity)) if self._matching else None) or previous.get("douban_id") or self._lookup_manual_douban_id(movie, MediaType.MOVIE, key)
+        if not subject and self._matching and not self._matching.should_retry(match_key):
+            return False
+        info = {}
+        if not subject:
+            info = self._resolve_douban_info(ids.get("tmdb"), ids.get("imdb"), movie.get("title"), movie.get("year"), MediaType.MOVIE)
+            subject = info.get("id")
+        if not subject:
+            if self._matching:
+                self._matching.fail(match_key, "电影尚未匹配到豆瓣，请补充对应条目链接", transient=self._match_transient)
+            return False
+        if self._matching:
+            self._matching.matched(match_key)
+        title = info.get("title") or previous.get("title") or movie.get("title", "未知")
+        douban_helper.set_target_context(str(subject), "movie.douban.com", title, "Trakt")
+        if not douban_helper.set_watching_status(subject_id=str(subject), status="collect", private=private, rating=None):
+            return False
+        finished[key] = {**previous, "douban_id": str(subject), "title": title, "en_title": movie.get("title"),
+                         "year": movie.get("year"), "media_type": MediaType.MOVIE.value, "status": "看完", "private": private,
+                         "watched_at": item.get("watched_at"), "sync_time": int(time.time())}
+        logger.info("电影观看历史同步成功：%s → 看过（无需评分）", title)
+        return True
+
+    def _prepare_match(self, kind: str, identity: str, title: str, candidate: Dict[str, Any]) -> str:
+        """共享匹配状态只保存最小媒体信息，不传递 OAuth 或 HTTP 响应。"""
+        if not self._matching:
+            return ""
+        media_key = "show" if kind == "trakt_season" else "movie"
+        media = candidate.get(media_key) or {}
+        safe = {key: candidate[key] for key in ("rating", "rated_at", "type", "watched_at", "season", "season_year") if key in candidate}
+        safe[media_key] = {"title": media.get("title"), "year": media.get("year"),
+                           "ids": {key: value for key, value in (media.get("ids") or {}).items() if key in ("trakt", "slug", "imdb", "tmdb")}}
+        return self._matching.prepare(kind, identity, "Trakt", title, "movie.douban.com", safe)
 
     def fetch_show_details(self, show_id: str) -> Optional[Dict[str, Any]]:
         """为未保存媒体ID的旧在看缓存补全剧集信息，成功后私下缓存以免重复查询。"""
@@ -426,6 +522,7 @@ class TraktHelper:
             try:
                 tmdb_info = await media_chain.async_tmdb_info(tmdbid=int(tmdb_id), mtype=mtype) if tmdb_id else {}
                 if tmdb_id and not tmdb_info:
+                    self._match_transient = True
                     return {}
                 # 核心的按 TMDB ID 桥接目前未透传季号，逐季状态必须显式调用按季匹配。
                 info = await media_chain.async_match_doubaninfo(
@@ -435,6 +532,7 @@ class TraktHelper:
                 # 整剧IMDb会触发核心的优先直返路径，该路径不核对季号，逐季匹配必须禁用它。
                 return info if self._matches_douban_season(info, season, season_year) else {}
             except Exception as error:
+                self._match_transient = True
                 logger.warning(f"豆瓣第{season}季匹配失败：{type(error).__name__}")
                 return {}
         if tmdb_id:
@@ -446,6 +544,7 @@ class TraktHelper:
                     logger.debug("MoviePilot 映射豆瓣信息 (TMDB %s): %s", tmdb_id, douban_info)
                     return douban_info
             except Exception as e:
+                self._match_transient = True
                 logger.debug("MoviePilot TMDB %s 映射豆瓣失败: %s", tmdb_id, e)
             return {}
 
@@ -461,6 +560,7 @@ class TraktHelper:
                     logger.debug("MoviePilot 兜底映射豆瓣信息 (%s): %s", imdb_id or title, douban_info)
                     return douban_info
             except Exception as e:
+                self._match_transient = True
                 logger.debug("MoviePilot IMDb/标题兜底映射豆瓣失败 %s: %s", title, e)
         return douban_info or {}
 
@@ -475,6 +575,7 @@ class TraktHelper:
         season_year: Optional[str] = None,
     ) -> Dict[str, Any]:
         """同步包装异步豆瓣匹配，内部通过 global_vars.loop 执行协程。"""
+        self._match_transient = False
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self._get_douban_info_by_tmdb(tmdb_id, imdb_id, title=title, year=year, mtype=media_type,
@@ -483,6 +584,7 @@ class TraktHelper:
             )
             return future.result(timeout=30) or {}
         except Exception as e:
+            self._match_transient = True
             logger.warning("匹配豆瓣失败 %s (%s): %s", title, year, e)
             return {}
 
@@ -569,10 +671,6 @@ class TraktHelper:
         title = media.get("title", "未知")
         year = media.get("year")
 
-        if not tmdb_id and not imdb_id:
-            logger.warning("Trakt 条目无 tmdb/imdb: %s (%s)", title, year)
-            return False
-
         key = f"{media_type}_{str(trakt_id) if trakt_id else slug or f'{title}_{year}'}"
         # 整剧评分不能证明任何一季已看完，也不能确定第一季就是当前观看季。
         if media_type == MediaType.TV:
@@ -591,7 +689,11 @@ class TraktHelper:
                 logger.debug("已同步过且评分未变，跳过: %s", title)
                 return True
 
-        subject_id = self._lookup_manual_douban_id(media, media_type, key)
+        candidate = {"movie": media, "rating": trakt_rating, "rated_at": item.get("rated_at")}
+        match_key = self._prepare_match("trakt_rating", self.movie_identity(candidate), title, candidate)
+        subject_id = (self._matching.get_manual(match_key) or self._matching.get_manual(self._matching.make_key("trakt_movie", self.movie_identity(candidate))) if self._matching else None) or (finished.get(key) or {}).get("douban_id") or self._lookup_manual_douban_id(media, media_type, key)
+        if not subject_id and self._matching and not self._matching.should_retry(match_key):
+            return False
         douban_info: Dict[str, Any] = {}
         if not subject_id:
             douban_info = self._resolve_douban_info(
@@ -599,6 +701,8 @@ class TraktHelper:
             )
             subject_id = douban_info.get("id")
         if not subject_id:
+            if self._matching:
+                self._matching.fail(match_key, "电影评分条目尚未匹配到豆瓣，请补充对应条目链接", transient=self._match_transient)
             logger.warning(
                 "Trakt 条目未匹配到豆瓣信息: %s (%s), tmdb=%s, imdb=%s, trakt=%s, rating=%s",
                 title, year, tmdb_id, imdb_id, trakt_id or slug, trakt_rating,
@@ -612,6 +716,9 @@ class TraktHelper:
                     "media_type": media_type.value,
                 }
             return False
+
+        if self._matching:
+            self._matching.matched(match_key)
 
         display_title = douban_info.get("alt_title", title)
 
@@ -758,6 +865,7 @@ class TraktHelper:
             return False
         season = item["season"]
         key = f"{MediaType.TV.value}_{show_id}_s{season}"
+        match_key = self._prepare_match("trakt_season", f"{show_id}:s{season}", f"{show.get('title', '未知')} 第{season}季", item)
         previous = watching.get(key) or {}
         if (previous and not previous.get("match_verified") and season > 1
                 and not self._matches_douban_season({"title": previous.get("title")}, season, None)):
@@ -768,15 +876,19 @@ class TraktHelper:
                 if old.get("season") is None and old.get("douban_id") == previous.get("douban_id"):
                     old["season_tracking"] = False
             previous = {}
-        subject = self._lookup_manual_douban_id(show, MediaType.TV, key, season=season)
+        subject = (self._matching.get_manual(match_key) if self._matching else None) or self._lookup_manual_douban_id(show, MediaType.TV, key, season=season)
         info = {}
         if not subject:
             subject = previous.get("douban_id") if previous.get("match_verified") else None
+        if not subject and self._matching and not self._matching.should_retry(match_key):
+            return False
         if not subject:
             info = self._resolve_douban_info(ids.get("tmdb"), ids.get("imdb"), show.get("title"), show.get("year"),
                                              MediaType.TV, season=season, season_year=item.get("season_year"))
             subject = info.get("id")
         if not subject:
+            if self._matching:
+                self._matching.fail(match_key, "季度未找到可确认的豆瓣条目，请补充这一季的链接", transient=self._match_transient)
             logger.warning(f"Trakt 剧集第{season}季未匹配到豆瓣，保留原有状态：{show.get('title')}")
             return False
         subject = str(subject)
@@ -790,8 +902,12 @@ class TraktHelper:
                        or (record.get("show") or {}).get("ids", {}).get("slug")
                        or (record.get("show") or {}).get("ids", {}).get("imdb")) == str(show_id)
                for record in watching.values() if record.get("season") is not None):
+            if self._matching:
+                self._matching.fail(match_key, "不同季度指向同一豆瓣条目，请核对季度链接")
             logger.warning(f"豆瓣季度条目冲突，跳过第{season}季：{show.get('title')}")
             return False
+        if self._matching:
+            self._matching.matched(match_key)
         actual = ((self._get_data("douban_sync_state") or {}).get("synced") or {}).get(
             f"https://movie.douban.com/j/subject/{subject}/interest", {})
         if actual.get("interest") == "collect":
