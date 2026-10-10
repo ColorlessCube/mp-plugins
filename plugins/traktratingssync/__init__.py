@@ -28,6 +28,7 @@ from app.plugins import _PluginBase
 from app.schemas import Response as ApiResponse, TokenPayload
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
+from .ass_cookie_helper import AssCookieError, AssCookieHelper, CredentialRequestUtils
 from .douban_helper import DoubanHelper
 from .matching_helper import MatchingHelper
 from .netease_helper import NeteaseHelper
@@ -49,7 +50,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影无需评分同步看过、剧集逐季在看/看过，微信读书、网易云专辑、小宇宙播客；支持未匹配记录处理。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.20.0"
+    plugin_version = "3.21.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -65,6 +66,9 @@ class TraktRatingsSync(_PluginBase):
     _trakt_auth_message: str = ""
     _trakt_manual_mappings: str = ""
     _douban_cookie: str = ""
+    _douban_cookie_source: str = "manual"
+    _netease_cookie_source: str = "manual"
+    _ass_config: Dict[str, Any] = {}
     _douban_write_limit: int = 10
     _douban_write_interval: int = 10
     _run_lock = Lock()
@@ -116,6 +120,13 @@ class TraktRatingsSync(_PluginBase):
             self.save_data("trakt_token", token_data)
         self._trakt_manual_mappings = (config.get("trakt_manual_mappings") or "").strip()
         self._douban_cookie = (config.get("douban_cookie") or "").strip()
+        self._douban_cookie_source = config.get("douban_cookie_source", "manual")
+        self._netease_cookie_source = config.get("netease_cookie_source", "manual")
+        # 只保存非敏感连接与身份引用，不接受表单中的 Read Key 或 ASS Cookie。
+        self._ass_config = {key: config.get(key, default) for key, default in self._ass_defaults().items()}
+        age = self._ass_config["ass_max_age"]
+        if isinstance(age, str) and re.fullmatch(r"[0-9]{1,6}", age):
+            self._ass_config["ass_max_age"] = int(age)
         self._douban_write_limit = max(1, int(config.get("douban_write_limit") or 10))
         self._douban_write_interval = max(5, int(config.get("douban_write_interval") or 10))
         self._weread_api_key = (config.get("weread_api_key") or "").strip()
@@ -195,6 +206,11 @@ class TraktRatingsSync(_PluginBase):
             self.save_data("last_run", {"started_at": started_at, "finished_at": int(time.time()), "status": "failed"})
             raise
         finally:
+            # ASS 明文仅属于本轮进程内操作，不让 Helper 成为跨轮凭据缓存。
+            if self._douban_cookie_source != "manual":
+                self._douban_helper = None
+            if self._netease_cookie_source != "manual":
+                self._netease_helper = None
             self._run_lock.release()
 
     def _run_sync(self) -> None:
@@ -209,8 +225,12 @@ class TraktRatingsSync(_PluginBase):
         self._source_fetch_ok = set()
         # 各来源共享请求预算与待处理队列，验证后不再进入下一个平台。
         try:
+            ass_douban = self._douban_cookie_source != "manual"
             self._douban_helper = DoubanHelper(
-                user_cookie=self._douban_cookie or None,
+                user_cookie=None if ass_douban else self._douban_cookie or None,
+                **({"credential_provider": lambda: self._read_ass_cookies("douban"),
+                    "credential_reference": self._credential_reference("douban"),
+                    "request_factory": CredentialRequestUtils} if ass_douban else {}),
                 notify_fn=lambda title, body: self._notify_issue("豆瓣", title, body),
                 save_data_fn=self.save_data,
                 get_data_fn=self.get_data,
@@ -790,14 +810,22 @@ class TraktRatingsSync(_PluginBase):
             logger.debug("未配置网易云音乐 Cookie，跳过同步")
             return
 
-        netease_helper = self._get_netease_helper()
+        try:
+            netease_helper = self._get_netease_helper()
+        except AssCookieError:
+            return
         logger.info("开始同步网易云音乐最近听歌记录到豆瓣（Cookie）...")
 
         if not netease_helper:
             logger.warning("网易云音乐 Helper 初始化失败，跳过同步")
             return
 
-        albums = netease_helper.get_recent_albums(limit=self._netease_limit)
+        try:
+            albums = netease_helper.get_recent_albums(limit=self._netease_limit)
+        finally:
+            if self._netease_cookie_source != "manual":
+                self._netease_helper = None
+                netease_helper.cookies.clear()
         if not albums:
             logger.info("网易云音乐未获取到最近专辑记录（Cookie 可能失效或暂无听歌记录）")
             return
@@ -1072,12 +1100,61 @@ class TraktRatingsSync(_PluginBase):
         helper.matched(key)
         return douban_title, subject
 
+    @staticmethod
+    def _ass_defaults() -> Dict[str, Any]:
+        """只读适配器的非敏感配置白名单。"""
+        return {"ass_origin": "", "ass_key_file": "", "ass_tenant_id": "", "ass_max_age": 3600,
+                "douban_ass_secret_id": "", "douban_ass_site_id": "douban", "douban_ass_account_id": "",
+                "netease_ass_secret_id": "", "netease_ass_site_id": "netease", "netease_ass_account_id": "",
+                "netease_ass_csrf_scope": "reject_ambiguous"}
+
+    def _credential_reference(self, site: str) -> str:
+        """通知与验证暂停按固定条目身份分组，不随观察刷新或 Cookie 变化重置。"""
+        config = self._ass_config
+        return "ass:" + ":".join(str(config.get(key, "")) for key in
+                                 ("ass_tenant_id", f"{site}_ass_secret_id", f"{site}_ass_site_id", f"{site}_ass_account_id"))
+
+    def _read_ass_cookies(self, site: str) -> Dict[str, str]:
+        """按已选择的网站从 ASS 新鲜读取；错误仅发送固定类别。"""
+        try:
+            if getattr(self, f"_{site}_cookie_source") != "ass":
+                raise AssCookieError("ass_configuration_invalid")
+            return AssCookieHelper(self._ass_config, site).read_cookies()
+        except AssCookieError as error:
+            source = "豆瓣" if site == "douban" else "网易云音乐"
+            hints = {
+                "ass_configuration_invalid": "连接或身份引用配置无效",
+                "ass_key_file_invalid": "Read Key 文件格式、路径或权限无效",
+                "ass_identity_mismatch": "Read Key、租户或授权数量与配置不符",
+                "ass_authentication_rejected": "Read Key 未通过认证，可能已过期或撤销",
+                "ass_access_denied": "Read Key 无权读取目标条目",
+                "ass_secret_unavailable": "目标条目不可用",
+                "ass_rate_limited": "ASS 读取受到限流",
+                "ass_unavailable": "ASS 连接或服务暂不可用",
+                "ass_response_invalid": "ASS 响应格式、大小或读取时间不符",
+                "ass_secret_binding_changed": "条目身份或版本在读取期间变化",
+                "ass_cookie_binding_mismatch": "Cookie 网站、账户或来源与配置不符",
+                "ass_cookie_invalidated": "Cookie 快照已失效",
+                "ass_cookie_expired": "Cookie 观察已过期或时钟偏差过大",
+                "ass_cookie_bundle_invalid": "Cookie 快照格式或固定消费范围不符",
+                "ass_cookie_required_missing": "必需 Cookie 或已指定的 CSRF 作用域缺失",
+                "ass_cookie_ambiguous": "Cookie 作用域存在歧义，请先只读验收再指定作用域",
+            }
+            hint = hints.get(str(error), "ASS 凭据读取未完成")
+            self._notify_issue(source, f"ASS {source}：{hint}", hint, category="ass")
+            raise
+
     def _has_netease_source(self) -> bool:
-        """判断网易云音乐是否存在可用数据源配置。"""
-        return bool(self._netease_cookie)
+        """ASS 配置错误也必须显式失败，不能回退手动 Cookie。"""
+        return self._netease_cookie_source != "manual" or bool(self._netease_cookie)
 
     def _get_netease_helper(self) -> Optional[NeteaseHelper]:
         """创建或复用网易云 Cookie Helper。"""
+        if self._netease_cookie_source != "manual":
+            self._netease_helper = None
+            return NeteaseHelper(cookies=self._read_ass_cookies("netease"),
+                                 notify_fn=self._send_netease_cookie_auth_notification,
+                                 request_factory=CredentialRequestUtils)
         if not self._netease_cookie:
             return None
         if not self._netease_helper:
@@ -1112,6 +1189,9 @@ class TraktRatingsSync(_PluginBase):
             "cron": self._cron,
             "bark_webhook_url": self._bark_webhook_url,
         }
+        current.update(self._ass_config)
+        current["douban_cookie_source"] = self._douban_cookie_source
+        current["netease_cookie_source"] = self._netease_cookie_source
         self._trakt_authorization_url = patch.get("trakt_authorization_url", self._trakt_authorization_url)
         self._trakt_auth_message = patch.get("trakt_auth_message", self._trakt_auth_message)
         self.save_data("trakt_auth_status", {"url": self._trakt_authorization_url, "message": self._trakt_auth_message})
@@ -1241,6 +1321,9 @@ class TraktRatingsSync(_PluginBase):
         credentials = {"Trakt": self._trakt_client_id, "豆瓣": self._douban_cookie,
                        "微信读书": self._weread_api_key, "网易云音乐": self._netease_cookie,
                        "小宇宙": self._xiaoyuzhou_cookie}
+        for site, label in (("douban", "豆瓣"), ("netease", "网易云音乐")):
+            if getattr(self, f"_{site}_cookie_source") != "manual":
+                credentials[label] = self._credential_reference(site)
         fingerprint = hashlib.sha256((credentials.get(source) or "").encode()).hexdigest()[:16]
         issues = dict(self.get_data("notification_issues") or {})
         previous = issues.get(source) or {}
@@ -1272,7 +1355,12 @@ class TraktRatingsSync(_PluginBase):
                    "微信读书": "请在插件配置页更新微信读书 API Key。",
                    "网易云音乐": "请在正常浏览器登录网易云，再更新插件 Cookie。",
                    "小宇宙": "请在插件配置页更新小宇宙认证信息。"}
-        body = content if source == "豆瓣" else actions.get(source, "请查看插件详情与日志。")
+        if category == "ass":
+            body = content + "；请检查只读授权、连接和快照状态，不回退手动或旧 Cookie，队列保留。"
+        elif source in ("豆瓣", "网易云音乐") and getattr(self, "_douban_cookie_source" if source == "豆瓣" else "_netease_cookie_source") == "ass":
+            body = content if source == "豆瓣" else "请在正常浏览器确认网易云登录并同步 Cookie 到 ASS；无需在插件中粘贴 Cookie。"
+        else:
+            body = content if source == "豆瓣" else actions.get(source, "请查看插件详情与日志。")
         state["last_attempt_at"] = now
         delivered = self._send_notification(title, body)
         if delivered:
@@ -1572,7 +1660,24 @@ class TraktRatingsSync(_PluginBase):
             {"component": "VBtn", "text": "打开 Trakt 授权页面", "props": {"href": "{{ _ui_trakt_url }}", "show": "{{ !!_ui_trakt_url }}", "target": "_blank", "rel": "noreferrer", "color": "primary", "class": "my-3"}},
         ]
         state = self.get_data("douban_sync_state") or {}
-        douban = [credential("douban_cookie", "豆瓣 Cookie", "支持 Cookie 字符串或含 Cookie 的完整 cURL")]
+        def cookie_source(site: str, label: str) -> List[dict]:
+            return [select(f"{site}_cookie_source", f"{label}凭据来源", [("手动配置", "manual"), ("ASS 只读", "ass")]),
+                    credential(f"{site}_cookie", f"{label} Cookie", "支持 Cookie 字符串或完整 cURL；ASS 模式不读取此字段",
+                               show=f"{{{{ {site}_cookie_source === 'manual' }}}}"),
+                    field(f"{site}_ass_secret_id", "ASS 条目 UUID", show=f"{{{{ {site}_cookie_source === 'ass' }}}}"),
+                    row(field(f"{site}_ass_site_id", "ASS site_id", show=f"{{{{ {site}_cookie_source === 'ass' }}}}"),
+                        field(f"{site}_ass_account_id", "ASS account_id", show=f"{{{{ {site}_cookie_source === 'ass' }}}}"))]
+
+        douban = cookie_source("douban", "豆瓣")
+        netease = cookie_source("netease", "网易云") + [
+            select("netease_ass_csrf_scope", "ASS __csrf 作用域", [("单值使用，双作用域拒绝", "reject_ambiguous"),
+                   ("仅 host-only（须先验收）", "host"), ("仅 domain（须先验收）", "domain")])]
+        ass = [field("ass_origin", "ASS 直连 HTTPS 地址", hint="不能使用跨主机跳转的入口"),
+               field("ass_key_file", "Read Key 只读文件绝对路径", hint="文件在 MoviePilot 容器内；不在页面填写 Key", **{"persistent-hint": True}),
+               field("ass_tenant_id", "ASS 租户 UUID"),
+               field("ass_max_age", "快照最大观察年龄（秒）", type="number", min=60, max=86400),
+               {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                "text": "仅授权 douban / netease 的 REST metadata/read + value/read；每次操作新鲜读取，失败不回退旧凭据。双 __csrf 必须先验证作用域，标签不代表网站身份。"}}]
         if state.get("requires_verification"):
             douban.extend([
                 {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "{{ _ui_douban_message }}"}},
@@ -1595,7 +1700,8 @@ class TraktRatingsSync(_PluginBase):
             heading("豆瓣"), *douban,
             self._fold("Trakt", trakt),
             self._fold("微信读书", [credential("weread_api_key", "微信读书 API Key", "仅支持现有 Skill API Key")]),
-            self._fold("网易云音乐", [credential("netease_cookie", "网易云 Cookie", "支持 Cookie 字符串或完整 cURL")]),
+            self._fold("网易云音乐", netease),
+            self._fold("ASS 只读凭据连接", ass),
             self._fold("小宇宙", [credential("xiaoyuzhou_cookie", "小宇宙认证信息", "支持 Token、含刷新令牌的 Cookie 或完整 cURL")]),
             self._fold("通知", [select("notification_mode", "通知内容", [("有新增时汇总，并提醒异常", "changes"), ("仅异常和恢复", "errors"), ("关闭推送", "off")]),
                                 select("notification_channel", "通知通道", [("MoviePilot 已配置通道", "moviepilot"), ("Bark", "bark")]),
@@ -1614,7 +1720,8 @@ class TraktRatingsSync(_PluginBase):
                 field("_ui_match_url", "对应豆瓣条目链接", hint="填写对应类型的豆瓣完整HTTPS链接或数字ID；剧集必须对应这一季", **{"persistent-hint": True}),
                 {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "{{ _ui_match_message }}"}}, button,
             ]))
-        return form, {"enable": False, "private": True, "cron": "0 2 * * *", "douban_cookie": "",
+        return form, {**self._ass_defaults(), "douban_cookie_source": "manual", "netease_cookie_source": "manual",
+                      "enable": False, "private": True, "cron": "0 2 * * *", "douban_cookie": "",
                       "trakt_username": "", "trakt_client_id": "", "trakt_redirect_uri": "", "trakt_manual_mappings": "",
                       "weread_api_key": "", "netease_cookie": "", "xiaoyuzhou_cookie": "",
                       "weread_limit": 20, "netease_limit": 20, "xiaoyuzhou_limit": 20,

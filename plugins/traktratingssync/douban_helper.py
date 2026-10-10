@@ -2,7 +2,7 @@
 """
 豆瓣书影音档案 Helper（本插件自包含，不依赖 doubanSync 插件）
 用于提交「看过/在看」「读过/在读」「听过」状态及评分到豆瓣。
-Cookie 需在插件配置中手动填写，失效时通过注入的 notify_fn 通知用户。
+Cookie 支持手动配置或 ASS 操作前新鲜读取，失效时通过 notify_fn 通知用户。
 """
 import hashlib
 import random
@@ -52,6 +52,9 @@ class DoubanHelper:
         get_data_fn: Optional[Callable[[str], Any]] = None,
         write_limit: int = 10,
         write_interval: int = 10,
+        credential_provider: Optional[Callable[[], Dict[str, str]]] = None,
+        credential_reference: str = "",
+        request_factory: Optional[Callable[..., Any]] = None,
     ):
         """初始化豆瓣登录、共享写入额度和不含凭据的持久化待同步队列。"""
         self._notify = notify_fn or (lambda title, body: None)
@@ -71,8 +74,12 @@ class DoubanHelper:
         self._attempted = set()
         self._transient_failures = 0
         self._stats = {"written": 0, "skipped": 0, "failed": 0}
-        fingerprint = hashlib.sha256((user_cookie or "").encode()).hexdigest()
-        if self._state.get("cookie_fingerprint") != fingerprint:
+        self._credential_provider = credential_provider
+        self._request_factory = request_factory
+        self._credential_failed = False
+        fingerprint = hashlib.sha256((credential_reference if credential_provider else user_cookie or "").encode()).hexdigest()
+        # ASS 快照/观察变化不能代替用户完成验证码，也不能在切换来源时解暂停。
+        if not credential_provider and self._state.get("cookie_fingerprint") != fingerprint:
             self._state.pop("requires_verification", None)
             self._state.pop("reason", None)
         self._state["cookie_fingerprint"] = fingerprint
@@ -82,7 +89,8 @@ class DoubanHelper:
             self.cookies = self._parse_cookie_input(user_cookie)
         else:
             self.cookies = {}
-            logger.warning("未配置豆瓣 Cookie，请在插件配置中填写")
+            if not credential_provider:
+                logger.warning("未配置豆瓣 Cookie，请在插件配置中填写")
 
         self.headers = {
             "User-Agent": settings.USER_AGENT,
@@ -98,7 +106,7 @@ class DoubanHelper:
         self.cookies.pop("ck", None)
         self._authenticated = False
 
-        if self.cookies and not self.requests_paused:
+        if (self.cookies or credential_provider) and not self.requests_paused:
             self._refresh_ck()
             self.ck = self.cookies.get("ck")
             if self.ck:
@@ -125,7 +133,8 @@ class DoubanHelper:
     @property
     def requests_paused(self) -> bool:
         """返回是否因验证或服务端冷却暂停所有豆瓣请求。"""
-        return bool(self._state.get("requires_verification") or self._state.get("blocked_until", 0) > time.time())
+        return bool(getattr(self, "_credential_failed", False) or self._state.get("requires_verification")
+                    or self._state.get("blocked_until", 0) > time.time())
 
     def _persist_sync_state(self) -> None:
         """持久化目标状态和暂停信息，不保存 Cookie、ck 或响应正文。"""
@@ -206,16 +215,35 @@ class DoubanHelper:
     # 内部工具
     # ------------------------------------------------------------------
 
+    def _request_utils(self, **kwargs):
+        """凭据模式可注入脱敏传输，手动模式保留已有 RequestUtils 边界。"""
+        return (getattr(self, "_request_factory", None) or RequestUtils)(**kwargs)
+
     def _refresh_ck(self) -> None:
-        """访问豆瓣首页刷新 ck Cookie"""
+        """刷新 CSRF；ASS 模式先新鲜读取，后续关联读写使用同一份 Cookie。"""
+        provider = getattr(self, "_credential_provider", None)
+        if provider:
+            try:
+                self.cookies = dict(provider())
+                self.cookies.pop("ck", None)
+                self.ck = None
+                self._authenticated = False
+            except Exception:
+                # 来源层已报告固定错误；不将 ASS 故障持久化为网站验证失败。
+                self._credential_failed = True
+                self._authenticated = False
+                self.cookies = {}
+                self.ck = None
+                self.headers.pop("Cookie", None)
+                return
         self.headers["Cookie"] = ";".join(f"{k}={v}" for k, v in self.cookies.items())
         try:
             self._sleep_before_request("刷新 ck")
-            response = RequestUtils(headers=self.headers, cookies=self.cookies, timeout=10).get_res(
-                url=self._URL_DOUBAN
+            response = self._request_utils(headers=self.headers, cookies=self.cookies, timeout=10).get_res(
+                url=self._URL_DOUBAN, verify=True, allow_redirects=False
             )
         except Exception as e:
-            logger.warning("刷新豆瓣 ck 请求失败: %s；%s", e, self._auth_context())
+            logger.warning("刷新豆瓣 ck 请求失败: %s；%s", type(e).__name__, self._auth_context())
             self.cookies["ck"] = ""
             return
         if response is None:
@@ -233,7 +261,9 @@ class DoubanHelper:
         if not ck:
             self.cookies["ck"] = ""
             return
-        self.cookies["ck"] = "" if ck == '"deleted"' else ck
+        self.cookies["ck"] = ck if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", ck) else ""
+        self.ck = self.cookies["ck"]
+        self._authenticated = bool(self.ck)
 
     def _build_headers(self, referer: str, host: str) -> dict:
         """构造带 Referer / Host / Cookie 的请求头"""
@@ -429,7 +459,7 @@ class DoubanHelper:
         """读取条目编辑表单中的用户内容；无法确认时不允许用空值覆盖。"""
         self._sleep_before_request("读取已有收藏内容")
         try:
-            response = RequestUtils(headers=self._build_headers(referer, host), cookies=self.cookies, timeout=10).get_res(url=url)
+            response = self._request_utils(headers=self._build_headers(referer, host), cookies=self.cookies, timeout=10).get_res(url=url, verify=True, allow_redirects=False)
             if self._check_access_response(response, writing=True) or response is None or response.status_code != 200:
                 return None
             payload = response.json()
@@ -482,6 +512,11 @@ class DoubanHelper:
         wait = max(0.0, self._next_write_at - time.monotonic())
         if wait:
             time.sleep(wait)
+        if getattr(self, "_credential_provider", None):
+            # 一次目标的 CSRF、已有内容 GET 与提交 POST 不混用不同快照。
+            self._refresh_ck()
+            if self.requests_paused or not self.ck:
+                return False
         self._attempted.add(url)
         entry["last_attempt_at"] = int(time.time())
         preserved = self._read_interest_fields(url, entry["referer"], entry["host"])
@@ -493,9 +528,9 @@ class DoubanHelper:
             return False
         submitted = {**preserved, **entry["data"], "ck": self.ck}
         try:
-            response = RequestUtils(
+            response = self._request_utils(
                 headers=self._build_headers(entry["referer"], entry["host"]), cookies=self.cookies, timeout=10,
-            ).post_res(url=url, data=submitted)
+            ).post_res(url=url, data=submitted, verify=True, allow_redirects=False)
         except Exception as error:
             logger.warning("豆瓣提交请求异常（%s），保留队列等待下次处理", type(error).__name__)
             response = None
@@ -537,15 +572,19 @@ class DoubanHelper:
         self._search_temporarily_failed = True
         if self._is_search_blocked():
             return None, None
+        if getattr(self, "_credential_provider", None):
+            self._refresh_ck()
+            if self.requests_paused or not self.ck:
+                return None, None
         self._sleep_before_request("搜索")
         self._throttle_search()
         url = self._URL_SEARCH
-        response = RequestUtils(
+        response = self._request_utils(
             headers=self._build_search_headers(referer=url),
             cookies=self.cookies,
             timeout=10,
         ).get_res(
-            url=url, params={"cat": cat, "q": keyword}
+            url=url, params={"cat": cat, "q": keyword}, verify=True, allow_redirects=False
         )
         if self._check_access_response(response):
             return None, None
@@ -577,16 +616,20 @@ class DoubanHelper:
         self._search_temporarily_failed = True
         if self._is_search_blocked():
             return None, None
+        if getattr(self, "_credential_provider", None):
+            self._refresh_ck()
+            if self.requests_paused or not self.ck:
+                return None, None
         self._sleep_before_request("播客搜索")
         self._throttle_search()
 
-        response = RequestUtils(
+        response = self._request_utils(
             headers=self._build_rexxar_headers(referer=self._URL_DOUBAN),
             cookies=self.cookies,
             timeout=10,
         ).get_res(
             url=self._URL_REXXAR_SEARCH,
-            params=self._build_rexxar_params(keyword, "podcast"),
+            params=self._build_rexxar_params(keyword, "podcast"), verify=True, allow_redirects=False,
         )
         if self._check_access_response(response):
             return None, None
@@ -600,7 +643,7 @@ class DoubanHelper:
             try:
                 data = response.json()
             except Exception as e:
-                logger.warning("解析豆瓣播客搜索 JSON 失败 [%s]: %s", keyword, e)
+                logger.warning("解析豆瓣播客搜索 JSON 失败 [%s]: %s", keyword, type(e).__name__)
                 data = {}
             douban_title, subject_id = self._parse_podcast_rexxar_result(keyword, data)
             if subject_id:

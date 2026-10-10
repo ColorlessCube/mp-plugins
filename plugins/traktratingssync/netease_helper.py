@@ -53,8 +53,11 @@ class NeteaseHelper:
             self,
             cookies: Optional[Any] = None,
             notify_fn: Optional[Callable[[str, str], None]] = None,
+            request_factory: Optional[Callable[..., Any]] = None,
     ):
+        """初始化只属于本次来源读取的 Cookie 和安全请求边界。"""
         self._notify = notify_fn or (lambda title, body: None)
+        self._request_factory = request_factory
         parsed_headers: Dict[str, str] = {}
         self._csrf_token = ""
         self._cookie_parse_warnings: List[str] = []
@@ -213,11 +216,10 @@ class NeteaseHelper:
         if cookie_string:
             csrf_values = cls._extract_cookie_values(cookie_string, "__csrf")
             if len(csrf_values) > 1:
-                unique_values = list(dict.fromkeys(csrf_values))
-                warnings.append(f"检测到重复 __csrf，值为 {unique_values}")
+                warnings.append("检测到重复 __csrf；手动模式保留原有最后值规则，请确认请求来源")
             if csrf_token and csrf_values and csrf_token != csrf_values[-1]:
                 warnings.append(
-                    f"URL 中 csrf_token={csrf_token} 与 Cookie 中最终 __csrf={csrf_values[-1]} 不一致，将优先使用 URL 参数"
+                    "URL 中 csrf_token 与 Cookie 中最终 __csrf 不一致，将优先使用 URL 参数"
                 )
             logger.debug("已从网易云 cURL 中提取 Cookie、请求头和 csrf_token")
             return {
@@ -236,8 +238,7 @@ class NeteaseHelper:
             f"cookie_count={len(self.cookies)}, "
             f"has_music_u={bool(self.cookies.get('MUSIC_U'))}, "
             f"has_csrf={bool(self.cookies.get('__csrf') or self._csrf_token)}, "
-            f"csrf_source={'url' if self._csrf_token else 'cookie'}, "
-            f"user_agent={self._headers.get('User-Agent', '')[:120]}"
+            f"csrf_source={'url' if self._csrf_token else 'cookie'}"
         )
 
     def _notify_auth_failure(self, message: str, detail: str) -> None:
@@ -271,7 +272,7 @@ class NeteaseHelper:
 
         try:
             self._sleep_before_request(endpoint)
-            request = RequestUtils(
+            request = (self._request_factory or RequestUtils)(
                 headers=self._headers,
                 cookies=self.cookies,
                 timeout=15,
@@ -280,12 +281,12 @@ class NeteaseHelper:
                 encrypted = self._encrypt_params(request_params)
                 response = request.post_res(
                     url=url,
-                    data=encrypted,
+                    data=encrypted, verify=True, allow_redirects=False,
                 )
             else:
                 response = request.get_res(
                     url=url,
-                    params=request_params,
+                    params=request_params, verify=True, allow_redirects=False,
                 )
 
             if response is None:
@@ -295,6 +296,9 @@ class NeteaseHelper:
             response.raise_for_status()
             data = response.json()
 
+            if not isinstance(data, dict) or type(data.get("code")) is not int:
+                logger.warning("网易云音乐 API 响应格式无效")
+                return None
             if data.get("code") == 200:
                 return data
 
@@ -303,15 +307,15 @@ class NeteaseHelper:
             if code in (301, 401):
                 msg = "网易云音乐 Cookie 已失效或填写错误，请重新从浏览器复制 MUSIC_U / __csrf，或直接粘贴包含 Cookie 的完整 cURL。"
                 detail = (
-                    f"endpoint={endpoint}, code={code}, api_msg={data.get('msg', data.get('message', ''))}, "
+                    f"endpoint={endpoint}, code={code}, "
                     f"{self._auth_context()}"
                 )
                 self._notify_auth_failure(msg, detail)
                 return None
 
             logger.warning(
-                "网易云音乐 API 返回错误: endpoint=%s, code=%s, msg=%s",
-                endpoint, code, data.get("msg", data.get("message", "")),
+                "网易云音乐 API 返回错误: endpoint=%s, code=%s",
+                endpoint, code,
             )
             return None
 
@@ -319,16 +323,16 @@ class NeteaseHelper:
             if e.response is not None and e.response.status_code in (401, 403):
                 msg = "网易云音乐请求被拒绝，Cookie 可能已失效、填写错误或被风控，请重新复制 Cookie 或完整 cURL。"
                 detail = (
-                    f"endpoint={endpoint}, status={e.response.status_code}, body={(e.response.text or '')[:200]}, "
+                    f"endpoint={endpoint}, status={e.response.status_code}, "
                     f"{self._auth_context()}"
                 )
                 self._notify_auth_failure(msg, detail)
             else:
-                logger.error("网易云音乐 API HTTP 错误: %s", e)
+                logger.error("网易云音乐 API HTTP 错误: %s", type(e).__name__)
         except requests.RequestException as e:
-            logger.error("网易云音乐 API 请求异常: %s", e)
+            logger.error("网易云音乐 API 请求异常: %s", type(e).__name__)
         except Exception as e:
-            logger.error("网易云音乐 API 处理异常: %s", e, exc_info=True)
+            logger.error("网易云音乐 API 处理异常: %s", type(e).__name__)
         return None
 
     # ------------------------------------------------------------------
@@ -395,8 +399,8 @@ class NeteaseHelper:
             if uid:
                 return int(uid)
             logger.warning(
-                "网易云 nuser/account/get 返回成功但未包含 account.id: keys=%s, %s",
-                list(result.keys())[:20],
+                "网易云 nuser/account/get 返回成功但未包含 account.id: field_count=%d, %s",
+                len(result),
                 self._auth_context(),
             )
         else:
