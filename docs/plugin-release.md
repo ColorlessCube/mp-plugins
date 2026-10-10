@@ -96,7 +96,8 @@ conda run -n movie-pilot pylint local-plugins/mp-plugins/plugins/traktratingssyn
 
 安装 ACK 之后至少检查：
 
-1. `query_installed_plugins` 的运行版本与目标一致。
+1. 再次调用 `query_installed_plugins`，运行版本与目标一致、`has_update=false`。
+   安装 ACK 内的市场对象可能仍带安装前的 `has_update=true`，不能据此认定升级失败或重复安装。
 2. REST `/api/v1/plugin/file/<PluginClassName>/__init__.py` 的 `plugin_version` 一致。
 3. 尽可能逐个比较本次运行 `.py` 与发布提交的 SHA-256，防止新入口配旧 helper 或混合版本。
 4. 插件表单、详情页和既有 API 注册可用；只检查结构，不输出配置值。
@@ -130,8 +131,14 @@ ASS 接入先保持来源为原手动模式。另行获准后配置专用 Read K
 不要 `reset --hard` 共享历史、强推、直接覆盖运行目录或假设安装器自动留了可靠备份。
 回退代码不会撤销数据库变化、凭据轮换、队列变化或已完成的外部写入；这些需要独立恢复方案。
 
+对 ASS 接入版本尤其注意：旧版 3.20.0 不认识 ASS 来源字段，可能直接使用仍保存的手动 Cookie。
+一旦已切换到 ASS，不能未经审查回退旧版并让原任务继续运行，否则破坏「无旧凭据回退」边界。
+先按授权暂停任务，确认兼容代码或显式重新配置来源后再恢复；不要把代码回退当作凭据撤销。
+
 ## 9. 发布记录
 
 每次记录在 `docs/releases/`：授权范围、旧/新版本、源提交、测试命令及结果、
 市场/安装 ACK、线上文件比较、配置保留、调度和日志检查、明确未执行环节及异常处理。
 只保存元数据，不记录生产地址、用户名、凭据、原始配置或日志。
+
+实录：[TraktRatingsSync 3.21.0 生产发布](releases/traktratingssync-3.21.0-20261010.md)。
