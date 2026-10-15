@@ -50,7 +50,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影无需评分同步看过、剧集逐季在看/看过，微信读书、网易云专辑、小宇宙播客；支持未匹配记录处理。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.21.1"
+    plugin_version = "3.21.2"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -670,10 +670,7 @@ class TraktRatingsSync(_PluginBase):
             return
 
         if not self._weread_helper:
-            self._weread_helper = WereadHelper(
-                api_key=self._weread_api_key,
-                notify_fn=self._send_weread_auth_notification,
-            )
+            self._weread_helper = WereadHelper(api_key=self._weread_api_key)
 
         logger.info("开始同步微信读书最近阅读记录...")
         books = self._weread_helper.get_recent_books(
@@ -681,14 +678,25 @@ class TraktRatingsSync(_PluginBase):
             include_progress=True,
         )
 
-        if not books:
-            logger.info("微信读书未获取到最近阅读记录（API Key 可能已失效或书架为空）")
+        issue = self._weread_helper.get_request_issue_kind()
+        if issue:
+            hints = {
+                "upgrade": ("微信读书 Skill 协议需要更新", "请更新插件的微信读书接口适配，无需更换 API Key；本轮书单未更新，已有记录保留。"),
+                "auth": ("微信读书 API Key 已失效", "请检查微信读书 API Key 是否有效及有访问权限；已有记录保留。"),
+                "rate_limit": ("微信读书暂时限流", "本轮读取已停止，等待下次定时重试；无需更换 API Key，已有记录保留。"),
+                "response": ("微信读书接口响应异常", "响应格式与已核对协议不符，本轮未处理不完整书单；请检查接口适配，已有记录保留。"),
+                "temporary": ("微信读书读取暂未完成", "可能是网络或上游服务暂时异常，等待下次定时重试；无需更换 API Key，已有记录保留。"),
+            }
+            title, content = hints.get(issue, hints["temporary"])
+            self._notify_issue("微信读书", title, content, category=issue)
             return
 
-        # 持久化书单（供详情页展示）
+        # 只有完整读取成功才能替换展示数据或清除来源异常；合法空书架也算成功。
         self.save_data("weread_books", books)
-
         self._mark_source_success("微信读书")
+        if not books:
+            logger.info("微信读书书架读取成功，本轮没有可处理的电子书记录")
+            return
         logger.info("微信读书拉取完成，共 %d 本，开始同步到豆瓣：", len(books))
         for i, book in enumerate(books, 1):
             time_str = WereadHelper.format_reading_time(book.get("reading_time", 0))
@@ -1377,7 +1385,9 @@ class TraktRatingsSync(_PluginBase):
                    "微信读书": "请在插件配置页更新微信读书 API Key。",
                    "网易云音乐": "请在正常浏览器登录网易云，再更新插件 Cookie。",
                    "小宇宙": "请在插件配置页更新小宇宙认证信息。"}
-        if category == "ass":
+        if source == "微信读书":
+            body = content
+        elif category == "ass":
             body = content + "；请检查只读授权、连接和快照状态，不回退手动或旧 Cookie，队列保留。"
         elif source in ("豆瓣", "网易云音乐") and getattr(self, "_douban_cookie_source" if source == "豆瓣" else "_netease_cookie_source") == "ass":
             body = content if source == "豆瓣" else "请在正常浏览器确认网易云登录并同步 Cookie 到 ASS；无需在插件中粘贴 Cookie。"
@@ -1412,10 +1422,6 @@ class TraktRatingsSync(_PluginBase):
     def _send_netease_cookie_auth_notification(self, title: str, content: str) -> bool:
         """将网易云授权异常交给统一通知规则。"""
         return self._notify_issue("网易云音乐", title, content)
-
-    def _send_weread_auth_notification(self, title: str, content: str) -> bool:
-        """将微信读书授权异常交给统一通知规则。"""
-        return self._notify_issue("微信读书", title, content)
 
     # ------------------------------------------------------------------
     # 插件接口
@@ -1722,7 +1728,7 @@ class TraktRatingsSync(_PluginBase):
             field("cron", "定时同步", hint="五段cron表达式，例如0 10 * * *代表每天上午10点", **{"persistent-hint": True}),
             heading("豆瓣"), *douban,
             self._fold("Trakt", trakt),
-            self._fold("微信读书", [credential("weread_api_key", "微信读书 API Key", "仅支持现有 Skill API Key")]),
+            self._fold("微信读书", [credential("weread_api_key", "微信读书 API Key", "使用 Skill 协议 1.0.5；协议升级提示需更新插件，不等同于 Key 失效")]),
             self._fold("网易云音乐", netease),
             self._fold("ASS 只读凭据连接", ass),
             self._fold("小宇宙", [credential("xiaoyuzhou_cookie", "小宇宙认证信息", "支持 Token、含刷新令牌的 Cookie 或完整 cURL")]),
