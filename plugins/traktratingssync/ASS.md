@@ -146,5 +146,5 @@ conda run -n movie-pilot pylint local-plugins/mp-plugins/plugins/traktratingssyn
 bootstrap 权限/轮换、TLS/跳转/限长/异常脱敏、验证码暂停、完整运行阻断及 Helper 清理。
 所有测试使用合成 Key/Cookie 和临时文件，禁止真实出站或真实配置/数据库写入。
 
-3.21.1 的本地验证、网站只读证据与尚未部署的边界见
+3.21.1 的本地验证、网站只读证据、生产升级与单次同步结果见
 [观察陈旧修正记录](../../docs/releases/traktratingssync-3.21.1-20261015.md)。
