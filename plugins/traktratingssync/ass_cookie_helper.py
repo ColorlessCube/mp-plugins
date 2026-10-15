@@ -131,6 +131,7 @@ class AssCookieHelper:
 
     def __init__(self, config: Dict[str, Any], site: str) -> None:
         """绑定固定网站及精确条目，配置中只保存连接与非敏感引用。"""
+        self._observation_age_seconds: Optional[int] = None
         try:
             if site not in self._SOURCES:
                 raise ValueError
@@ -162,6 +163,11 @@ class AssCookieHelper:
                 raise ValueError
         except Exception:
             raise AssCookieError("ass_configuration_invalid") from None
+
+    @property
+    def observation_age_seconds(self) -> Optional[int]:
+        """返回最近成功校验快照的观察年龄，仅用于提示而非网站登录判断。"""
+        return self._observation_age_seconds
 
     def _read_key(self) -> str:
         """拒绝符号链接、特殊文件、宽权限及超长输入；不缓存密钥。"""
@@ -209,7 +215,8 @@ class AssCookieHelper:
             raise AssCookieError("ass_response_invalid") from None
 
     def read_cookies(self) -> Dict[str, str]:
-        """新鲜授权读取；失败不回退手动或上次 Cookie，不写回插件配置。"""
+        """重新授权读取；观察年龄只提示，失败不回退手动或上次 Cookie。"""
+        self._observation_age_seconds = None
         token = self._read_key()
         try:
             deadline = time.monotonic() + 20
@@ -247,7 +254,8 @@ class AssCookieHelper:
             raise AssCookieError("ass_response_invalid") from None
 
     def _project(self, raw: str, now: float) -> Dict[str, str]:
-        """验证完整 v1/v2 快照后，按固定域、根路径及明确作用域投影。"""
+        """验证完整 v1/v2 快照后投影；网站仍需独立确认登录有效。"""
+        self._observation_age_seconds = None
         try:
             if not isinstance(raw, str) or len(raw.encode("utf-8")) > 16384:
                 raise ValueError
@@ -268,8 +276,9 @@ class AssCookieHelper:
                 raise AssCookieError("ass_cookie_invalidated")
             if not bundle.cookies or bundle.reason is not None:
                 raise ValueError
-            if not -60 <= now - observed <= self._age or created - now > 60:
-                raise AssCookieError("ass_cookie_expired")
+            # 浏览器离线不等于登录失效；未来时间仍按时钟异常拒绝。
+            if observed - now > 60 or created - now > 60:
+                raise AssCookieError("ass_cookie_clock_skew")
             allowed = ({"dbcl2": "douban.com", "bid": "douban.com", "ck": "douban.com"}
                        if self._site == "douban" else {"MUSIC_U": "music.163.com", "__csrf": "music.163.com"})
             required = "dbcl2" if self._site == "douban" else "MUSIC_U"
@@ -310,6 +319,7 @@ class AssCookieHelper:
                 raise AssCookieError("ass_cookie_required_missing")
             if self._site == "netease" and self._csrf_scope != "reject_ambiguous" and "__csrf" not in selected:
                 raise AssCookieError("ass_cookie_required_missing")
+            self._observation_age_seconds = max(0, int(now - observed))
             return selected
         except AssCookieError:
             raise

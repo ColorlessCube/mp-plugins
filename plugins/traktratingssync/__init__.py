@@ -50,7 +50,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影无需评分同步看过、剧集逐季在看/看过，微信读书、网易云专辑、小宇宙播客；支持未匹配记录处理。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.21.0"
+    plugin_version = "3.21.1"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -147,6 +147,7 @@ class TraktRatingsSync(_PluginBase):
         self._notification_channel = config.get("notification_channel") or ("bark" if self._bark_webhook_url else "moviepilot")
         self._source_issue_this_run = set()
         self._source_fetch_ok = set()
+        self._ass_stale_warned = set()
 
         # 重置 helper，下次 run() 时重新初始化
         self._douban_helper = None
@@ -223,6 +224,7 @@ class TraktRatingsSync(_PluginBase):
                     self._douban_write_interval, self._douban_write_interval * 2)
         self._source_issue_this_run = set()
         self._source_fetch_ok = set()
+        self._ass_stale_warned = set()
         # 各来源共享请求预算与待处理队列，验证后不再进入下一个平台。
         try:
             ass_douban = self._douban_cookie_source != "manual"
@@ -1119,7 +1121,10 @@ class TraktRatingsSync(_PluginBase):
         try:
             if getattr(self, f"_{site}_cookie_source") != "ass":
                 raise AssCookieError("ass_configuration_invalid")
-            return AssCookieHelper(self._ass_config, site).read_cookies()
+            helper = AssCookieHelper(self._ass_config, site)
+            cookies = helper.read_cookies()
+            self._update_ass_observation_hint(site, helper.observation_age_seconds)
+            return cookies
         except AssCookieError as error:
             source = "豆瓣" if site == "douban" else "网易云音乐"
             hints = {
@@ -1135,7 +1140,7 @@ class TraktRatingsSync(_PluginBase):
                 "ass_secret_binding_changed": "条目身份或版本在读取期间变化",
                 "ass_cookie_binding_mismatch": "Cookie 网站、账户或来源与配置不符",
                 "ass_cookie_invalidated": "Cookie 快照已失效",
-                "ass_cookie_expired": "Cookie 观察已过期或时钟偏差过大",
+                "ass_cookie_clock_skew": "Cookie 快照时间超前，请检查采集端时钟",
                 "ass_cookie_bundle_invalid": "Cookie 快照格式或固定消费范围不符",
                 "ass_cookie_required_missing": "必需 Cookie 或已指定的 CSRF 作用域缺失",
                 "ass_cookie_ambiguous": "Cookie 作用域存在歧义，请先只读验收再指定作用域",
@@ -1143,6 +1148,23 @@ class TraktRatingsSync(_PluginBase):
             hint = hints.get(str(error), "ASS 凭据读取未完成")
             self._notify_issue(source, f"ASS {source}：{hint}", hint, category="ass")
             raise
+
+    def _update_ass_observation_hint(self, site: str, age: Optional[int]) -> None:
+        """观察陈旧只保存脱敏提示，不标记来源失败、不发送登录失效通知。"""
+        warnings = dict(self.get_data("ass_observation_warnings") or {})
+        if age is not None and age > self._ass_config["ass_max_age"]:
+            if site not in self._ass_stale_warned:
+                self._ass_stale_warned.add(site)
+                label = "豆瓣" if site == "douban" else "网易云音乐"
+                logger.warning(f"ASS {label} Cookie 观察时间较旧（{age} 秒），不直接阻断；继续由网站检查登录态")
+                warnings[site] = {"age_seconds": age, "checked_at": int(time.time())}
+                self.save_data("ass_observation_warnings", warnings)
+            elif site not in warnings:
+                warnings[site] = {"age_seconds": age, "checked_at": int(time.time())}
+                self.save_data("ass_observation_warnings", warnings)
+        elif site in warnings:
+            warnings.pop(site)
+            self.save_data("ass_observation_warnings", warnings)
 
     def _has_netease_source(self) -> bool:
         """ASS 配置错误也必须显式失败，不能回退手动 Cookie。"""
@@ -1675,7 +1697,8 @@ class TraktRatingsSync(_PluginBase):
         ass = [field("ass_origin", "ASS 直连 HTTPS 地址", hint="不能使用跨主机跳转的入口"),
                field("ass_key_file", "Read Key 只读文件绝对路径", hint="文件在 MoviePilot 容器内；不在页面填写 Key", **{"persistent-hint": True}),
                field("ass_tenant_id", "ASS 租户 UUID"),
-               field("ass_max_age", "快照最大观察年龄（秒）", type="number", min=60, max=86400),
+               field("ass_max_age", "观察时间陈旧提示阈值（秒）", type="number", min=60, max=86400,
+                     hint="超过阈值只提示，不直接阻断；Cookie 能否使用由网站登录检查决定。", **{"persistent-hint": True}),
                {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
                 "text": "仅授权 douban / netease 的 REST metadata/read + value/read；每次操作新鲜读取，失败不回退旧凭据。双 __csrf 必须先验证作用域，标签不代表网站身份。"}}]
         if state.get("requires_verification"):
@@ -1787,6 +1810,12 @@ class TraktRatingsSync(_PluginBase):
                         ("提交失败", run.get("failed", 0)), ("待写入", len(pending)), ("未匹配", len(unmatched)),
                     )]},
         ]
+        for site, warning in (self.get_data("ass_observation_warnings") or {}).items():
+            if site in ("douban", "netease") and getattr(self, f"_{site}_cookie_source") == "ass":
+                label = "豆瓣" if site == "douban" else "网易云音乐"
+                page.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                    "text": f"ASS {label}：上次读取时观察时间较旧（{warning['age_seconds']} 秒，检查于 {timestamp(warning['checked_at'])}）；"
+                            "此提示不直接阻断同步，实际登录检查结果见本轮状态。建议恢复浏览器自动采集。"}})
         issues = self.get_data("notification_issues") or {}
         for source, issue in issues.items():
             if issue.get("active"):

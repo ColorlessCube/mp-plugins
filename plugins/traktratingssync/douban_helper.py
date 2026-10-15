@@ -11,7 +11,7 @@ import shlex
 import time
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -77,6 +77,7 @@ class DoubanHelper:
         self._credential_provider = credential_provider
         self._request_factory = request_factory
         self._credential_failed = False
+        self._login_check_failed = False
         fingerprint = hashlib.sha256((credential_reference if credential_provider else user_cookie or "").encode()).hexdigest()
         # ASS 快照/观察变化不能代替用户完成验证码，也不能在切换来源时解暂停。
         if not credential_provider and self._state.get("cookie_fingerprint") != fingerprint:
@@ -133,7 +134,8 @@ class DoubanHelper:
     @property
     def requests_paused(self) -> bool:
         """返回是否因验证或服务端冷却暂停所有豆瓣请求。"""
-        return bool(getattr(self, "_credential_failed", False) or self._state.get("requires_verification")
+        return bool(getattr(self, "_credential_failed", False) or getattr(self, "_login_check_failed", False)
+                    or self._state.get("requires_verification")
                     or self._state.get("blocked_until", 0) > time.time())
 
     def _persist_sync_state(self) -> None:
@@ -208,7 +210,7 @@ class DoubanHelper:
 
     @property
     def is_authenticated(self) -> bool:
-        """返回豆瓣 Cookie 是否有效（ck 已成功获取）"""
+        """返回本轮认证结果；ASS 模式须首页确认登录且取得有效 CSRF。"""
         return self._authenticated
 
     # ------------------------------------------------------------------
@@ -219,8 +221,50 @@ class DoubanHelper:
         """凭据模式可注入脱敏传输，手动模式保留已有 RequestUtils 边界。"""
         return (getattr(self, "_request_factory", None) or RequestUtils)(**kwargs)
 
+    def _defer_login_check(self) -> None:
+        """网络或页面格式无法确认登录时只停本轮，不制造人工验证锁。"""
+        self._login_check_failed = True
+        self._authenticated = False
+        self.ck = None
+        self.cookies.pop("ck", None)
+        message = "豆瓣登录检查暂未确认，本轮停止请求并保留队列；下次定时重试，不等同于 Cookie 失效"
+        logger.warning(message)
+        self._notify("豆瓣登录检查暂未完成", message)
+
+    def _check_ass_login(self, response: Any) -> bool:
+        """检查首页登录导航或旧版账号标记，不以匿名也能取得的 ck 代替认证。"""
+        location = urlsplit(response.headers.get("Location", ""))
+        login_redirect = (300 <= response.status_code < 400 and (
+            (location.hostname == "accounts.douban.com" and location.path.startswith("/passport/login"))
+            or (location.hostname in (None, "www.douban.com") and location.path.startswith("/accounts/login"))))
+        if login_redirect or response.status_code in (401, 403) or self._is_need_login_response(response):
+            self._pause_requests("豆瓣登录已失效或访问被拒绝，请在浏览器确认登录后同步 Cookie 并恢复")
+            return False
+        if response.status_code != 200:
+            self._defer_login_check()
+            return False
+        # 只读取页面脚本的账号标记，不把正文中的个人主页链接当作当前登录用户。
+        soup = BeautifulSoup(response.text or "", "html.parser")
+        identities = {match.group(2) for script in soup.find_all("script")
+                      for match in re.finditer(r"\b_USER_ID\s*=\s*(['\"])([0-9]*)\1", script.get_text())}
+        if identities:
+            expected = self.cookies.get("dbcl2", "").strip('"').split(":", 1)[0]
+            if not expected.isdigit() or identities != {expected}:
+                self._pause_requests("豆瓣未登录或登录账号与 Cookie 不符，请在浏览器确认后重新同步 Cookie 并恢复")
+                return False
+            return True
+        # 当前首页不再提供 _USER_ID；仅信任全局账号导航中的站内退出控件。
+        # 这里判断已登录，不声称从导航独立确认了数字账号；ASS 条目绑定仍须通过。
+        for anchor in soup.select("#db-global-nav .nav-user-account a[href]"):
+            target = urlsplit(urljoin(self._URL_DOUBAN, anchor["href"]))
+            if (target.scheme == "https" and target.hostname == "www.douban.com"
+                    and target.username is None and target.path.rstrip("/") == "/accounts/logout"):
+                return True
+        self._defer_login_check()
+        return False
+
     def _refresh_ck(self) -> None:
-        """刷新 CSRF；ASS 模式先新鲜读取，后续关联读写使用同一份 Cookie。"""
+        """刷新 CSRF；ASS 重新授权读取并只读检查登录，后续关联读写使用同一快照。"""
         provider = getattr(self, "_credential_provider", None)
         if provider:
             try:
@@ -245,25 +289,30 @@ class DoubanHelper:
         except Exception as e:
             logger.warning("刷新豆瓣 ck 请求失败: %s；%s", type(e).__name__, self._auth_context())
             self.cookies["ck"] = ""
+            if provider:
+                self._defer_login_check()
             return
         if response is None:
             logger.warning("刷新豆瓣 ck 未返回响应；%s", self._auth_context())
             self.cookies["ck"] = ""
+            if provider:
+                self._defer_login_check()
             return
         if self._check_access_response(response):
             self.cookies["ck"] = ""
+            return
+        if provider and not self._check_ass_login(response):
             return
         ck = getattr(response, "cookies", {}).get("ck") if getattr(response, "cookies", None) else ""
         ck_str = response.headers.get("Set-Cookie", "")
         if not ck:
             match = re.search(r"(?:^|,\s*)ck=([^;]+)", ck_str or "")
             ck = match.group(1).strip() if match else ""
-        if not ck:
-            self.cookies["ck"] = ""
-            return
-        self.cookies["ck"] = ck if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", ck) else ""
+        self.cookies["ck"] = ck if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", ck or "") else ""
         self.ck = self.cookies["ck"]
         self._authenticated = bool(self.ck)
+        if provider and not self._authenticated:
+            self._defer_login_check()
 
     def _build_headers(self, referer: str, host: str) -> dict:
         """构造带 Referer / Host / Cookie 的请求头"""

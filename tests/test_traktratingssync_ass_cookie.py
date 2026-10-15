@@ -103,7 +103,7 @@ def test_v2_csrf_scope_is_explicit_even_for_equal_values(monkeypatch, tmp_path, 
     {"cookies": []}, {"reason": "required_cookie_missing"}, {"unknown": "field"},
 ])
 def test_bundle_fail_closed(monkeypatch, tmp_path, change):
-    """拒绝错误身份、格式、时钟、版本与过期观察。"""
+    """拒绝错误身份、格式、时钟和版本；观察早于生成时间也不合法。"""
     module = _load_adapter(monkeypatch)
     bundle = _bundle()
     bundle.update(change)
@@ -220,7 +220,7 @@ def test_fresh_read_pins_key_tenant_secret_and_version(monkeypatch, tmp_path):
     assert helper.read_cookies() == {"dbcl2": '"123:test"'}
     assert len(paths) == 8 and paths[0] == paths[4] == "/api/v1/secrets/access-status"
     assert set(vars(helper)) == {"_site", "_origin", "_key_file", "_tenant", "_secret", "_account",
-                                 "_site_id", "_age", "_csrf_scope", "_get"}  # _get 是测试桩。
+                                 "_site_id", "_age", "_csrf_scope", "_observation_age_seconds", "_get"}  # _get 是测试桩。
 
 
 @pytest.mark.parametrize("index,change", [(0, {"tenant_id": SECRET}), (0, {"key_id": SECRET}),
@@ -390,7 +390,7 @@ def test_douban_rechecks_before_write_and_keeps_one_snapshot_for_get_post(monkey
     module = _load_douban_helper_module(monkeypatch)
     helper = _build_helper(module, monkeypatch)
     calls, reads = [], []
-    helper._credential_provider = lambda: reads.append("read") or {"dbcl2": "fresh"}
+    helper._credential_provider = lambda: reads.append("read") or {"dbcl2": '"123:fresh"'}
     class RequestStub:
         """CSRF、内容和提交请求均使用合成响应。"""
         def __init__(self, **kwargs):
@@ -399,7 +399,7 @@ def test_douban_rechecks_before_write_and_keeps_one_snapshot_for_get_post(monkey
         def get_res(self, **kwargs):
             """返回新 CSRF，不调用网站。"""
             calls.append(("csrf", self.cookies, kwargs))
-            return _Response(200, cookies={"ck": "freshck"})
+            return _Response(200, text='<script>var _USER_ID = "123";</script>', cookies={"ck": "freshck"})
         def post_res(self, **kwargs):
             """记录同一份凭据的写入。"""
             calls.append(("post", self.cookies, kwargs))
@@ -410,7 +410,7 @@ def test_douban_rechecks_before_write_and_keeps_one_snapshot_for_get_post(monkey
     helper._state["pending"][url] = {"data": {"interest": "collect"}, "referer": "https://movie.douban.com/subject/123/", "host": "movie.douban.com"}
     assert helper._submit_pending(url)
     assert reads == ["read"] and [call[0] for call in calls] == ["csrf", "existing", "post"]
-    assert calls[1][1] == calls[2][1] == {"dbcl2": "fresh", "ck": "freshck"}
+    assert calls[1][1] == calls[2][1] == {"dbcl2": '"123:fresh"', "ck": "freshck"}
     assert calls[0][2]["verify"] is True and calls[2][2]["allow_redirects"] is False
     assert "fresh" not in json.dumps(helper._state)
 
@@ -603,6 +603,6 @@ def test_release_metadata_matches_plugin_and_documentation(monkeypatch):
     module = _load_plugin_module(monkeypatch)
     root = Path(__file__).resolve().parents[1]
     metadata = json.loads((root / "package.json").read_text())["TraktRatingsSync"]
-    assert metadata["version"] == module.TraktRatingsSync.plugin_version == "3.21.0"
-    assert "v3.21.0" in metadata["history"]
+    assert metadata["version"] == module.TraktRatingsSync.plugin_version == "3.21.1"
+    assert "v3.21.1" in metadata["history"]
     assert (root / "plugins/traktratingssync/ASS.md").is_file()
