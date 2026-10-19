@@ -89,6 +89,8 @@ ASS 仍须每次授权读取；豆瓣用首页登录态与 CSRF 确认登录，�
 网站失效、快照 invalid、必需 Cookie 到期、身份不符或 Read Key 不可用仍阻断；
 网络或页面格式暂时无法确认豆瓣登录时只停本轮，不要求无依据的人工验证。
 
+3.22.0新增`ass-browser-session` schema1完整/schema2 complete或mixed的Cookie-only消费；全包256KiB、严格校验页面时间/基线和作用域，但不恢复storage/env/headers。额外统计Cookie/其他路径不误当授权错误，仍只选已审查的豆瓣/网易云Cookie。新增精确名称+UUID引用（默认旧名称），不自动切新项/签Key/授grant；旧两项保留并迁移新两项时，需明确授权将Read Key授权数量上限从默认2设4。
+
 配置、权限、兼容范围、验收步骤和离线验证见 [ASS 接入说明](plugins/traktratingssync/ASS.md)。
 本功能不接入 Trakt、微信读书或小宇宙凭据，不新增依赖、宿主配置或数据库迁移。
 

@@ -220,7 +220,7 @@ def test_fresh_read_pins_key_tenant_secret_and_version(monkeypatch, tmp_path):
     assert helper.read_cookies() == {"dbcl2": '"123:test"'}
     assert len(paths) == 8 and paths[0] == paths[4] == "/api/v1/secrets/access-status"
     assert set(vars(helper)) == {"_site", "_origin", "_key_file", "_tenant", "_secret", "_account",
-                                 "_site_id", "_age", "_csrf_scope", "_observation_age_seconds", "_get"}  # _get 是测试桩。
+                                 "_site_id", "_age", "_csrf_scope", "_observation_age_seconds", "_secret_name", "_max_grants", "_get"}  # _get 是测试桩。
 
 
 @pytest.mark.parametrize("index,change", [(0, {"tenant_id": SECRET}), (0, {"key_id": SECRET}),
@@ -603,6 +603,6 @@ def test_release_metadata_matches_plugin_and_documentation(monkeypatch):
     module = _load_plugin_module(monkeypatch)
     root = Path(__file__).resolve().parents[1]
     metadata = json.loads((root / "package.json").read_text())["TraktRatingsSync"]
-    assert metadata["version"] == module.TraktRatingsSync.plugin_version == "3.21.2"
-    assert "v3.21.2" in metadata["history"]
+    assert metadata["version"] == module.TraktRatingsSync.plugin_version == "3.22.0"
+    assert "v3.22.0" in metadata["history"]
     assert (root / "plugins/traktratingssync/ASS.md").is_file()

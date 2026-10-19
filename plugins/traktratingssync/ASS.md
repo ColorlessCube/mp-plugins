@@ -1,6 +1,6 @@
 # 豆瓣 / 网易云 ASS 只读凭据
 
-适用于 `TraktRatingsSync` 3.21.1（3.21.0 起支持 ASS）。仅改变豆瓣与网易云的 Cookie 来源，不改变 Trakt PKCE、
+适用于 `TraktRatingsSync` 3.22.0（3.21.0 起支持旧包，3.22.0 起支持完整浏览器会话）。仅改变豆瓣与网易云的 Cookie 来源，不改变 Trakt PKCE、
 微信读书 Skill Key、小宇宙刷新令牌、历史缓存、匹配、共享写入额度或调度入口。
 升级默认仍使用原有手动 Cookie；初始化、保存配置、打开页面不读取 ASS、不调用网站、不触发同步。
 
@@ -9,9 +9,9 @@
 由 ASS 管理员另行签发**专用消费者 Read Key**：
 
 - 仅 `rest`；scope 为 `secrets:metadata:read`、`secrets:value:read`。
-- `secret_ids` 精准绑定实际需要的 `douban`、`netease` **现有条目 UUID**，不授予整个租户；
+- `secret_ids` 精准绑定实际需要的豆瓣、网易云**现有条目 UUID**（旧名或`session.douban.main` / `session.netease.main`），不授予整个租户；
   `allowed_secret_names` 留空（它是采集 Write Key 的授权字段，不能用于 Read Key）。
-  本适配器只支持这两个固定名称，拒绝有效授权条目数超过 2 的 Key。
+  适配器固定两个网站，各自配置精确名称+UUID。默认拒绝有效授权数超过2；保留旧两项并过渡到新两项时，只有明确批准补充精确grant和将`ass_max_grants`设4才接受，最多4。插件本身不授予权限。
   名称对应的条目删除/重建后不自动扩大授权，必须重新审查。
 - 默认有效期 90 天；只有用户明确批准长期有效时才显式设置 `expires_at=null`（永不过期，直至撤销）。
 - 不授予 `secrets:write`，不复用 Chrome 采集 Key / producer；设置合理有效期与读额度。
@@ -35,6 +35,7 @@ Read Key 仅放在 MoviePilot 进程可读的文件中，配置页面只填路�
 | `ass_origin` | 直连 HTTPS origin，例如 `https://ass.example.com:18443`；无认证信息、路径、query 或 fragment |
 | `ass_key_file` | MoviePilot **容器内**受保护文件的绝对路径 |
 | `ass_tenant_id` | 凭据所属租户 UUID |
+| `ass_max_grants` | Read Key有效授权数上限，默认2，1–4整数；迁移保留旧两项时须明确批准设4，并非自动扩权 |
 | `ass_max_age` | 观察陈旧提示阈值，默认 3600 秒，60–86400；3.21.1 起超过阈值仅提示，不阻断网站登录检查。保留原字段和值，无需重配 |
 
 豆瓣和网易云各自填写：
@@ -42,7 +43,8 @@ Read Key 仅放在 MoviePilot 进程可读的文件中，配置页面只填路�
 | 字段 | 含义 |
 | --- | --- |
 | `<site>_cookie_source` | `manual`（默认）或 `ass`，其中 site 为 `douban` / `netease` |
-| `<site>_ass_secret_id` | 固定名称条目的 UUID，不能只按名称追随删除后重建的条目 |
+| `<site>_ass_secret_name` | 精确条目名称，默认保留旧douban/netease；新完整会话显式填写例如session.douban.main |
+| `<site>_ass_secret_id` | 与名称共同固定的条目 UUID，不能只按名称追随删除后重建的条目 |
 | `<site>_ass_site_id` | 实际策略的 site_id，默认 `douban` / `netease`，必须核对 |
 | `<site>_ass_account_id` | 实际策略的 account_id，必填，不假设为 main |
 
@@ -55,7 +57,13 @@ Read Key 仅放在 MoviePilot 进程可读的文件中，配置页面只填路�
 使用独立 Session，不继承环境代理或 `.netrc`；不存在忽略证书的选项。网络出口必须支持直连。
 网站登录重定向会被拒绝/识别为未通过检查，不跟随跳转发送 Cookie。
 
-## 固定消费范围与 v1/v2
+## 固定消费范围与旧/新协议
+
+3.22.0继续支持旧`ass-cookie-bundle` schema1/2（16KiB/100个/单值4096旧限制不变），同时支持`ass-browser-session` schema1完整、schema2 complete/mixed。新包256KiB UTF8/500个/单Cookie16KiB，页面storage可含118331bytes等大值但总包仍不得超限。只按本地固定Cookie范围投影，不把额外统计Cookie或其他路径误当授权扩张；全部Cookie及页面结构/来源/大小仍严格验证，不忽略未知字段/分区/重复物理身份。
+
+新包schema2必须带有效capture_mode/pages_observed_at/page_baseline_id：complete的页面时间等于本次观察、基线ID等于自身；mixed保留旧页面时间/ID且不晚于组合生成。这里只消费当前Cookie，**不恢复或使用env/storage/headers**；页面旧不冒充新，观察年龄来自Cookie的observed_at。mixed可用于HTTP Cookie投影，但不是同账号/登录证明，也不解除验证码/暂停或当作新登录。失效/空包/过期必需Cookie仍阻断。无本地明文快照缓存。
+
+新增字段不自动改来源/UUID/Key/grant/调度；生产切源须另明确授权和只读账号验收，原手动Cookie不回退。旧值和旧Read grants可保留，默认2的授权上限不静默变4。
 
 适配器自包含，不导入 ASS 后端，不需要新依赖。固定消费契约如下：
 
@@ -63,10 +71,8 @@ Read Key 仅放在 MoviePilot 进程可读的文件中，配置页面只填路�
   原生 `dbcl2` 的平衡外层双引号保留。快照中的同域根路径 `ck` 经过结构验证但不沿用，仍从豆瓣首页刷新 CSRF。
   已选 domain Cookie 适用于已有的 www/movie/book/music 豆瓣操作；不将 host-only 凭据扩大到子域。
 - 网易云 source_origins 仅 `https://music.163.com`；消费 `music.163.com` 根路径 `/` 的 **domain** `MUSIC_U`（必需）与 `__csrf`（可选）。
-- 每一个 Cookie 都检查结构、名称、域、路径、长度、请求头字符、store `0`、session/expiry 一致性；
-  不接受 partitionKey、混合 store、未知字段或超出上述固定范围的 Cookie。不同策略范围需要另行评审，不能自动放宽。
-- 完整快照最多 16 KiB UTF-8 / 100 个 Cookie；严格 JSON，不接受重复字段、非有限数或 bool/string 版本。
-  v1 的身份是 name + 规范域 + path，v2 再加 hostOnly；同一物理身份重复始终拒绝。
+- 每个Cookie验证结构、域/来源、路径、长度、store0与session/expiry；新完整包可有同来源额外Cookie但不被消费，只有选中Cookie检查HTTP头字符。旧包仍拒绝名单外Cookie；分区/混合store/未知字段一律拒绝。不能把host-only扩大到子域，不能将其他路径的同名Cookie串到根请求。
+- 旧包16KiB/100个，旧v1身份为name+规范域+path、旧v2再加hostOnly；新包始终包含hostOnly区别。严格JSON拒绝重复字段、非有限数和bool/string版本；物理重复始终拒绝，新包全包和各组件限制见上。
 - 按本地配置固定账户与网站来源，要求 captured、观察不早于生成时间，生成/观察时间不能超前本机 60 秒；
   未初始化、invalid、过期必需 Cookie 或不可用 Key 均阻断。生成时间不是网站签发时间。
 - **观察时间过旧不等于 Cookie 失效。** 3.21.1 起，超过 `ass_max_age` 只在日志（每轮每站一次）与详情页提示，
@@ -93,7 +99,7 @@ Read Key 仅放在 MoviePilot 进程可读的文件中，配置页面只填路�
 
 每次 ASS 读取执行 access-status → metadata → value → metadata 四次鉴权 GET。
 固定 token 内 Key ID、租户、条目 UUID、名称和前后 value version；观察到变化立即拒绝，不重新请求猜测结果。
-TLS、HTTP 状态、JSON 和响应分块检查有超时、整体期限及 20 KiB 响应上限，失败只暴露固定错误分类。
+TLS、HTTP状态、JSON和响应分块有超时/整体期限；metadata/status仍20KiB，只有value响应允许至2MiB以容纳262144bytes内层JSON的再次转义，内层仍按旧/新限制验证。失败仅固定分类，不输出全包或底层异常。
 
 - 豆瓣初始化登录检查、每次凭据搜索、每个待提交目标都重新授权读取。
   ASS 模式复用原首页 GET，同时要求 HTTP 200、已登录页面标记及有效 CSRF。

@@ -88,6 +88,137 @@ class _Bundle(BaseModel):
     cookies: List[_Cookie] = Field(max_length=100, repr=False)
 
 
+MAX_SESSION_BYTES = 256 * 1024
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+SAFE_HEADERS = {"user-agent", "accept", "accept-language", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"}
+
+
+class _BrowserCookie(_Cookie):
+    value: SecretStr = Field(max_length=16384)
+
+
+class _Storage(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    local: Dict[str, SecretStr] = Field(repr=False)
+    session: Dict[str, SecretStr] = Field(repr=False)
+
+
+class _Page(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    origin: str
+    page_url: str = Field(max_length=2048)
+    referrer: Optional[str] = Field(default=None, max_length=2048)
+    visibility_state: Literal["visible", "hidden", "unknown"] = "unknown"
+    env: Dict[str, Any] = Field(repr=False)
+    storage: _Storage = Field(repr=False)
+    headers: Dict[str, SecretStr] = Field(repr=False)
+    headers_status: Literal["observed", "not_observed"]
+
+
+class _BrowserBundle(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    format: Literal["ass-browser-session"]
+    schema_version: int
+    capture_mode: Optional[Literal["complete", "mixed"]] = None
+    pages_observed_at: Optional[str] = None
+    page_baseline_id: Optional[str] = None
+    site_id: str = Field(pattern=r"^[a-z][a-z0-9._-]{0,62}$")
+    account_id: str = Field(pattern=r"^[a-z][a-z0-9._-]{0,62}$")
+    producer_id: str
+    snapshot_id: str
+    ordering_mode: Literal["snapshot_created_at"]
+    snapshot_created_at: str
+    observed_at: str
+    state: Literal["captured", "invalid"]
+    reason: Optional[Literal["manual_invalidation"]] = None
+    source_origins: List[str] = Field(min_length=1, max_length=5)
+    cookies: List[_BrowserCookie] = Field(max_length=500, repr=False)
+    pages: List[_Page] = Field(max_length=5, repr=False)
+
+
+def _bounded_environment(value, depth=0):
+    """只验证页面环境边界，不将它还原到网站或输出给日志。"""
+    if depth > 5:
+        raise ValueError
+    if isinstance(value, dict):
+        if len(value) > 40 or any(not isinstance(k, str) or len(k) > 128 for k in value):
+            raise ValueError
+        for child in value.values():
+            _bounded_environment(child, depth + 1)
+    elif isinstance(value, list):
+        if len(value) > 40:
+            raise ValueError
+        for child in value:
+            _bounded_environment(child, depth + 1)
+    elif isinstance(value, str):
+        if len(value.encode("utf-8")) > 4096:
+            raise ValueError
+    elif value is not None and (type(value) not in (int, float, bool) or (type(value) is float and not math.isfinite(value))):
+        raise ValueError
+
+
+def _validate_browser(bundle):
+    """严格验证完整/混合包与原页面年龄；只将 Cookie 子集交给业务。"""
+    if bundle.schema_version == 1:
+        if any(v is not None for v in (bundle.capture_mode, bundle.pages_observed_at, bundle.page_baseline_id)):
+            raise ValueError
+    else:
+        if bundle.state != "captured" or bundle.capture_mode is None:
+            raise ValueError
+        page_time = _timestamp(bundle.pages_observed_at)
+        _uuid(bundle.page_baseline_id)
+        if page_time > _timestamp(bundle.observed_at):
+            raise ValueError
+        if bundle.capture_mode == "complete":
+            if page_time != _timestamp(bundle.observed_at) or bundle.page_baseline_id != bundle.snapshot_id:
+                raise ValueError
+        elif bundle.page_baseline_id == bundle.snapshot_id or page_time > _timestamp(bundle.snapshot_created_at):
+            raise ValueError
+    if bundle.source_origins != sorted(set(bundle.source_origins)):
+        raise ValueError
+    hosts = [urlsplit(x).hostname for x in bundle.source_origins]
+    identities = set()
+    for cookie in bundle.cookies:
+        domain = cookie.domain.removeprefix(".")
+        if (not re.fullmatch(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", domain)
+                or any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-") for label in domain.split("."))
+                or not any(host == domain or (not cookie.hostOnly and host.endswith("." + domain)) for host in hosts)
+                or (cookie.hostOnly and cookie.domain.startswith("."))
+                or cookie.session != (cookie.expirationDate is None)):
+            raise ValueError
+        identity = (cookie.name, domain, cookie.path, cookie.hostOnly)
+        if identity in identities:
+            raise ValueError
+        identities.add(identity)
+        value = cookie.value.get_secret_value()
+        if len(value.encode("utf-8")) > 16384 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError
+    if bundle.state == "invalid":
+        if bundle.cookies or bundle.pages or bundle.reason != "manual_invalidation":
+            raise ValueError
+        return
+    if bundle.reason is not None or sorted(p.origin for p in bundle.pages) != bundle.source_origins:
+        raise ValueError
+    for page in bundle.pages:
+        for value in (page.page_url, page.referrer):
+            if value is None:
+                continue
+            url = urlsplit(value)
+            if (url.scheme + "://" + url.netloc != page.origin or url.query or url.fragment
+                    or url.username is not None or url.password is not None or any(ord(c) <= 32 for c in value)):
+                raise ValueError
+        if set(page.env) != {"navigator", "screen", "intl"} or any(not isinstance(v, dict) for v in page.env.values()):
+            raise ValueError
+        _bounded_environment(page.env)
+        for entries in (page.storage.local, page.storage.session):
+            if len(entries) > 500 or any(len(k.encode("utf-8")) > 512 or len(v.get_secret_value().encode("utf-8")) > MAX_SESSION_BYTES for k, v in entries.items()):
+                raise ValueError
+        if set(page.headers) - SAFE_HEADERS or (page.headers_status == "not_observed" and page.headers):
+            raise ValueError
+        if any(len(v.get_secret_value().encode("utf-8")) > 2048 or "\r" in v.get_secret_value() or "\n" in v.get_secret_value() for v in page.headers.values()):
+            raise ValueError
+
+
 def _json_object(pairs):
     """拒绝重复 JSON 字段，避免解码器之间出现不同身份解释。"""
     result = {}
@@ -149,6 +280,12 @@ class AssCookieHelper:
                 raise ValueError
             self._tenant = _uuid(config.get("ass_tenant_id"))
             self._secret = _uuid(config.get(f"{site}_ass_secret_id"))
+            self._secret_name = config.get(f"{site}_ass_secret_name", site)
+            if not isinstance(self._secret_name, str) or not re.fullmatch(r"[a-z][a-z0-9._-]{0,127}", self._secret_name):
+                raise ValueError
+            self._max_grants = config.get("ass_max_grants", 2)
+            if type(self._max_grants) is not int or not 1 <= self._max_grants <= 4:
+                raise ValueError
             self._account = config.get(f"{site}_ass_account_id", "")
             self._site_id = config.get(f"{site}_ass_site_id", site)
             if any(not isinstance(v, str) or not re.fullmatch(r"[a-z][a-z0-9._-]{0,62}", v)
@@ -205,7 +342,7 @@ class AssCookieHelper:
                     raise AssCookieError(code)
                 raw = bytearray()
                 for chunk in response.iter_content(1024):
-                    if time.monotonic() > deadline or len(raw) + len(chunk) > 20 * 1024:
+                    if time.monotonic() > deadline or len(raw) + len(chunk) > (MAX_RESPONSE_BYTES if path.endswith("/value") else 20 * 1024):
                         raise AssCookieError("ass_response_invalid")
                     raw.extend(chunk)
                 return _decode(raw.decode("utf-8"))
@@ -229,22 +366,22 @@ class AssCookieHelper:
                         or status.get("value_scope_authorized") is not True
                         or type(status.get("revision")) is not int or status["revision"] < 1
                         or type(status.get("active_grant_count")) is not int
-                        or not 1 <= status["active_grant_count"] <= 2
+                        or not 1 <= status["active_grant_count"] <= self._max_grants
                         or not -5 <= now - _timestamp(status["checked_at"], milliseconds=False) <= 60
                         or (status.get("expires_at") is not None
                             and _timestamp(status["expires_at"], milliseconds=False) <= now)):
                     raise AssCookieError("ass_identity_mismatch")
-                path = f"/api/v1/secrets/{self._site}"
+                path = f"/api/v1/secrets/{self._secret_name}"
                 before = self._get(session, token, path + "/metadata", deadline)
                 version = before.get("current_version")
-                if (before.get("id") != self._secret or before.get("name") != self._site
+                if (before.get("id") != self._secret or before.get("name") != self._secret_name
                         or type(version) is not int or version < 1):
                     raise AssCookieError("ass_secret_binding_changed")
                 value = self._get(session, token, path + "/value", deadline)
                 after = self._get(session, token, path + "/metadata", deadline)
-                if (after.get("id") != self._secret or after.get("name") != self._site
+                if (after.get("id") != self._secret or after.get("name") != self._secret_name
                         or type(after.get("current_version")) is not int
-                        or after["current_version"] != version or value.get("name") != self._site
+                        or after["current_version"] != version or value.get("name") != self._secret_name
                         or type(value.get("version")) is not int or value["version"] != version):
                     raise AssCookieError("ass_secret_binding_changed")
                 return self._project(value.get("value"), time.time())
@@ -257,11 +394,17 @@ class AssCookieHelper:
         """验证完整 v1/v2 快照后投影；网站仍需独立确认登录有效。"""
         self._observation_age_seconds = None
         try:
-            if not isinstance(raw, str) or len(raw.encode("utf-8")) > 16384:
+            if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_SESSION_BYTES:
                 raise ValueError
-            bundle = _Bundle.model_validate(_decode(raw))
-            if bundle.schema_version not in (1, 2):
+            data = _decode(raw)
+            if type(data.get("schema_version")) is not int or data["schema_version"] not in (1, 2):
                 raise ValueError
+            browser = data.get("format") == "ass-browser-session"
+            if not browser and len(raw.encode("utf-8")) > 16384:
+                raise ValueError
+            bundle = (_BrowserBundle if browser else _Bundle).model_validate(data)
+            if browser:
+                _validate_browser(bundle)
             _uuid(bundle.producer_id)
             _uuid(bundle.snapshot_id)
             created, observed = _timestamp(bundle.snapshot_created_at), _timestamp(bundle.observed_at)
@@ -271,10 +414,10 @@ class AssCookieHelper:
                     or set(bundle.source_origins) != {self._SOURCES[self._site]}):
                 raise AssCookieError("ass_cookie_binding_mismatch")
             if bundle.state == "invalid":
-                if bundle.cookies or bundle.reason != "required_cookie_missing":
+                if bundle.cookies or bundle.reason != ("manual_invalidation" if browser else "required_cookie_missing"):
                     raise ValueError
                 raise AssCookieError("ass_cookie_invalidated")
-            if not bundle.cookies or bundle.reason is not None:
+            if (not browser and not bundle.cookies) or bundle.reason is not None:
                 raise ValueError
             # 浏览器离线不等于登录失效；未来时间仍按时钟异常拒绝。
             if observed - now > 60 or created - now > 60:
@@ -286,12 +429,14 @@ class AssCookieHelper:
             selected = {}
             for cookie in bundle.cookies:
                 domain = cookie.domain.removeprefix(".")
+                if browser and (cookie.name not in allowed or domain != allowed[cookie.name] or cookie.path != "/"):
+                    continue
                 if (cookie.name not in allowed or domain != allowed[cookie.name] or cookie.path != "/"
                         or (cookie.hostOnly and cookie.domain.startswith("."))
                         or cookie.session != (cookie.expirationDate is None)):
                     raise ValueError
                 identity = (cookie.name, domain, cookie.path)
-                if bundle.schema_version == 2:
+                if browser or bundle.schema_version == 2:
                     identity += (cookie.hostOnly,)
                 if identity in identities:
                     raise ValueError

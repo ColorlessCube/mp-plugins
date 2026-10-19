@@ -50,7 +50,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影无需评分同步看过、剧集逐季在看/看过，微信读书、网易云专辑、小宇宙播客；支持未匹配记录处理。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.21.2"
+    plugin_version = "3.22.0"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -127,6 +127,9 @@ class TraktRatingsSync(_PluginBase):
         age = self._ass_config["ass_max_age"]
         if isinstance(age, str) and re.fullmatch(r"[0-9]{1,6}", age):
             self._ass_config["ass_max_age"] = int(age)
+        grants = self._ass_config["ass_max_grants"]
+        if isinstance(grants, str) and re.fullmatch(r"[0-9]", grants):
+            self._ass_config["ass_max_grants"] = int(grants)
         self._douban_write_limit = max(1, int(config.get("douban_write_limit") or 10))
         self._douban_write_interval = max(5, int(config.get("douban_write_interval") or 10))
         self._weread_api_key = (config.get("weread_api_key") or "").strip()
@@ -1113,9 +1116,9 @@ class TraktRatingsSync(_PluginBase):
     @staticmethod
     def _ass_defaults() -> Dict[str, Any]:
         """只读适配器的非敏感配置白名单。"""
-        return {"ass_origin": "", "ass_key_file": "", "ass_tenant_id": "", "ass_max_age": 3600,
-                "douban_ass_secret_id": "", "douban_ass_site_id": "douban", "douban_ass_account_id": "",
-                "netease_ass_secret_id": "", "netease_ass_site_id": "netease", "netease_ass_account_id": "",
+        return {"ass_origin": "", "ass_key_file": "", "ass_tenant_id": "", "ass_max_age": 3600, "ass_max_grants": 2,
+                "douban_ass_secret_id": "", "douban_ass_secret_name": "douban", "douban_ass_site_id": "douban", "douban_ass_account_id": "",
+                "netease_ass_secret_id": "", "netease_ass_secret_name": "netease", "netease_ass_site_id": "netease", "netease_ass_account_id": "",
                 "netease_ass_csrf_scope": "reject_ambiguous"}
 
     def _credential_reference(self, site: str) -> str:
@@ -1692,6 +1695,7 @@ class TraktRatingsSync(_PluginBase):
             return [select(f"{site}_cookie_source", f"{label}凭据来源", [("手动配置", "manual"), ("ASS 只读", "ass")]),
                     credential(f"{site}_cookie", f"{label} Cookie", "支持 Cookie 字符串或完整 cURL；ASS 模式不读取此字段",
                                show=f"{{{{ {site}_cookie_source === 'manual' }}}}"),
+                    field(f"{site}_ass_secret_name", "ASS 精确条目名称", hint="例如 session.douban.main；与下方UUID共同固定，不自动追随同名重建", show=f"{{{{ {site}_cookie_source === 'ass' }}}}"),
                     field(f"{site}_ass_secret_id", "ASS 条目 UUID", show=f"{{{{ {site}_cookie_source === 'ass' }}}}"),
                     row(field(f"{site}_ass_site_id", "ASS site_id", show=f"{{{{ {site}_cookie_source === 'ass' }}}}"),
                         field(f"{site}_ass_account_id", "ASS account_id", show=f"{{{{ {site}_cookie_source === 'ass' }}}}"))]
@@ -1703,10 +1707,12 @@ class TraktRatingsSync(_PluginBase):
         ass = [field("ass_origin", "ASS 直连 HTTPS 地址", hint="不能使用跨主机跳转的入口"),
                field("ass_key_file", "Read Key 只读文件绝对路径", hint="文件在 MoviePilot 容器内；不在页面填写 Key", **{"persistent-hint": True}),
                field("ass_tenant_id", "ASS 租户 UUID"),
+               field("ass_max_grants", "Read Key 精确授权数量上限", type="number", min=1, max=4,
+                     hint="默认2；保留旧项并迁移到两个新会话时可明确设4，不会自动新增授权。", **{"persistent-hint": True}),
                field("ass_max_age", "观察时间陈旧提示阈值（秒）", type="number", min=60, max=86400,
                      hint="超过阈值只提示，不直接阻断；Cookie 能否使用由网站登录检查决定。", **{"persistent-hint": True}),
                {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                "text": "仅授权 douban / netease 的 REST metadata/read + value/read；每次操作新鲜读取，失败不回退旧凭据。双 __csrf 必须先验证作用域，标签不代表网站身份。"}}]
+                "text": "仅授权所选两站精确条目的 REST metadata/read + value/read；支持旧Cookie包与新完整/混合会话，但只消费Cookie、不恢复页面数据。每次操作新鲜读取，失败不回退旧凭据。双 __csrf 必须先验证作用域，标签不代表网站身份。"}}]
         if state.get("requires_verification"):
             douban.extend([
                 {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "{{ _ui_douban_message }}"}},
