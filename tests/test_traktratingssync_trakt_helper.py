@@ -62,6 +62,9 @@ class _Response:
         """模拟 requests.Response 在 4xx/5xx 时为 False。"""
         return self.status_code < 400
 
+    def close(self):
+        """模拟释放已经缓冲的响应连接。"""
+
 
 def _load_trakt_helper_module(monkeypatch):
     """加载 TraktHelper 并替换 MoviePilot 边界依赖。"""

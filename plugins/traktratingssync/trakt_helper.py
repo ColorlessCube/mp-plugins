@@ -13,12 +13,15 @@ import math
 import random
 import re
 import secrets
+import ssl
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import cn2an
+from requests.exceptions import ChunkedEncodingError, ConnectionError, ProxyError, RequestException, SSLError, Timeout
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, ProxyError as Urllib3ProxyError, SSLError as Urllib3SSLError
 
 from app.chain.media import MediaChain
 from app.core.config import global_vars, settings
@@ -47,6 +50,10 @@ class TraktHelper:
     _AUTH_BASE = "https://auth.trakt.tv"
     _API_VERSION = "2"
     _REQUEST_JITTER_RANGE = (0.5, 1.5)
+    _READ_MAX_ATTEMPTS = 3
+    _READ_RETRY_DELAYS = (1.0, 2.0)
+    _READ_RETRY_STATUSES = (502, 503, 504)
+    _READ_ERROR_MAX_NODES = 32
     _PKCE_AUTH_URL = "https://auth.trakt.tv/oauth/authorize"
     _PKCE_LIFETIME_SECONDS = 600
 
@@ -79,6 +86,7 @@ class TraktHelper:
         }
         self._last_oauth_unauthorized = False
         self._request_issue_kind = "temporary"
+        self._last_read_transport = "none"
         self._matching = matching_helper
         self._match_transient = False
 
@@ -115,7 +123,67 @@ class TraktHelper:
         logger.debug("Trakt %s 前随机等待 %.2f 秒", action, delay)
         time.sleep(delay)
 
-    def _log_response_failure(self, action: str, response: Any, oauth: bool = False) -> None:
+    @classmethod
+    def _classify_read_error(cls, error: RequestException) -> tuple[str, bool]:
+        """有界检查结构化异常链；TLS 优先拒绝，代理仅重试明确的瞬时连接故障。"""
+        pending: list[BaseException] = [error]
+        seen, errors, leaves = set(), [], []
+        truncated = False
+        while pending and len(seen) < cls._READ_ERROR_MAX_NODES:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            errors.append(current)
+            if isinstance(current, (SSLError, Urllib3SSLError, ssl.SSLError)):
+                return "tls", False
+            truncated = truncated or len(current.args) > cls._READ_ERROR_MAX_NODES
+            children = [value for value in (
+                current.__cause__, current.__context__, getattr(current, "reason", None),
+                getattr(current, "original_error", None), *current.args[:cls._READ_ERROR_MAX_NODES],
+            ) if isinstance(value, BaseException)]
+            pending.extend(children)
+            if not children:
+                leaves.append(current)
+        complete = not pending and not truncated
+        if any(isinstance(current, (ProxyError, Urllib3ProxyError)) for current in errors):
+            # 未知实际故障即使带瞬时原因也不能重试；仅将明确的包装类型视为透明节点。
+            transient = (ConnectTimeoutError, Timeout, TimeoutError,
+                         ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError)
+            wrappers = (ProxyError, Urllib3ProxyError, MaxRetryError, ConnectionError)
+            return "proxy", bool(complete and leaves and all(isinstance(leaf, transient) for leaf in leaves)
+                                 and all(type(current) in wrappers or isinstance(current, transient) for current in errors))
+        transport = ("timeout" if isinstance(error, Timeout) else "connection" if isinstance(error, ConnectionError)
+                     else "transfer" if isinstance(error, ChunkedEncodingError) else "request")
+        return transport, complete and isinstance(error, (ConnectionError, Timeout, ChunkedEncodingError))
+
+    def _get_read_response(self, action: str, url: str, headers: Dict[str, str],
+                           timeout: int, params: Optional[Dict[str, Any]] = None) -> Any:
+        """只读 GET 有限重试；完整缓冲后关闭响应，调用方仍可解析正文。"""
+        self._last_read_transport = "none"
+        for attempt in range(self._READ_MAX_ATTEMPTS):
+            try:
+                response = RequestUtils(timeout=timeout, headers=headers, proxies=settings.PROXY).get_res(
+                    url=url, params=params, raise_exception=True, allow_redirects=False, stream=False,
+                )
+                self._last_read_transport = "no_response" if response is None else "none"
+            except RequestException as error:
+                self._last_read_transport, retryable = self._classify_read_error(error)
+                if not retryable:
+                    return None
+                response = None
+            status = response.status_code if response is not None else None
+            if response is not None:
+                response.close()
+            if (response is not None and status not in self._READ_RETRY_STATUSES) or attempt == self._READ_MAX_ATTEMPTS - 1:
+                return response
+            delay = self._READ_RETRY_DELAYS[attempt]
+            logger.warning(f"Trakt {action}读取暂时失败（status={status}, transport={self._last_read_transport}），"
+                           f"{delay:g} 秒后重试（第 {attempt + 2}/{self._READ_MAX_ATTEMPTS} 次）")
+            time.sleep(delay)
+        return None
+
+    def _log_response_failure(self, action: str, response: Any, oauth: bool = False, transport: str = "") -> None:
         """仅记录响应分类，避免错误正文或请求地址泄露认证信息。"""
         status = getattr(response, "status_code", None)
         headers = getattr(response, "headers", {}) or {}
@@ -128,6 +196,8 @@ class TraktHelper:
         if content_type not in ("application/json", "text/html", "text/plain"):
             content_type = "其他" if content_type else "未知"
         detail = f"status={status}, content_type={content_type}, html={is_html}"
+        if response is None and transport:
+            detail += f", transport={transport}"
         if status == 403:
             if is_html:
                 advice = "响应疑似边缘或上游拦截页面，请检查网络出口及上游访问限制"
@@ -184,9 +254,9 @@ class TraktHelper:
 
         try:
             self._sleep_before_request(f"fetch_ratings/{media_type}")
-            resp = RequestUtils(timeout=30, headers=self._headers, proxies=settings.PROXY).get_res(url=url)
+            resp = self._get_read_response("公开评分接口", url, self._headers, timeout=30)
             if resp is None:
-                self._log_response_failure("公开评分接口", resp)
+                self._log_response_failure("公开评分接口", resp, transport=self._last_read_transport)
                 return None
             if resp.status_code == 200:
                 data = resp.json()
@@ -236,9 +306,9 @@ class TraktHelper:
         url = f"{self._API_BASE}{path}"
         try:
             self._sleep_before_request(f"fetch_playback/{path}")
-            resp = RequestUtils(timeout=20, headers=headers, proxies=settings.PROXY).get_res(url=url)
+            resp = self._get_read_response("播放进度", url, headers, timeout=20)
             if resp is None:
-                self._log_response_failure("播放进度", resp, oauth=True)
+                self._log_response_failure("播放进度", resp, oauth=True, transport=self._last_read_transport)
                 return None
             if resp.status_code == 204:
                 return []
@@ -275,12 +345,12 @@ class TraktHelper:
         url = f"{self._API_BASE}/sync/history/{media_type}"
         try:
             self._sleep_before_request(f"fetch_history/{media_type}")
-            resp = RequestUtils(timeout=20, headers=headers, proxies=settings.PROXY).get_res(
-                url=url,
+            resp = self._get_read_response(
+                "观看历史", url, headers, timeout=20,
                 params={"limit": max(1, int(limit or 20))},
             )
             if resp is None:
-                self._log_response_failure("观看历史", resp, oauth=True)
+                self._log_response_failure("观看历史", resp, oauth=True, transport=self._last_read_transport)
                 return None
             if resp.status_code == 204:
                 return []
@@ -312,13 +382,14 @@ class TraktHelper:
         params = {"hidden": "true", "specials": "false", "last_activity": "watched"} if path == "progress/watched" else {"extended": "full"}
         try:
             self._sleep_before_request("季度完成状态")
-            response = RequestUtils(timeout=20, headers=headers, proxies=settings.PROXY).get_res(
-                url=f"{self._API_BASE}/shows/{quote(str(show_id), safe='')}" + (f"/{path}" if path else ""), params=params,
+            response = self._get_read_response(
+                "季度完成状态", f"{self._API_BASE}/shows/{quote(str(show_id), safe='')}" + (f"/{path}" if path else ""),
+                headers, timeout=20, params=params,
             )
             if response is None or response.status_code != 200:
                 if response is not None and response.status_code == 401 and access_token:
                     self._last_oauth_unauthorized = True
-                self._log_response_failure("季度完成状态", response, oauth=bool(access_token))
+                self._log_response_failure("季度完成状态", response, oauth=bool(access_token), transport=self._last_read_transport)
                 return None
             data = response.json()
             expected = list if path == "seasons" else dict

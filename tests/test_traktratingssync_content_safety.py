@@ -6,6 +6,7 @@ import pytest
 
 from test_traktratingssync_douban_helper import _Response, _build_helper, _load_douban_helper_module, block_network
 from test_traktratingssync_trakt_helper import _build_helper as _build_trakt, _load_trakt_helper_module
+from test_traktratingssync_trakt_helper import _Response as _TraktResponse
 from test_traktratingssync_presentation import _plugin
 from test_traktratingssync_completion import _state, _douban
 
@@ -139,9 +140,9 @@ def test_new_show_rating_updates_verified_incomplete_season_without_completing_i
     assert posts[0]["status"] == "do" and posts[0]["rating"] == 4
 
 
-@pytest.mark.parametrize("response,category", [(None, "temporary"), (_Response(503), "temporary"),
-    (_Response(401), "auth"), (_Response(403), "application"),
-    (_Response(403, text="<html>blocked</html>"), "access"), (_Response(429), "rate_limit")])
+@pytest.mark.parametrize("response,category", [(None, "temporary"), (_TraktResponse(503), "temporary"),
+    (_TraktResponse(401), "auth"), (_TraktResponse(403), "application"),
+    (_TraktResponse(403, text="<html>blocked</html>"), "access"), (_TraktResponse(429), "rate_limit")])
 def test_trakt_request_classification_and_action_match_failure(monkeypatch, response, category):
     """按真实失败类型提示，网络、限流与403不能被当成令牌过期。"""
     module = _load_trakt_helper_module(monkeypatch)
