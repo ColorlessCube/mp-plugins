@@ -603,7 +603,8 @@ def test_release_metadata_matches_plugin_and_documentation(monkeypatch):
     module = _load_plugin_module(monkeypatch)
     root = Path(__file__).resolve().parents[1]
     metadata = json.loads((root / "package.json").read_text())["TraktRatingsSync"]
-    assert metadata["version"] == module.TraktRatingsSync.plugin_version == "3.22.1"
+    assert metadata["version"] == module.TraktRatingsSync.plugin_version == "3.22.2"
+    assert "v3.22.2" in metadata["history"]
     assert "v3.22.1" in metadata["history"]
     assert "v3.22.0" in metadata["history"]
     assert (root / "plugins/traktratingssync/ASS.md").is_file()

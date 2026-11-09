@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import cn2an
+from requests import Session
 from requests.exceptions import ChunkedEncodingError, ConnectionError, ProxyError, RequestException, SSLError, Timeout
 from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, ProxyError as Urllib3ProxyError, SSLError as Urllib3SSLError
 
@@ -28,6 +29,26 @@ from app.core.config import global_vars, settings
 from app.log import logger
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
+
+
+class _ReadTransportError(RequestException):
+    """宿主日志仅见固定消息，原始异常仅用于本地结构分类。"""
+
+    def __init__(self, original_error: RequestException) -> None:
+        """保留原始异常图，但不把其字符串交给 RequestUtils。"""
+        super().__init__("trakt_read_transport_failed")
+        self.original_error = original_error
+
+
+class _ReadSession(Session):
+    """为只读请求隔离宿主的异常原文日志，不修改代理、CA 或重试策略。"""
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:
+        """通过标准会话请求，在宿主捕获之前替换日志可见异常。"""
+        try:
+            return super().request(*args, **kwargs)
+        except RequestException as error:
+            raise _ReadTransportError(error) from None
 
 
 class TraktHelper:
@@ -125,27 +146,48 @@ class TraktHelper:
 
     @classmethod
     def _classify_read_error(cls, error: RequestException) -> tuple[str, bool]:
-        """有界检查结构化异常链；TLS 优先拒绝，代理仅重试明确的瞬时连接故障。"""
-        pending: list[BaseException] = [error]
+        """有界检查完整异常图；仅确认的 TLS EOF 和明确的代理瞬时故障可重试。"""
+        pending: list[tuple[BaseException, frozenset[int]]] = [(error, frozenset())]
         seen, errors, leaves = set(), [], []
         truncated = False
         while pending and len(seen) < cls._READ_ERROR_MAX_NODES:
-            current = pending.pop()
+            current, ancestors = pending.pop()
+            if id(current) in ancestors:
+                truncated = True
+                continue
             if id(current) in seen:
                 continue
             seen.add(id(current))
             errors.append(current)
-            if isinstance(current, (SSLError, Urllib3SSLError, ssl.SSLError)):
-                return "tls", False
             truncated = truncated or len(current.args) > cls._READ_ERROR_MAX_NODES
-            children = [value for value in (
+            values = (
                 current.__cause__, current.__context__, getattr(current, "reason", None),
                 getattr(current, "original_error", None), *current.args[:cls._READ_ERROR_MAX_NODES],
-            ) if isinstance(value, BaseException)]
-            pending.extend(children)
+            )
+            # 不展开任意容器或对象，避免遗漏其中的非安全原因；有界检查失败即拒绝重试。
+            truncated = truncated or any(value is not None and not isinstance(value, (BaseException, str, int))
+                                         for value in values)
+            for attribute in ("reason", "original_error"):
+                value = getattr(current, attribute, None)
+                if value is not None and not isinstance(value, BaseException):
+                    if not (type(current) is ssl.SSLEOFError and attribute == "reason"
+                            and value == "UNEXPECTED_EOF_WHILE_READING"):
+                        truncated = True
+            children = [value for value in values if isinstance(value, BaseException)]
+            pending.extend((child, ancestors | {id(current)}) for child in children)
             if not children:
                 leaves.append(current)
         complete = not pending and not truncated
+        if any(isinstance(current, (SSLError, Urllib3SSLError, ssl.SSLError)) for current in errors):
+            if any(isinstance(current, ssl.SSLCertVerificationError)
+                   or getattr(current, "reason", None) == "CERTIFICATE_VERIFY_FAILED" for current in errors):
+                return "tls_certificate", False
+            # 包装节点可携带文案，但未知故障即使带 EOF 原因也不能变为可恢复。
+            wrappers = (SSLError, Urllib3SSLError, MaxRetryError, ConnectionError, ProxyError, Urllib3ProxyError)
+            confirmed_eof = bool(complete and leaves
+                                 and all(type(leaf) is ssl.SSLEOFError for leaf in leaves)
+                                 and all(type(current) in wrappers or type(current) is ssl.SSLEOFError for current in errors))
+            return ("tls_eof", True) if confirmed_eof else ("tls_other", False)
         if any(isinstance(current, (ProxyError, Urllib3ProxyError)) for current in errors):
             # 未知实际故障即使带瞬时原因也不能重试；仅将明确的包装类型视为透明节点。
             transient = (ConnectTimeoutError, Timeout, TimeoutError,
@@ -163,12 +205,14 @@ class TraktHelper:
         self._last_read_transport = "none"
         for attempt in range(self._READ_MAX_ATTEMPTS):
             try:
-                response = RequestUtils(timeout=timeout, headers=headers, proxies=settings.PROXY).get_res(
-                    url=url, params=params, raise_exception=True, allow_redirects=False, stream=False,
-                )
+                with _ReadSession() as session:
+                    response = RequestUtils(session=session, timeout=timeout, headers=headers, proxies=settings.PROXY).get_res(
+                        url=url, params=params, raise_exception=True, allow_redirects=False, stream=False, verify=True,
+                    )
                 self._last_read_transport = "no_response" if response is None else "none"
             except RequestException as error:
-                self._last_read_transport, retryable = self._classify_read_error(error)
+                original = error.original_error if isinstance(error, _ReadTransportError) else error
+                self._last_read_transport, retryable = self._classify_read_error(original)
                 if not retryable:
                     return None
                 response = None

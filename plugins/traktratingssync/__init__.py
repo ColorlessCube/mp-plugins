@@ -28,7 +28,7 @@ from app.plugins import _PluginBase
 from app.schemas import Response as ApiResponse, TokenPayload
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
-from .ass_cookie_helper import AssCookieError, AssCookieHelper, CredentialRequestUtils
+from .ass_cookie_helper import AssCookieError, AssCookieHelper, CredentialRequestUtils, _SafeSession
 from .douban_helper import DoubanHelper
 from .matching_helper import MatchingHelper
 from .netease_helper import NeteaseHelper
@@ -50,7 +50,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影无需评分同步看过、剧集逐季在看/看过，微信读书、网易云专辑、小宇宙播客；支持未匹配记录处理。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.22.1"
+    plugin_version = "3.22.2"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -1255,6 +1255,7 @@ class TraktRatingsSync(_PluginBase):
         if not self._bark_webhook_url:
             logger.debug("未配置 Bark Webhook URL，跳过通知发送")
             return False
+        resp = None
         try:
             title = (title or "").strip()
             content = (content or "").strip()
@@ -1267,22 +1268,41 @@ class TraktRatingsSync(_PluginBase):
                 content = title
 
             url, payload = self._build_bark_request(self._bark_webhook_url, title, content, link_url)
-            logger.debug("发送 Bark 通知: %s", title)
-            resp = RequestUtils(
-                timeout=10, headers={"Content-Type": "application/json"}
-            ).post_res(url=url, json=payload)
-            if resp and resp.status_code == 200:
-                logger.info("✅ Bark 通知发送成功: %s", title)
+            logger.debug("发送 Bark 通知")
+            # 在 RequestUtils 记录异常之前脱敏；沿用既有环境代理和 CA，不重放通知 POST。
+            with _SafeSession() as session:
+                resp = RequestUtils(
+                    session=session, timeout=10, headers={"Content-Type": "application/json"}
+                ).post_res(url=url, json=payload, verify=True, allow_redirects=False, stream=False)
+            if resp is None:
+                logger.warning("Bark 通知送达未确认：未取得服务端回执，结果未知；不立即重发")
+                return False
+            status = resp.status_code if type(resp.status_code) is int else None
+            if status != 200:
+                logger.warning(f"Bark 通知送达未确认：HTTP {status}，结果未知；不立即重发")
+                return False
+            try:
+                acknowledgement = resp.json()
+            except ValueError:
+                acknowledgement = None
+            code = acknowledgement.get("code") if isinstance(acknowledgement, dict) else None
+            if type(code) is int and code == 200:
+                logger.info("Bark 通知服务端已接受；不代表手机已收到")
                 return True
-            logger.warning(
-                "❌ Bark 通知发送失败: HTTP %s %s",
-                getattr(resp, "status_code", "None"),
-                "",
-            )
+            if type(code) is int and 400 <= code <= 599:
+                logger.warning(f"Bark 服务端拒绝通知（code={code}）")
+            else:
+                logger.warning("Bark 通知送达未确认：回执无效，结果未知；不立即重发")
             return False
-        except Exception as e:
-            logger.error(f"Bark 通知发送异常：{type(e).__name__}")
+        except Exception:
+            logger.warning("Bark 通知送达未确认：请求处理异常，结果未知；不立即重发")
             return False
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    logger.warning("Bark 响应连接释放异常")
 
     @staticmethod
     def _build_bark_request(
