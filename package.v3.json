@@ -1,0 +1,17 @@
+{
+  "QuarkDisk": {
+    "name": "夸克网盘存储",
+    "description": "保留 QuarkDisk 身份与旧配置的 MoviePilot V3.2.5 兼容适配，基于 xijin285 1.1.0；非上游官方发布。",
+    "version": "2.0.0",
+    "icon": "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/18dbf2d752de2f7729d06a532125c6a2d9d24a5b/icons/quark.ico",
+    "author": "xijin285",
+    "level": 1,
+    "v3": true,
+    "release": false,
+    "system_version": ">=3.2.5,<4",
+    "labels": "存储,网盘,V3适配",
+    "history": {
+      "v2.0.0": "V3 专用兼容适配：保留 QuarkDisk/夸克网盘身份与 enabled/cookie 配置；新增严格分页查询、五参元数据快照、统一只读管理与安全目录下载；复制仍未实现，存储管理配置动作明确拒绝；保留 GPLv3 许可与来源说明。"
+    }
+  }
+}

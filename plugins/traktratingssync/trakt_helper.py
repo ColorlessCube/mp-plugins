@@ -16,6 +16,7 @@ import secrets
 import ssl
 import time
 from datetime import datetime, timezone
+from importlib import import_module
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
@@ -652,9 +653,29 @@ class TraktHelper:
                 return {}
         if tmdb_id:
             try:
-                douban_info = await media_chain.async_get_doubaninfo_by_tmdbid(
-                    tmdbid=int(tmdb_id), mtype=mtype
-                )
+                legacy_bridge = getattr(media_chain, "async_get_doubaninfo_by_tmdbid", None)
+                if callable(legacy_bridge):
+                    douban_info = await legacy_bridge(tmdbid=int(tmdb_id), mtype=mtype)
+                else:
+                    # V3.2.5 转换接口返回原始详情 dict，不是统一媒体身份对象。
+                    # 延迟导入，避免旧宿主缺少 MediaSource 时破坏 V2 路径。
+                    media_source_enum = getattr(import_module("app.schemas.types"), "MediaSource")
+                    douban_info = await media_chain.async_convert_media_identity(
+                        target_source=media_source_enum.Douban, media_source=media_source_enum.TMDB,
+                        media_id=str(int(tmdb_id)), mtype=mtype,
+                    )
+                    if douban_info is None or (isinstance(douban_info, dict) and not douban_info):
+                        return {}
+                    if not isinstance(douban_info, dict):
+                        self._match_transient = True
+                        return {}
+                    subject_id = douban_info.get("id")
+                    if (type(subject_id) not in (str, int)
+                            or not re.fullmatch(r"0*[1-9][0-9]*", str(subject_id))
+                            or any(key in douban_info and douban_info[key] != media_source_enum.Douban
+                                   for key in ("media_source", "source"))):
+                        self._match_transient = True
+                        return {}
                 if douban_info and douban_info.get("id"):
                     logger.debug("MoviePilot 映射豆瓣信息 (TMDB %s): %s", tmdb_id, douban_info)
                     return douban_info
