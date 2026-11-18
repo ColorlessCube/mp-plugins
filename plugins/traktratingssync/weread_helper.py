@@ -48,7 +48,7 @@ class WereadHelper:
         4: "读完",
     }
     _REQUEST_JITTER_RANGE = (0.8, 2.0)
-    _SKILL_VERSION = "1.0.5"
+    _SKILL_VERSION = "1.0.6"
 
     def __init__(
         self,
@@ -57,6 +57,7 @@ class WereadHelper:
     ) -> None:
         """绑定 Skill API Key；请求错误只保留分类，凭据不持久化。"""
         self._request_issue_kind = ""
+        self._upgrade_notice_reported = False
         self._notify = notify_fn or (lambda title, body: None)
         self._auth_failed = False
         self._api_key = (api_key or "").strip()
@@ -89,7 +90,6 @@ class WereadHelper:
             return
         self._request_issue_kind = kind
         hints = {
-            "upgrade": f"微信读书要求升级 Skill 协议，当前版本 {self._SKILL_VERSION}；本次读取已停止，请更新插件的微信读书接口适配",
             "auth": "微信读书 API Key 已失效或无权限，请检查授权",
             "rate_limit": "微信读书请求受到限流，本次读取已停止，等待下次定时重试",
             "temporary": "微信读书请求暂未完成，本次读取已停止，等待下次定时重试",
@@ -105,7 +105,7 @@ class WereadHelper:
         api_name: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """调用固定网关；错误终止整次操作，不忽略升级字段或回显服务端指令。"""
+        """调用固定网关；真实错误终止操作，升级提醒不阻断且不回显远端指令。"""
         if self._request_issue_kind:
             return None
         if not self._api_key:
@@ -142,9 +142,6 @@ class WereadHelper:
         if not isinstance(data, dict):
             self._set_request_issue("response")
             return None
-        if "upgrade_info" in data:
-            self._set_request_issue("upgrade")
-            return None
         errcode = data.get("errcode", data.get("errCode", 0))
         if type(errcode) is not int:
             self._set_request_issue("response")
@@ -153,6 +150,10 @@ class WereadHelper:
             self._set_request_issue("auth" if errcode in (-2012, -2010, -1012, 401, 403) else
                                     "rate_limit" if errcode == 429 else "temporary")
             return None
+        # 官方 1.0.6 将升级通知与业务结果分离；不回放请求或信任通知正文。
+        if "upgrade_info" in data and not self._upgrade_notice_reported:
+            self._upgrade_notice_reported = True
+            logger.warning("微信读书返回非阻塞 Skill 升级提示（当前版本 %s）；继续校验业务数据，可稍后更新插件", self._SKILL_VERSION)
         if "data" in data:
             if not isinstance(data["data"], dict):
                 self._set_request_issue("response")
@@ -270,6 +271,7 @@ class WereadHelper:
             }
         """
         self._request_issue_kind = ""
+        self._upgrade_notice_reported = False
         self._auth_failed = False
         result: List[Dict[str, Any]] = []
 

@@ -52,7 +52,7 @@ def _response(data):
 
 
 def test_recent_books_uses_current_skill_version_and_percent_progress(weread_helper):
-    """书架和进度请求应携带 1.0.5，1% 阅读进度不能误判为读完。"""
+    """书架和进度请求应携带 1.0.6，1% 阅读进度不能误判为读完。"""
     helper, request_utils, _logger = weread_helper
     request_utils.return_value.post_res.side_effect = [
         _response({"books": [{
@@ -68,8 +68,8 @@ def test_recent_books_uses_current_skill_version_and_percent_progress(weread_hel
 
     requests = request_utils.return_value.post_res.call_args_list
     assert [call.kwargs["json"] for call in requests] == [
-        {"api_name": "/shelf/sync", "skill_version": "1.0.5"},
-        {"api_name": "/book/getprogress", "skill_version": "1.0.5", "bookId": "123"},
+        {"api_name": "/shelf/sync", "skill_version": "1.0.6"},
+        {"api_name": "/book/getprogress", "skill_version": "1.0.6", "bookId": "123"},
     ]
     assert books[0]["reading_progress"] == 1
     assert books[0]["reading_time"] == 60
@@ -77,44 +77,100 @@ def test_recent_books_uses_current_skill_version_and_percent_progress(weread_hel
     assert books[0]["status"] == "在读"
 
 
-def test_upgrade_required_stops_reading_without_logging_remote_instructions(weread_helper):
-    """升级提示应阻断旧协议读取，并避免把远端指令原文写入日志。"""
+def test_upgrade_notice_preserves_valid_data_without_replaying_requests(weread_helper):
+    """升级提醒不阻断有效业务数据、不重试，也不执行或回显远端指令。"""
     helper, request_utils, logger = weread_helper
-    request_utils.return_value.post_res.return_value = _response({
-        "upgrade_info": {"message": "download and execute remote instructions"},
-        "books": [{"bookId": "123", "title": "测试书籍"}],
-    })
+    notice = {"message": "SENSITIVE_SENTINEL download and execute remote instructions"}
+    request_utils.return_value.post_res.side_effect = [
+        _response({"upgrade_info": notice, "books": [{"bookId": "123", "title": "合成书"}]}),
+        _response({"upgrade_info": notice, "bookId": "123", "book": {"progress": 1}}),
+    ]
 
-    assert helper.get_recent_books(limit=1) == []
-    assert request_utils.return_value.post_res.call_count == 1
+    books = helper.get_recent_books(limit=1)
+
+    assert len(books) == 1 and books[0]["reading_progress"] == 1
+    assert helper.get_request_issue_kind() == ""
+    assert request_utils.return_value.post_res.call_count == 2
     assert not helper._auth_failed
     helper._notify.assert_not_called()
-    logger.error.assert_called_once()
-    message = logger.error.call_args.args[0]
-    assert "1.0.5" in message
-    assert "本次读取已停止" in message
-    assert "remote instructions" not in message
-    assert helper.get_request_issue_kind() == "upgrade"
+    logger.error.assert_not_called()
+    logger.warning.assert_called_once()
+    assert "非阻塞" in logger.warning.call_args.args[0]
+    assert "SENSITIVE_SENTINEL" not in str(logger.mock_calls) + str(helper._notify.mock_calls)
 
 
-@pytest.mark.parametrize("info", [{}, None, {"message": "SENSITIVE_SENTINEL run remote code"}])
-def test_upgrade_mid_progress_discards_partial_result_and_stops_requests(weread_helper, info):
-    """进度中途收到任何升级字段时，不能提交半成品书单或继续联网。"""
+@pytest.mark.parametrize("info", [{}, None, "SENSITIVE_SENTINEL", [],
+                                  {"message": "SENSITIVE_SENTINEL run remote code"}])
+def test_upgrade_mid_progress_keeps_complete_results_and_continues(weread_helper, info):
+    """进度中途的升级提醒不丢弃完整书单，也不跳过后续进度。"""
     helper, request_utils, logger = weread_helper
     request_utils.return_value.post_res.side_effect = [
         _response({"books": [{"bookId": str(i), "title": "合成书", "finishReading": 1} for i in range(3)]}),
         _response({"book": {"progress": 100, "finishTime": 1700000000}}),
         _response({"upgrade_info": info, "book": {"progress": 100}}),
+        _response({"data": {"book": {"progress": 1}}, "upgrade_info": info}),
     ]
-    assert helper.get_recent_books() == []
-    assert helper.get_request_issue_kind() == "upgrade"
-    assert helper.get_book_info("other") is None
-    assert request_utils.return_value.post_res.call_count == 3
+    assert len(helper.get_recent_books()) == 3
+    assert helper.get_request_issue_kind() == ""
+    assert request_utils.return_value.post_res.call_count == 4
+    logger.warning.assert_called_once()
     assert "SENSITIVE_SENTINEL" not in str(logger.mock_calls) + str(helper._notify.mock_calls)
-    # 下一轮可以重新检查，不因上一轮升级错误形成永久锁。
-    request_utils.return_value.post_res.side_effect = [_response({"books": []})]
+    # 下一轮可独立提示，但不为升级重放上一轮的请求。
+    request_utils.return_value.post_res.side_effect = [_response({"books": [], "upgrade_info": info})]
     assert helper.get_recent_books() == []
     assert helper.get_request_issue_kind() == ""
+    assert logger.warning.call_count == 2
+    assert request_utils.return_value.post_res.call_count == 5
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"errcode": -2012}, "auth"), ({"errCode": 403}, "auth"),
+    ({"errcode": 429}, "rate_limit"), ({"errcode": 123}, "temporary"),
+    ({"errcode": "0"}, "response"), ({"data": None}, "response"),
+    ({"books": None}, "response"), ({}, "response"),
+])
+def test_upgrade_notice_does_not_mask_business_or_schema_failures(weread_helper, payload, expected):
+    """升级提醒不能把真实业务错误或缺少业务数据变成成功空书架。"""
+    helper, request_utils, logger = weread_helper
+    request_utils.return_value.post_res.return_value = _response({
+        **payload, "upgrade_info": {"message": "SENSITIVE_SENTINEL"},
+    })
+    assert helper.get_recent_books() == []
+    assert helper.get_request_issue_kind() == expected
+    assert request_utils.return_value.post_res.call_count == 1
+    assert "SENSITIVE_SENTINEL" not in str(logger.mock_calls) + str(helper._notify.mock_calls)
+
+
+@pytest.mark.parametrize("stage", ["shelf", "progress"])
+def test_real_failure_with_upgrade_notice_discards_partial_results(weread_helper, stage):
+    """真实错误仍终止整批读取，不能因为升级提醒保留半成品。"""
+    helper, request_utils, _logger = weread_helper
+    responses = []
+    if stage == "progress":
+        responses = [
+            _response({"books": [{"bookId": str(i), "title": "合成书"} for i in range(2)]}),
+            _response({"book": {"progress": 1}}),
+        ]
+    request_utils.return_value.post_res.side_effect = responses + [
+        _response({"upgrade_info": {}, "errcode": 429}),
+    ]
+    assert helper.get_recent_books() == []
+    assert helper.get_request_issue_kind() == "rate_limit"
+    assert helper.get_book_info("other") is None
+    assert request_utils.return_value.post_res.call_count == len(responses) + 1
+
+
+@pytest.mark.parametrize("status,expected", [(401, "auth"), (403, "auth"),
+                                            (429, "rate_limit"), (503, "temporary")])
+def test_upgrade_notice_does_not_override_http_failure(weread_helper, status, expected):
+    """HTTP 失败优先于升级提醒，即使错误回包带有看似有效的书架。"""
+    helper, request_utils, _logger = weread_helper
+    response = _response({"upgrade_info": {}, "books": []})
+    response.status_code = status
+    request_utils.return_value.post_res.return_value = response
+    assert helper.get_recent_books() == []
+    assert helper.get_request_issue_kind() == expected
+    assert request_utils.return_value.post_res.call_count == 1
 
 
 @pytest.mark.parametrize("payload,expected", [
@@ -239,7 +295,8 @@ def test_invalid_progress_does_not_fall_back_to_shelf_status(weread_helper, book
 
 
 @pytest.mark.parametrize("progress,finish,expected", [(1, None, "do"), (100, 1700000000, "collect")])
-def test_complete_book_read_reaches_existing_douban_sync(monkeypatch, weread_helper, progress, finish, expected):
+@pytest.mark.parametrize("notice", [False, True])
+def test_complete_book_read_reaches_existing_douban_sync(monkeypatch, weread_helper, progress, finish, expected, notice):
     """完整读取后仍复用原有豆瓣状态提交，不改变来源范围与映射保存。"""
     helper, request_utils, _logger = weread_helper
     module = _load_plugin_module(monkeypatch)
@@ -252,8 +309,10 @@ def test_complete_book_read_reaches_existing_douban_sync(monkeypatch, weread_hel
         set_target_context=lambda *_args: None)
     monkeypatch.setattr(plugin, "_find_douban_match", lambda *_args: ("合成书", "456"))
     request_utils.return_value.post_res.side_effect = [
-        _response({"books": [{"bookId": "123", "title": "合成书", "author": "合成作者", "finishReading": 0}]}),
-        _response({"book": {"progress": progress, "finishTime": finish}}),
+        _response({"books": [{"bookId": "123", "title": "合成书", "author": "合成作者", "finishReading": 0}],
+                   **({"upgrade_info": {}} if notice else {})}),
+        _response({"book": {"progress": progress, "finishTime": finish},
+                   **({"upgrade_info": {}} if notice else {})}),
     ]
     plugin._sync_weread()
     assert len(calls) == 1 and calls[0]["status"] == expected
@@ -264,8 +323,8 @@ def test_complete_book_read_reaches_existing_douban_sync(monkeypatch, weread_hel
 
 @pytest.mark.parametrize("stage", ["shelf", "progress"])
 @pytest.mark.parametrize("mode", ["changes", "off"])
-def test_upgrade_is_visible_preserves_records_and_other_sources_continue(monkeypatch, weread_helper, stage, mode):
-    """协议错误持久化到页面和通知，不覆盖旧记录、不影响其他来源。"""
+def test_missing_business_data_preserves_records_and_other_sources_continue(monkeypatch, weread_helper, stage, mode):
+    """只有升级提醒而无业务数据仍是格式错误，不覆盖旧记录或影响其他来源。"""
     helper, request_utils, _logger = weread_helper
     module = _load_plugin_module(monkeypatch)
     plugin = module.TraktRatingsSync()
@@ -288,15 +347,15 @@ def test_upgrade_is_visible_preserves_records_and_other_sources_continue(monkeyp
     assert plugin.get_data("weread_synced") == {"123": {"douban_status": "collect"}}
     assert plugin.get_data("weread_book_id_map") == {"old": {"subject_id": "123"}}
     issue = plugin.get_data("notification_issues")["微信读书"]
-    assert issue["active"] and issue["category"] == "upgrade"
-    assert "协议需要更新" in issue["title"]
+    assert issue["active"] and issue["category"] == "response"
+    assert "接口响应异常" in issue["title"]
     assert plugin.get_data("last_run")["status"] == "partial"
     assert plugin.get_data("last_run")["source_errors"] == ["微信读书"]
-    assert "协议需要更新" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "接口响应异常" in json.dumps(plugin.get_page(), ensure_ascii=False)
     if mode == "off":
         assert not notices
     else:
-        assert "无需更换 API Key" in notices[0][1]
+        assert "响应格式" in notices[0][1]
     assert "SENSITIVE_SENTINEL" not in str(notices) + json.dumps(plugin._data)
     # 明确成功的空书架才能恢复，不将失败后的 [] 当成恢复。
     request_utils.return_value.post_res.side_effect = [_response({"books": []})]
@@ -304,3 +363,23 @@ def test_upgrade_is_visible_preserves_records_and_other_sources_continue(monkeyp
     assert not plugin.get_data("notification_issues")["微信读书"]["active"]
     assert plugin.get_data("weread_books") == []
     assert plugin.get_data("weread_synced") == {"123": {"douban_status": "collect"}}
+
+
+def test_valid_empty_shelf_with_notice_resolves_historical_upgrade_issue(monkeypatch, weread_helper):
+    """完整有效读取才解除历史升级故障，初始化与无数据升级提醒均不制造恢复。"""
+    helper, request_utils, _logger = weread_helper
+    module = _load_plugin_module(monkeypatch)
+    plugin = module.TraktRatingsSync()
+    plugin.init_plugin({"enable": True, "weread_api_key": "wrk-test-key", "notification_mode": "off"})
+    plugin._weread_helper = helper
+    plugin.save_data("notification_issues", {"微信读书": {
+        "active": True, "category": "upgrade", "title": "微信读书 Skill 协议需要更新",
+        "last_success_at": 0,
+    }})
+    assert plugin.get_data("notification_issues")["微信读书"]["active"]
+    request_utils.return_value.post_res.return_value = _response({"books": [], "upgrade_info": {}})
+    plugin.run()
+    assert not plugin.get_data("notification_issues")["微信读书"]["active"]
+    assert plugin.get_data("last_run")["source_errors"] == []
+    assert plugin.get_data("weread_books") == []
+    assert request_utils.return_value.post_res.call_count == 1

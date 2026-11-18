@@ -50,7 +50,7 @@ class TraktRatingsSync(_PluginBase):
     plugin_name = "豆瓣书影音同步"
     plugin_desc = "聚合多平台记录同步到豆瓣：Trakt 电影无需评分同步看过、剧集逐季在看/看过，微信读书、网易云专辑、小宇宙播客；支持未匹配记录处理。"
     plugin_icon = "trakt.png"
-    plugin_version = "3.22.3"
+    plugin_version = "3.22.4"
     plugin_author = "ColorlessCube"
     author_url = "https://github.com/ColorlessCube"
     plugin_config_prefix = "trakt_ratings_sync_"
@@ -684,7 +684,6 @@ class TraktRatingsSync(_PluginBase):
         issue = self._weread_helper.get_request_issue_kind()
         if issue:
             hints = {
-                "upgrade": ("微信读书 Skill 协议需要更新", "请更新插件的微信读书接口适配，无需更换 API Key；本轮书单未更新，已有记录保留。"),
                 "auth": ("微信读书 API Key 已失效", "请检查微信读书 API Key 是否有效及有访问权限；已有记录保留。"),
                 "rate_limit": ("微信读书暂时限流", "本轮读取已停止，等待下次定时重试；无需更换 API Key，已有记录保留。"),
                 "response": ("微信读书接口响应异常", "响应格式与已核对协议不符，本轮未处理不完整书单；请检查接口适配，已有记录保留。"),
@@ -1754,7 +1753,7 @@ class TraktRatingsSync(_PluginBase):
             field("cron", "定时同步", hint="五段cron表达式，例如0 10 * * *代表每天上午10点", **{"persistent-hint": True}),
             heading("豆瓣"), *douban,
             self._fold("Trakt", trakt),
-            self._fold("微信读书", [credential("weread_api_key", "微信读书 API Key", "使用 Skill 协议 1.0.5；协议升级提示需更新插件，不等同于 Key 失效")]),
+            self._fold("微信读书", [credential("weread_api_key", "微信读书 API Key", "使用 Skill 协议 1.0.6；升级提示不阻断有效数据，也不等同于 Key 失效")]),
             self._fold("网易云音乐", netease),
             self._fold("ASS 只读凭据连接", ass),
             self._fold("小宇宙", [credential("xiaoyuzhou_cookie", "小宇宙认证信息", "支持 Token、含刷新令牌的 Cookie 或完整 cURL")]),
